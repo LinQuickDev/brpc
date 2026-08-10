@@ -282,8 +282,8 @@ http_archive(
 git_repository(
     name = "umdk",
     build_file = "//bazel/third_party/umdk:umdk.BUILD",
+    commit = "564ee727a55523d4351a8fb3c94292b388ebb924", # v26.06.0_CAM
     remote = "https://atomgit.com/openeuler/umdk.git",
-    commit = "564ee727a55523d4351a8fb3c94292b388ebb924",  # v26.06.0_CAM
 )
 
 # Header-only JSON library used by iobuf_unittest's IOBuf<->std::iostream

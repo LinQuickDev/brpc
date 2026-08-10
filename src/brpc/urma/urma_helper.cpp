@@ -100,7 +100,6 @@ DEFINE_bool(urma_poller_yield, false,
             "Yield (bthread_yield) in the busy poll loop to let other "
             "bthreads run");
 
-
 // Set to true to skip real URMA hardware initialization (unit tests). When
 // true, GlobalUrmaInitializeOrDie() returns without touching liburma and the
 // endpoint builds its state machine without posting real WRs.
