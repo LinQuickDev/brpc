@@ -708,6 +708,27 @@ int urma_wait_jfc(urma_jfce_t* jfce, uint32_t jfc_cnt, int,
 void urma_ack_jfc(urma_jfc_t*[], uint32_t[], uint32_t) {
 }
 
+// Referenced by SetBondingMode() in urma_helper.cpp whenever the provider
+// header urma_ubagg.h is available (BRPC_URMA_HAS_BONDING_EXT). Without a
+// definition here, WITH_URMA=ON fails to link against the mock. The mock
+// advertises no bonding device, so this is never reached at runtime, but the
+// symbol must exist.
+urma_status_t urma_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
+                            urma_user_ctl_out_t *out) {
+    if (ctx == nullptr || in == nullptr || out == nullptr) {
+        return URMA_EINVAL;
+    }
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (context_map.find(ctx) == context_map.end()) {
+        return URMA_EINVAL;
+    }
+    // No provider state to configure; accept the command and report an empty
+    // output buffer.
+    out->addr = 0;
+    out->len = 0;
+    return URMA_SUCCESS;
+}
+
 }  // extern "C"
 
 #endif  // BRPC_WITH_URMA

@@ -85,6 +85,49 @@ jobs:
               -DWITH_ASAN=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
         make -j ${{env.proc_num}} && make clean
 
+  compile-and-test-with-urma:
+    # WITH_URMA=ON is not covered by the jobs above: none of them set the flag,
+    # so src/brpc/urma/*.cpp and brpc_urma_unittest.cpp are never compiled.
+    # liburma is absent on the runner, so CMake falls back to the link-time
+    # mock (src/brpc/urma/mock_urma.cpp) and no URMA hardware is needed.
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v2
+    - uses: ./.github/actions/install-essential-dependencies
+
+    # test/CMakeLists.txt does find_package(Gperftools) and links
+    # ${GPERFTOOLS_LIBRARIES} into every unittest target. The make-based
+    # unittest jobs never hit this, but the CMake generate step fails with
+    # NOTFOUND without it.
+    - name: install gperftools
+      run: sudo apt-get install -y libgoogle-perftools-dev
+
+    # DOWNLOAD_URMA_HEADERS fetches from atomgit.com, which is slow and often
+    # unreachable from CI. openEuler mirrors the same repo (identical tags and
+    # layout) on GitHub, so clone that and hand it to CMake via URMA_ROOT.
+    - name: fetch UMDK headers
+      run: |
+        git clone --depth 1 --branch v26.06.0_CAM \
+            https://github.com/openeuler-mirror/umdk.git $GITHUB_WORKSPACE/umdk
+        test -f $GITHUB_WORKSPACE/umdk/src/urma/lib/urma/core/include/urma_api.h
+
+    - name: gcc with URMA
+      env:
+        URMA_ROOT: ${{ github.workspace }}/umdk
+      run: |
+        export CC=gcc && export CXX=g++
+        mkdir urma_build && cd urma_build
+        cmake -DWITH_URMA=ON \
+              -DBUILD_UNIT_TESTS=ON -DBUILD_BRPC_TOOLS=OFF \
+              -DCMAKE_BUILD_TYPE=Debug -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+        # brpc_urma_unittest links brpc-shared-debug, built from
+        # SOURCES_DEBUG_LIB, which contains every urma_*.cpp plus
+        # mock_urma.cpp -- so this target compiles all the URMA code.
+        make -j ${{env.proc_num}} brpc_urma_unittest
+
+    - name: run brpc_urma_unittest
+      run: cd urma_build/test && ./brpc_urma_unittest
+
   gcc-compile-with-make-protobuf:
     runs-on: ubuntu-22.04
     steps:
