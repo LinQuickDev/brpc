@@ -62,7 +62,13 @@ struct PendingRecv {
     uint64_t user_ctx;
 };
 
-std::shared_mutex g_rw_mutex;
+// brpc is built with -std=c++14 whenever protobuf < 4.21 (see BRPC_CXX_STANDARD
+// in CMakeLists.txt and CXXFLAGS in config_brpc.sh), which is the case on the
+// CI runners. std::shared_mutex is C++17-only; std::shared_timed_mutex is the
+// C++14 equivalent and has the same locking semantics here.
+typedef std::shared_timed_mutex MockSharedMutex;
+
+MockSharedMutex g_rw_mutex;
 bool initialized = false;
 std::vector<urma_device_t *> device_list;
 std::map<urma_context_t *, int> context_map;
@@ -119,7 +125,7 @@ urma_eid_info_t mock_eid_info = {
 extern "C" {
 
 urma_status_t urma_init(urma_init_attr_t *init_attr) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (initialized) {
         return URMA_EEXIST;
     }
@@ -128,7 +134,7 @@ urma_status_t urma_init(urma_init_attr_t *init_attr) {
 }
 
 urma_status_t urma_uninit(void) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     initialized = false;
     for (auto device : device_list) {
         delete device;
@@ -153,7 +159,7 @@ urma_status_t urma_uninit(void) {
 
 urma_device_t **urma_get_device_list(int *num_devices) {
     {
-        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
         if (!initialized) {
             *num_devices = 0;
             return nullptr;
@@ -168,7 +174,7 @@ urma_device_t **urma_get_device_list(int *num_devices) {
         }
     }
     {
-        std::unique_lock<std::shared_mutex> write_lock(g_rw_mutex);
+        std::unique_lock<MockSharedMutex> write_lock(g_rw_mutex);
         if (!initialized) {
             *num_devices = 0;
             return nullptr;
@@ -193,7 +199,7 @@ urma_device_t **urma_get_device_list(int *num_devices) {
 
 urma_device_t *urma_get_device_by_name(char *dev_name) {
     {
-        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
         if (!initialized) {
             return nullptr;
         }
@@ -207,7 +213,7 @@ urma_device_t *urma_get_device_by_name(char *dev_name) {
         }
     }
     {
-        std::unique_lock<std::shared_mutex> write_lock(g_rw_mutex);
+        std::unique_lock<MockSharedMutex> write_lock(g_rw_mutex);
         if (!initialized) {
             return nullptr;
         }
@@ -265,7 +271,7 @@ void urma_free_eid_list(urma_eid_info_t *eid_list) {
 }
 
 urma_context_t *urma_create_context(urma_device_t *device, uint32_t eid_index) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!device) {
         return nullptr;
     }
@@ -277,7 +283,7 @@ urma_context_t *urma_create_context(urma_device_t *device, uint32_t eid_index) {
 }
 
 urma_status_t urma_delete_context(urma_context_t *ctx) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || context_map.find(ctx) == context_map.end()) {
         return URMA_EINVAL;
     }
@@ -287,7 +293,7 @@ urma_status_t urma_delete_context(urma_context_t *ctx) {
 }
 
 urma_jfce_t *urma_create_jfce(urma_context_t *ctx) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
@@ -305,7 +311,7 @@ urma_jfce_t *urma_create_jfce(urma_context_t *ctx) {
 }
 
 urma_status_t urma_delete_jfce(urma_jfce_t *jfce) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jfce || jfce_map.find(jfce) == jfce_map.end()) {
         return URMA_EINVAL;
     }
@@ -316,7 +322,7 @@ urma_status_t urma_delete_jfce(urma_jfce_t *jfce) {
 }
 
 urma_jfc_t *urma_create_jfc(urma_context_t *ctx, urma_jfc_cfg_t *cfg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
@@ -334,7 +340,7 @@ urma_jfc_t *urma_create_jfc(urma_context_t *ctx, urma_jfc_cfg_t *cfg) {
 }
 
 urma_status_t urma_delete_jfc(urma_jfc_t *jfc) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jfc || jfc_state_map.find(jfc) == jfc_state_map.end()) {
         return URMA_EINVAL;
     }
@@ -345,7 +351,7 @@ urma_status_t urma_delete_jfc(urma_jfc_t *jfc) {
 }
 
 urma_jfr_t *urma_create_jfr(urma_context_t *ctx, urma_jfr_cfg_t *cfg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
@@ -361,7 +367,7 @@ urma_jfr_t *urma_create_jfr(urma_context_t *ctx, urma_jfr_cfg_t *cfg) {
 }
 
 urma_status_t urma_delete_jfr(urma_jfr_t *jfr) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jfr || jfr_map.find(jfr) == jfr_map.end()) {
         return URMA_EINVAL;
     }
@@ -373,7 +379,7 @@ urma_status_t urma_delete_jfr(urma_jfr_t *jfr) {
 }
 
 urma_target_seg_t *urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
@@ -389,7 +395,7 @@ urma_target_seg_t *urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg) {
 }
 
 urma_status_t urma_unregister_seg(urma_target_seg_t *seg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!seg || seg_map.find(seg) == seg_map.end()) {
         return URMA_EINVAL;
     }
@@ -401,7 +407,7 @@ urma_status_t urma_unregister_seg(urma_target_seg_t *seg) {
 urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
                                    urma_token_t *token_value, uint64_t addr,
                                    urma_import_seg_flag_t flag) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !seg || !token_value ||
         context_map.find(ctx) == context_map.end()) {
         return nullptr;
@@ -414,7 +420,7 @@ urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
 }
 
 urma_status_t urma_unimport_seg(urma_target_seg_t *tseg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!tseg || seg_map.find(tseg) == seg_map.end()) {
         return URMA_EINVAL;
     }
@@ -428,7 +434,7 @@ urma_status_t urma_get_async_event(urma_context_t *ctx,
     if (!ctx || !event) {
         return URMA_EINVAL;
     }
-    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
     if (context_map.find(ctx) == context_map.end()) {
         return URMA_EINVAL;
     }
@@ -438,7 +444,7 @@ urma_status_t urma_get_async_event(urma_context_t *ctx,
 void urma_ack_async_event(urma_async_event_t *event) {}
 
 urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
@@ -455,7 +461,7 @@ urma_jetty_t *urma_create_jetty(urma_context_t *ctx, urma_jetty_cfg_t *cfg) {
 }
 
 urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
         return URMA_EINVAL;
     }
@@ -466,7 +472,7 @@ urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
 }
 
 urma_status_t urma_unbind_jetty(urma_jetty_t *jetty) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
         return URMA_EINVAL;
     }
@@ -477,7 +483,7 @@ urma_status_t urma_unbind_jetty(urma_jetty_t *jetty) {
 urma_target_jetty_t *urma_import_jetty(urma_context_t *ctx,
                                        urma_rjetty_t *rjetty,
                                        urma_token_t *token_value) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!ctx || !rjetty || !token_value ||
         context_map.find(ctx) == context_map.end()) {
         return nullptr;
@@ -490,7 +496,7 @@ urma_target_jetty_t *urma_import_jetty(urma_context_t *ctx,
 }
 
 urma_status_t urma_unimport_jetty(urma_target_jetty_t *tjetty) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!tjetty || target_jetty_map.find(tjetty) == target_jetty_map.end()) {
         return URMA_EINVAL;
     }
@@ -501,7 +507,7 @@ urma_status_t urma_unimport_jetty(urma_target_jetty_t *tjetty) {
 
 urma_status_t urma_bind_jetty(urma_jetty_t *jetty,
                               urma_target_jetty_t *tjetty) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jetty || !tjetty || jetty_map.find(jetty) == jetty_map.end() ||
         target_jetty_map.find(tjetty) == target_jetty_map.end()) {
         return URMA_EINVAL;
@@ -511,7 +517,7 @@ urma_status_t urma_bind_jetty(urma_jetty_t *jetty,
 }
 
 urma_status_t urma_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr) {
-    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
     if (!jetty || !attr || jetty_map.find(jetty) == jetty_map.end()) {
         return URMA_EINVAL;
     }
@@ -520,7 +526,7 @@ urma_status_t urma_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr) {
 
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                                       urma_jfs_wr_t **bad_wr) {
-    std::shared_lock<std::shared_mutex> read_lock(g_rw_mutex);
+    std::shared_lock<MockSharedMutex> read_lock(g_rw_mutex);
     auto local_it = jetty_map.find(jetty);
     auto local_jfc_it =
         jetty ? jfc_state_map.find(jetty->jetty_cfg.jfs_cfg.jfc)
@@ -555,7 +561,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
         PendingRecv recv{};
         urma_jfc_t* remote_jfc = nullptr;
         {
-            std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+            std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
             auto remote_it = jetty_id_map.find(current->tjetty->id.id);
             if (remote_it == jetty_id_map.end()) {
                 continue;
@@ -585,7 +591,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
 
         JfcState* remote_state = nullptr;
         {
-            std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+            std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
             auto state_it = jfc_state_map.find(remote_jfc);
             if (state_it != jfc_state_map.end()) {
                 remote_state = state_it->second;
@@ -613,7 +619,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
 
 urma_status_t urma_post_jfr_wr(urma_jfr_t *jfr, urma_jfr_wr_t *wr,
                                urma_jfr_wr_t **bad_wr) {
-    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::unique_lock<MockSharedMutex> lock(g_rw_mutex);
     auto recv_it = jfr_recv_map.find(jfr);
     if (!jfr || !wr || recv_it == jfr_recv_map.end()) {
         if (bad_wr) {
@@ -644,7 +650,7 @@ urma_status_t urma_post_jetty_recv_wr(urma_jetty_t *jetty,
                                       urma_jfr_wr_t **bad_wr) {
     urma_jfr_t* shared_jfr = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
         if (!jetty || jetty_map.find(jetty) == jetty_map.end()) {
             if (bad_wr) {
                 *bad_wr = wr;
@@ -659,7 +665,7 @@ urma_status_t urma_post_jetty_recv_wr(urma_jetty_t *jetty,
 int urma_poll_jfc(urma_jfc_t *jfc, int num_entries, urma_cr_t *cr_list) {
     JfcState* state = nullptr;
     {
-        std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+        std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
         auto it = jfc_state_map.find(jfc);
         if (it == jfc_state_map.end()) {
             return -1;
@@ -690,7 +696,7 @@ int urma_wait_jfc(urma_jfce_t* jfce, uint32_t jfc_cnt, int,
     }
     uint64_t value = 0;
     (void)read(jfce->fd, &value, sizeof(value));
-    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
     uint32_t count = 0;
     for (const auto& item : jfc_state_map) {
         if (count >= jfc_cnt || item.first->jfc_cfg.jfce != jfce) {
@@ -718,7 +724,7 @@ urma_status_t urma_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
     if (ctx == nullptr || in == nullptr || out == nullptr) {
         return URMA_EINVAL;
     }
-    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    std::shared_lock<MockSharedMutex> lock(g_rw_mutex);
     if (context_map.find(ctx) == context_map.end()) {
         return URMA_EINVAL;
     }
