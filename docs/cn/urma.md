@@ -36,6 +36,21 @@ UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `liburma` 时
 真实硬件数据通路，否则链接 brpc 的 mock，使 URMA 代码和测试仍可在无硬件
 环境编译。
 
+### Bazel 编译
+
+```bash
+# 带 URMA 支持编译 brpc
+bazel build --define=BRPC_WITH_URMA=true //:brpc
+```
+
+Bazel 下的 URMA 头文件来自 `WORKSPACE` / `MODULE.bazel` 中固定 commit 的
+`umdk` `git_repository`，没有 CMake `DOWNLOAD_URMA_HEADERS` 那样的开关：
+既不能改用系统已安装的 SDK 头文件，也无法禁止下载。此外 Bazel 构建目前
+未提供检测/链接真实 `liburma` 的逻辑，`src/brpc/urma/mock_urma.cpp` 会
+无条件编入，因此 Bazel 构建的 URMA 始终使用 mock 数据通路；如需链接真实
+硬件，请使用 CMake 或 Make 构建。`urma_performance` 示例目前也只有
+CMake/Make 构建脚本，尚无对应的 Bazel target。
+
 ## 使用
 
 通过在 channel / server 上设置 `socket_mode` 选择传输层：
