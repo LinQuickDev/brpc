@@ -38,6 +38,23 @@ When `liburma` is found it is linked for the hardware data path. Otherwise,
 brpc uses its link-time mock so URMA code and tests can still be built without
 hardware.
 
+### Build with Bazel
+
+```bash
+# Build brpc with URMA support
+bazel build --define=BRPC_WITH_URMA=true //:brpc
+```
+
+Bazel fetches the UMDK headers from the `umdk` `git_repository` pinned to a
+fixed commit in `WORKSPACE` / `MODULE.bazel`. There is no Bazel equivalent of
+CMake's `DOWNLOAD_URMA_HEADERS`: Bazel can neither use a locally installed SDK
+nor disable the download. Bazel builds also have no detection/linking logic
+for a real `liburma` yet — `src/brpc/urma/mock_urma.cpp` is compiled in
+unconditionally, so a Bazel build of URMA always uses the mock data path. Use
+CMake or Make to link against real hardware. The `urma_performance` example
+currently only has CMake/Make build files; there is no Bazel target for it
+yet.
+
 ## Usage
 
 Select the transport by setting `socket_mode` on the channel / server:
