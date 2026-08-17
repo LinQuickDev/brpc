@@ -130,7 +130,7 @@ src/brpc/
 flowchart TB
     S["Socket"] --> UT["UpgradeTransport\nTCP-first 路由与状态发布"]
     UT --> TCP["TcpTransport\n默认数据面 / fallback"]
-    UT --> HS["HandshakeSession\nphase / version / lifecycle"]
+    UT --> HS["HandshakeSession\nclient/server driver + lifecycle"]
     HS --> IO["SocketHandshakeIO\nReadExact / WriteAll / readable butex"]
     UT --> RA["RDMA adapter"]
     UT --> UA["URMA adapter"]
@@ -140,7 +140,7 @@ flowchart TB
     BA --> BE["UBShmEndpoint\nUBRing / Shared Memory"]
 ```
 
-`UpgradeTransport` 决定当前数据走 TCP 还是高速 Endpoint；`HandshakeSession` 只管理一次升级尝试；具体 adapter 负责 Hello/ACK wire codec 和资源协商。Endpoint 不持有 TCP Transport，也不执行 TCP fd 读写。
+`UpgradeTransport` 决定当前数据走 TCP 还是高速 Endpoint；`HandshakeSession` 驱动一次升级尝试的公共步骤；具体 adapter 通过回调完成 Hello/ACK wire codec 和资源协商。Endpoint 不持有 TCP Transport，也不执行 TCP fd 读写。
 
 ## 4.1 选定架构：Handshake 位于 Transport 层
 
@@ -389,7 +389,7 @@ public:
 };
 ```
 
-实际实现中不建议使用裸 `shared_ptr<void>`，更适合使用各协议自己的 `ParsedHello` 结构配合回调，或者让 `HandshakeDriver` 只传递 `std::string payload`，由 endpoint 在回调中解析。
+实际实现中不建议使用裸 `shared_ptr<void>`，更适合使用各协议自己的 `ParsedHello` 结构配合回调，或者让 `HandshakeSession` 只传递步骤结果，由协议 callback 保存强类型上下文。
 
 建议第一版采用回调方式，避免公共头文件包含协议专有类型：
 
@@ -403,7 +403,7 @@ struct HandshakeCallbacks {
 };
 ```
 
-## 6. HandshakeDriver 状态机
+## 6. HandshakeSession 状态机
 
 ### 6.1 Client 流程
 
@@ -448,7 +448,7 @@ server 解析必须保留 `NEED_MORE_DATA`：
 
 ### 6.3 公共驱动不负责的动作
 
-`HandshakeDriver` 在协议成功后只调用回调，不直接操作资源：
+`HandshakeSession` 通过 callback 驱动协议步骤，不直接依赖具体资源类型：
 
 - RDMA：回调中执行 `AllocateResources/BringUpQp`；
 - URMA：回调中执行 `AllocateResources/ImportPeer`；
@@ -525,17 +525,17 @@ UBSHM 是最适合优先迁移的实现，因为它只有固定长度 v2 协议�
 
 ```cpp
 class RdmaEndpoint {
-    handshake::HandshakeDriver _handshake;
+    handshake::HandshakeSession _handshake;
     RdmaHandshakeAdapter _handshake_adapter;
 };
 
 class UrmaEndpoint {
-    handshake::HandshakeDriver _handshake;
+    handshake::HandshakeSession _handshake;
     UrmaHandshakeAdapter _handshake_adapter;
 };
 
 class UBShmEndpoint {
-    handshake::HandshakeDriver _handshake;
+    handshake::HandshakeSession _handshake;
     UBShmHandshakeAdapter _handshake_adapter;
 };
 ```
@@ -657,7 +657,7 @@ Hello valid
 ### Phase 2：抽取公共 driver
 
 - 引入统一 `Result/Phase`；
-- 将 client/server 的握手阶段迁移到 `HandshakeDriver`；
+- 将 client/server 的握手阶段迁移到 `HandshakeSession`；
 - 保留各 endpoint 的资源协商回调；
 - 统一 fallback 和错误处理。
 
@@ -715,13 +715,14 @@ classDiagram
         +CutFromIOBuf()
         +CutFromIOBufList()
         +WaitEpollOut()
-        +ActivateHighSpeed()
         +FallbackToTcp()
     }
     class HandshakeSession {
         -SocketHandshakeIO io
         -atomic phase
         -int protocol_version
+        +RunClient(callbacks)
+        +RunServer(callbacks)
         +MarkEstablished()
         +PublishFallback()
         +MarkFailed()
@@ -743,16 +744,16 @@ classDiagram
 
 `UpgradeTransport` 是 TCP-first 的公共路由层：`UNINITIALIZED/NEGOTIATING/FALLBACK_TCP` 都走 `TcpTransport`，仅当 `HandshakeSession` release 发布 `ESTABLISHED` 后才调用高速 Endpoint 的发送与等待钩子。成功升级后的 TCP 控制连接只允许 EOF，不再接受应用数据。
 
-`HandshakeSession` 管理一次升级尝试的 phase、协议版本、fallback/established 发布顺序和 `SocketHandshakeIO`。RDMA/UBSHM 仍保留各自不同的 wire codec、协议中间阶段和资源协商，这是有意保留的 adapter 边界，不再由 Endpoint 持有。
+`HandshakeSession::RunClient/RunServer` 统一执行资源准备、Hello 收发、远端参数协商、ACK 收发以及 established/fallback/failed 发布。RDMA/UBSHM 仅通过 callback 提供 wire codec 和资源操作；RDMA server 的 `STEP_NEED_MORE` 仍由 bRPC 标准 parser 增量驱动，UBSHM server 使用同一驱动的 blocking 模式。
 
 ### 14.1 当前完成度
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
 | TCP-first 路由 | 已实现 | RDMA/UBSHM 共同继承 `UpgradeTransport`，不再各自持有 `TcpTransport` |
-| 公共握手生命周期 | 已实现 | `HandshakeSession` 统一 phase、version、I/O 和终态发布 |
+| 公共握手处理 | 已实现 | `RunClient/RunServer` 统一 Hello、资源协商、ACK、fallback 和错误流程 |
 | RDMA client/server | 已迁移 | server 保留 #3350 的 bRPC 标准协议增量解析流程 |
-| UBSHM client/server | 部分迁移 | 生命周期已进入 Transport；server 固定帧仍由握手 bthread 读取，后续迁移到标准 parser |
+| UBSHM client/server | 已迁移公共驱动 | server 当前使用 blocking 模式；后续只需把输入方式迁移到标准 parser |
 | URMA | 待迁移 | origin/master 暂无受版本控制的 URMA Transport；合入后实现 `UpgradeTransport` 的数据面钩子并复用 `HandshakeSession` |
 | 通用 FrameCodec/Protocol adapter | 待实现 | 当前先复用 RDMA 已验证的 v2/v3 codec，避免一次改动 wire format 与 Transport 生命周期 |
 
@@ -761,26 +762,24 @@ classDiagram
 | 修复 | 公共约束 | 落点 |
 |---|---|---|
 | #3347 | fallback 状态必须原子发布，事件线程用 acquire 读取 | `HandshakeSession::PublishFallback/phase` |
-| #3406 | 必须先发布 Transport 的 TCP active/off 状态，再 release 发布 `FALLBACK_TCP` | `UpgradeTransport::FallbackToTcp` 调整 provider 状态后发布终态 |
+| #3406 | 必须先发布 Transport 的 TCP active/off 状态，再 release 发布 `FALLBACK_TCP` | `HandshakeSession` 先调用 `set_tcp_active` callback，再 release 发布终态 |
 | #3424 | 高速资源准备失败是可降级错误；清理部分资源并保持 TCP 可用 | RDMA 保留事务式 `AllocateResources`；失败后由公共 fallback 路径恢复 TCP |
 | #3425 | CQ re-arm 后同时补 poll send/recv CQ | 保留在 RDMA Endpoint 数据面，不移入握手组件 |
 | #3427 | 外部 Bazel workspace 下生成规则不能依赖主仓布局 | 公共实现不新增 proto；源码通过现有递归 glob 收录 |
 
 ### 14.3 状态发布规则
 
-成功升级和回退只能由 `UpgradeTransport` 发布：
+成功升级和回退由 `HandshakeSession` 按固定顺序发布，Transport callback 只切换 provider 状态：
 
 ```cpp
-void UpgradeTransport::FallbackToTcp() {
-    handshake.PublishFallback([this]() {
-        SetHighSpeedAvailable(false);
-    });
-}
+// Fallback: publish TCP/provider state first, then terminal phase.
+PublishFallback([&callbacks]() {
+    callbacks.set_tcp_active();
+});
 
-void UpgradeTransport::ActivateHighSpeed() {
-    SetHighSpeedAvailable(true);
-    handshake.MarkEstablished();
-}
+// Success: endpoint is ready before ESTABLISHED becomes visible.
+callbacks.set_high_speed_active();
+MarkEstablished();
 ```
 
 事件线程必须通过 acquire load 读取 phase。看到 `FALLBACK_TCP` 后可以直接恢复 `InputMessenger`；看到 `ESTABLISHED` 后才允许发送和接收高速数据。`UNINITIALIZED/NEGOTIATING` 状态不得路由到 Endpoint 数据面。

@@ -49,9 +49,7 @@ protected:
                               const OnEdgeTrigger& default_on_edge);
     void ResetUpgradeTransport();
 
-    void ActivateHighSpeed();
     void FallbackToTcp();
-    void FailHandshake();
     void TryReadOnTcp();
 
     virtual void SetHighSpeedAvailable(bool available) = 0;

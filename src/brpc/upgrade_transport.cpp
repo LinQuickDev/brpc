@@ -68,19 +68,10 @@ int UpgradeTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
     return _tcp_transport->WaitEpollOut(epollout_butex, pollin, duetime);
 }
 
-void UpgradeTransport::ActivateHighSpeed() {
-    SetHighSpeedAvailable(true);
-    _handshake.MarkEstablished();
-}
-
 void UpgradeTransport::FallbackToTcp() {
     _handshake.PublishFallback([this]() {
         SetHighSpeedAvailable(false);
     });
-}
-
-void UpgradeTransport::FailHandshake() {
-    _handshake.MarkFailed();
 }
 
 void UpgradeTransport::OnNewDataFromTcp(Socket* socket) {

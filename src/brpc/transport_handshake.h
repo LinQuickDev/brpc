@@ -19,6 +19,7 @@
 #define BRPC_TRANSPORT_HANDSHAKE_H
 
 #include <cstddef>
+#include <functional>
 
 #include "butil/atomicops.h"
 #include "butil/iobuf.h"
@@ -47,6 +48,53 @@ enum Phase {
     ESTABLISHED = 0x100,
     FALLBACK_TCP = 0x200,
     FAILED = 0x300,
+};
+
+enum StepResult {
+    STEP_OK = 0,
+    STEP_FALLBACK,
+    STEP_NEED_MORE,
+    STEP_NOT_MINE,
+    STEP_ERROR,
+};
+
+struct HandshakePhases {
+    int prepare_local;
+    int hello_send;
+    int hello_wait;
+    int negotiate;
+    int ack_send;
+    int ack_wait;
+};
+
+// Protocol-specific operations invoked by the common client driver. A
+// callback reports what happened but does not advance the session phase.
+struct ClientHandshakeCallbacks {
+    HandshakePhases phases;
+    std::function<StepResult()> prepare_local;
+    std::function<StepResult()> send_local_hello;
+    std::function<StepResult()> receive_remote_hello;
+    std::function<StepResult()> negotiate_resources;
+    std::function<StepResult(bool)> send_ack;
+    std::function<void()> set_high_speed_active;
+    std::function<void()> set_tcp_active;
+    std::function<void()> on_failed;
+};
+
+// The server driver can operate incrementally (InputMessenger parser) or run
+// through ACK_WAIT in one blocking handshake bthread.
+struct ServerHandshakeCallbacks {
+    HandshakePhases phases;
+    bool blocking;
+    bool fallback_on_not_mine;
+    std::function<StepResult()> receive_remote_hello;
+    std::function<StepResult()> prepare_local;
+    std::function<StepResult()> negotiate_resources;
+    std::function<StepResult(bool)> send_local_hello;
+    std::function<StepResult()> receive_ack;
+    std::function<void()> set_high_speed_active;
+    std::function<void()> set_tcp_active;
+    std::function<void()> on_failed;
 };
 
 // Owns TCP-fd I/O and its readable notification while upgrading a connection.
@@ -120,6 +168,9 @@ public:
     SocketHandshakeIO* io() { return &_io; }
     const SocketHandshakeIO* io() const { return &_io; }
     void NotifyReadable() { _io.NotifyReadable(); }
+
+    StepResult RunClient(const ClientHandshakeCallbacks& callbacks);
+    StepResult RunServer(const ServerHandshakeCallbacks& callbacks);
 
 private:
     SocketHandshakeIO _io;
