@@ -61,6 +61,8 @@ DECLARE_bool(rdma_trace_verbose);
 
 namespace v2_wire {
 
+int DrainBytes(handshake::SocketHandshakeIO* io, size_t n);
+
 void HelloMessage::Serialize(void* data) const {
     butil::RawPacker(data)
         .pack16(msg_len)
@@ -106,9 +108,10 @@ static void TranslateV2Hello(const HelloMessage& msg, ParsedHello* out) {
     out->qp_num = msg.qp_num;
 }
 
-RemoteHelloResult ReadBodyAndNegotiate(RdmaEndpoint* ep, ParsedHello* remote) {
+RemoteHelloResult ReadBodyAndNegotiate(handshake::SocketHandshakeIO* io,
+                                       ParsedHello* remote) {
     uint8_t data[HELLO_V2_MSG_LEN_MIN];
-    if (ep->ReadFromFd(data, HELLO_V2_MSG_LEN_MIN - HELLO_MAGIC_LEN) < 0) {
+    if (io->ReadExact(data, HELLO_V2_MSG_LEN_MIN - HELLO_MAGIC_LEN) < 0) {
         return RemoteHelloResult::ERROR;
     }
     HelloMessage remote_msg{};
@@ -124,7 +127,7 @@ RemoteHelloResult ReadBodyAndNegotiate(RdmaEndpoint* ep, ParsedHello* remote) {
         // carry enough information for negotiation; unknown trailing
         // bytes are treated as optional hints that v2 safely ignores.
         size_t ext_len = remote_msg.msg_len - HELLO_V2_MSG_LEN_MIN;
-        if (DrainBytes(ep, ext_len) < 0) {
+        if (DrainBytes(io, ext_len) < 0) {
             return RemoteHelloResult::ERROR;
         }
     }
@@ -135,11 +138,11 @@ RemoteHelloResult ReadBodyAndNegotiate(RdmaEndpoint* ep, ParsedHello* remote) {
     return RemoteHelloResult::NEGOTIATED;
 }
 
-int DrainBytes(RdmaEndpoint* ep, size_t n) {
+int DrainBytes(handshake::SocketHandshakeIO* io, size_t n) {
     uint8_t scratch[64];
     while (n > 0) {
         size_t chunk = std::min(n, sizeof(scratch));
-        if (ep->ReadFromFd(scratch, chunk) < 0) {
+        if (io->ReadExact(scratch, chunk) < 0) {
             return -1;
         }
         n -= chunk;
@@ -170,12 +173,12 @@ int RdmaHandshakeClientV2::SendLocalHello() {
     }
     fast_memcpy(data, HELLO_MAGIC, 4);
     local_msg.Serialize((char*)data + 4);
-    return ep->WriteToFd(data, HELLO_V2_MSG_LEN_MIN);
+    return _io->WriteAll(data, HELLO_V2_MSG_LEN_MIN);
 }
 
 RemoteHelloResult RdmaHandshakeClientV2::ReceiveAndParseRemoteHello(ParsedHello* remote) {
     uint8_t magic[HELLO_MAGIC_LEN];
-    if (_ep->ReadFromFd(magic, HELLO_MAGIC_LEN) < 0) {
+    if (_io->ReadExact(magic, HELLO_MAGIC_LEN) < 0) {
         return RemoteHelloResult::ERROR;
     }
     if (memcmp(magic, HELLO_MAGIC, HELLO_MAGIC_LEN) != 0) {
@@ -183,7 +186,7 @@ RemoteHelloResult RdmaHandshakeClientV2::ReceiveAndParseRemoteHello(ParsedHello*
         return RemoteHelloResult::ERROR;
     }
 
-    return v2_wire::ReadBodyAndNegotiate(_ep, remote);
+    return v2_wire::ReadBodyAndNegotiate(_io, remote);
 }
 
 // Parse one complete v2 client hello out of `_source` (non-blocking).
@@ -259,7 +262,7 @@ int RdmaHandshakeServerV2::SendLocalHello() {
     }
     fast_memcpy(data, HELLO_MAGIC, 4);
     local_msg.Serialize((char*)data + 4);
-    return _ep->WriteToFd(data, HELLO_V2_MSG_LEN_MIN);
+    return _io->WriteAll(data, HELLO_V2_MSG_LEN_MIN);
 }
 
 namespace v3_wire {
@@ -320,9 +323,9 @@ void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg) {
     }
 }
 
-int ReadAndParseV3Hello(RdmaEndpoint* ep, RdmaHello* out) {
+int ReadAndParseV3Hello(handshake::SocketHandshakeIO* io, RdmaHello* out) {
     uint8_t size_buf[HELLO_V3_PB_SIZE_LEN];
-    if (ep->ReadFromFd(size_buf, HELLO_V3_PB_SIZE_LEN) < 0) {
+    if (io->ReadExact(size_buf, HELLO_V3_PB_SIZE_LEN) < 0) {
         return -1;
     }
     uint32_t pb_size = butil::NetToHost32(
@@ -332,7 +335,7 @@ int ReadAndParseV3Hello(RdmaEndpoint* ep, RdmaHello* out) {
         return -1;
     }
     butil::IOPortal body;
-    if (ep->ReadFromFd(&body, pb_size) < 0) {
+    if (io->ReadExact(&body, pb_size) < 0) {
         return -1;
     }
 
@@ -345,7 +348,7 @@ int ReadAndParseV3Hello(RdmaEndpoint* ep, RdmaHello* out) {
     return 0;
 }
 
-int WriteV3Hello(RdmaEndpoint* ep, const RdmaHello& msg) {
+int WriteV3Hello(handshake::SocketHandshakeIO* io, const RdmaHello& msg) {
     uint32_t pb_size = static_cast<uint32_t>(msg.ByteSizeLong());
     if (pb_size > HELLO_V3_MAX_PB_SIZE) {
         errno = EPROTO;
@@ -363,7 +366,7 @@ int WriteV3Hello(RdmaEndpoint* ep, const RdmaHello& msg) {
         errno = EPROTO;
         return -1;
     }
-    return ep->WriteToFd(&packet);
+    return io->WriteAll(&packet);
 }
 
 void TranslateHello(const RdmaHello& msg, ParsedHello* out) {
@@ -402,12 +405,12 @@ int RdmaHandshakeClientV3::SendLocalHello() {
 
     RdmaHello local_msg{};
     v3_wire::FillLocalRdmaHello(_ep, &local_msg);
-    return v3_wire::WriteV3Hello(_ep, local_msg);
+    return v3_wire::WriteV3Hello(_io, local_msg);
 }
 
 RemoteHelloResult RdmaHandshakeClientV3::ReceiveAndParseRemoteHello(ParsedHello* remote) {
     uint8_t magic[HELLO_MAGIC_LEN];
-    if (_ep->ReadFromFd(magic, HELLO_MAGIC_LEN) < 0) {
+    if (_io->ReadExact(magic, HELLO_MAGIC_LEN) < 0) {
         return RemoteHelloResult::ERROR;
     }
     if (memcmp(magic, HELLO_MAGIC_V3, HELLO_MAGIC_LEN) != 0) {
@@ -416,7 +419,7 @@ RemoteHelloResult RdmaHandshakeClientV3::ReceiveAndParseRemoteHello(ParsedHello*
     }
 
     RdmaHello remote_msg{};
-    if (v3_wire::ReadAndParseV3Hello(_ep, &remote_msg) < 0) {
+    if (v3_wire::ReadAndParseV3Hello(_io, &remote_msg) < 0) {
         return RemoteHelloResult::ERROR;
     }
     if (!v3_wire::ValidRdmaHello(remote_msg)) {
@@ -482,28 +485,30 @@ int RdmaHandshakeServerV3::SendLocalHello() {
     } else {
         v3_wire::FillLocalRdmaHello(_ep, &local_msg);
     }
-    return v3_wire::WriteV3Hello(_ep, local_msg);
+    return v3_wire::WriteV3Hello(_io, local_msg);
 }
 
-std::unique_ptr<RdmaHandshake> CreateClientHandshake(RdmaEndpoint* ep) {
+std::unique_ptr<RdmaHandshake> CreateClientHandshake(
+    RdmaEndpoint* ep, handshake::SocketHandshakeIO* io) {
     switch (FLAGS_rdma_client_handshake_version) {
     case 3:
-        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV3(ep));
+        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV3(ep, io));
     case 2:
     default:
-        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV2(ep));
+        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV2(ep, io));
     }
 }
 
 std::unique_ptr<RdmaHandshake> CreateServerHandshakeByMagic(
-    RdmaEndpoint* ep, butil::IOBuf* source, const uint8_t magic[HELLO_MAGIC_LEN]) {
+    RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, butil::IOBuf* source,
+    const uint8_t magic[HELLO_MAGIC_LEN]) {
     if (memcmp(magic, HELLO_MAGIC, HELLO_MAGIC_LEN) == 0) {
         return std::unique_ptr<RdmaHandshake>(
-                new RdmaHandshakeServerV2(ep, source));
+                new RdmaHandshakeServerV2(ep, io, source));
     }
     if (memcmp(magic, HELLO_MAGIC_V3, HELLO_MAGIC_LEN) == 0) {
         return std::unique_ptr<RdmaHandshake>(
-                new RdmaHandshakeServerV3(ep, source));
+                new RdmaHandshakeServerV3(ep, io, source));
     }
     return NULL;
 }

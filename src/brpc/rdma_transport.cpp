@@ -17,11 +17,17 @@
 
 #if BRPC_WITH_RDMA
 
+#include <unistd.h>
+
 #include "brpc/rdma_transport.h"
+#include "butil/sys_byteorder.h"
 #include "brpc/event_dispatcher.h"
 #include "brpc/tcp_transport.h"
 #include "brpc/input_messenger.h"
 #include "brpc/rdma/rdma_endpoint.h"
+#include "brpc/rdma/rdma_handshake.h"
+#include "brpc/rdma/rdma_handshake_constants.h"
+#include "brpc/rdma/rdma_handshake_server.h"
 #include "brpc/rdma/rdma_helper.h"
 
 namespace brpc {
@@ -30,8 +36,292 @@ DECLARE_bool(usercode_in_pthread);
 
 extern SocketVarsCollector *g_vars;
 
+namespace rdma {
+
+DECLARE_bool(rdma_trace_verbose);
+
+void RdmaConnect::StartConnect(const Socket* socket,
+                               void (*done)(int err, void* data),
+                               void* data) {
+    RdmaTransport* transport =
+        static_cast<RdmaTransport*>(socket->_transport.get());
+    CHECK(transport->_rdma_ep != NULL);
+    SocketUniquePtr ptr;
+    if (Socket::Address(socket->id(), &ptr) != 0) {
+        return;
+    }
+    if (!IsRdmaAvailable()) {
+        transport->_handshake.PublishFallback([transport]() {
+            transport->_rdma_state = RdmaTransport::RDMA_OFF;
+        });
+        done(0, data);
+        return;
+    }
+    _done = done;
+    _data = data;
+    bthread_t tid;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "RdmaProcessHandshakeAtClient");
+    if (bthread_start_background(&tid, &attr,
+                                 RdmaTransport::ProcessHandshakeAtClient,
+                                 transport) < 0) {
+        LOG(FATAL) << "Fail to start handshake bthread";
+        Run();
+    } else {
+        ptr.release();
+    }
+}
+
+void RdmaConnect::StopConnect(Socket*) {}
+
+void RdmaConnect::Run() {
+    _done(errno, _data);
+}
+
+}  // namespace rdma
+
+void RdmaTransport::OnNewDataFromTcp(Socket* socket) {
+    RdmaTransport* transport =
+        static_cast<RdmaTransport*>(socket->_transport.get());
+    CHECK(transport->_rdma_ep != NULL);
+
+    int progress = Socket::PROGRESS_INIT;
+    while (true) {
+        // Acquire pairs with PublishFallback's release store. In particular,
+        // RDMA_OFF is visible before InputMessenger resumes TCP parsing.
+        const int state = transport->_handshake.phase();
+        if (state == UNINIT) {
+            // The client handshake bthread has not started yet.
+        } else if (state < ESTABLISHED) {
+            transport->_handshake.NotifyReadable();
+        } else if (state == FALLBACK_TCP) {
+            InputMessenger::OnNewMessages(socket);
+            return;
+        } else if (state == ESTABLISHED) {
+            uint8_t byte;
+            const ssize_t nr = read(socket->fd(), &byte, 1);
+            if (nr == 0) {
+                socket->SetEOF();
+                return;
+            }
+            if (nr > 0) {
+                socket->SetFailed(EPROTO, "Read unexpected data from %s",
+                                  socket->description().c_str());
+                return;
+            }
+            if (errno != EAGAIN) {
+                const int saved_errno = errno;
+                socket->SetFailed(saved_errno, "Fail to read from %s: %s",
+                                  socket->description().c_str(),
+                                  berror(saved_errno));
+                return;
+            }
+        }
+        if (!socket->MoreReadEvents(&progress)) {
+            break;
+        }
+    }
+}
+
+void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
+    RdmaTransport* transport = static_cast<RdmaTransport*>(arg);
+    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
+    SocketUniquePtr socket(transport->_socket);
+    rdma::RdmaConnect::RunGuard guard(
+        static_cast<rdma::RdmaConnect*>(socket->_app_connect.get()));
+
+    LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
+        << "Start handshake on " << socket->description();
+
+    std::unique_ptr<rdma::RdmaHandshake> handshake =
+        rdma::CreateClientHandshake(ep, &transport->_handshake);
+    CHECK(handshake != NULL);
+    transport->_handshake_version = handshake->ProtocolVersion();
+
+    transport->_handshake.SetPhase(C_ALLOC_QPCQ);
+    if (ep->AllocateResources() < 0) {
+        PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
+                      << socket->description();
+        // Resource preparation is transactional (see #3424): partial RDMA
+        // resources are cleaned by AllocateResources and TCP remains usable.
+        errno = 0;
+        transport->_handshake.PublishFallback([transport]() {
+            transport->_rdma_state = RDMA_OFF;
+        });
+        return NULL;
+    }
+
+    transport->_handshake.SetPhase(C_HELLO_SEND);
+    if (handshake->SendLocalHello() < 0) {
+        const int saved_errno = errno;
+        socket->SetFailed(saved_errno,
+                          "Fail to complete rdma handshake from %s: %s",
+                          socket->description().c_str(), berror(saved_errno));
+        transport->_handshake.MarkFailed();
+        return NULL;
+    }
+
+    transport->_handshake.SetPhase(C_HELLO_WAIT);
+    rdma::ParsedHello remote{};
+    const rdma::RemoteHelloResult result =
+        handshake->ReceiveAndParseRemoteHello(&remote);
+    if (result == rdma::RemoteHelloResult::ERROR) {
+        const int saved_errno = errno;
+        socket->SetFailed(saved_errno,
+                          "Fail to complete rdma handshake from %s: %s",
+                          socket->description().c_str(), berror(saved_errno));
+        transport->_handshake.MarkFailed();
+        return NULL;
+    }
+
+    if (result != rdma::RemoteHelloResult::NEGOTIATED) {
+        transport->_rdma_state = RDMA_OFF;
+    } else {
+        ep->ApplyRemoteHello(remote);
+        transport->_handshake.SetPhase(C_BRINGUP_QP);
+        if (ep->BringUpQp(remote, false) < 0) {
+            LOG(WARNING) << "Fail to bringup QP, fallback to tcp:"
+                         << socket->description();
+            transport->_rdma_state = RDMA_OFF;
+        } else {
+            transport->_rdma_state = RDMA_ON;
+        }
+    }
+
+    transport->_handshake.SetPhase(C_ACK_SEND);
+    const bool rdma_on = transport->_rdma_state == RDMA_ON;
+    const uint32_t flags_be = butil::HostToNet32(
+        rdma_on ? rdma::HELLO_ACK_RDMA_OK : 0);
+    if (transport->_handshake.WriteAll(&flags_be, rdma::HELLO_ACK_LEN) < 0) {
+        const int saved_errno = errno;
+        socket->SetFailed(saved_errno,
+                          "Fail to complete rdma handshake from %s: %s",
+                          socket->description().c_str(), berror(saved_errno));
+        transport->_handshake.MarkFailed();
+        return NULL;
+    }
+
+    if (rdma_on) {
+        transport->_handshake.MarkEstablished();
+        LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
+            << "Client handshake ends (use rdma v"
+            << transport->_handshake_version << ") on "
+            << socket->description();
+    } else {
+        transport->_handshake.PublishFallback([transport]() {
+            transport->_rdma_state = RDMA_OFF;
+        });
+        LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
+            << "Client handshake ends (use tcp) on " << socket->description();
+    }
+    errno = 0;
+    return NULL;
+}
+
+ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
+                                                   Socket* socket) {
+    RdmaTransport* transport =
+        static_cast<RdmaTransport*>(socket->_transport.get());
+    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
+    CHECK(ep != NULL);
+
+    if (socket->parsing_context() == NULL) {
+        if (source->size() < rdma::HELLO_MAGIC_LEN) {
+            return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+        }
+        uint8_t magic[rdma::HELLO_MAGIC_LEN];
+        CHECK_EQ(source->copy_to(magic, sizeof(magic)), sizeof(magic));
+        std::unique_ptr<rdma::RdmaHandshake> handshake =
+            rdma::CreateServerHandshakeByMagic(
+                ep, &transport->_handshake, source, magic);
+        if (handshake == NULL) {
+            return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+        }
+        transport->_handshake_version = handshake->ProtocolVersion();
+        transport->_handshake.SetPhase(S_HELLO_WAIT);
+
+        rdma::ParsedHello remote{};
+        const rdma::RemoteHelloResult result =
+            handshake->ReceiveAndParseRemoteHello(&remote);
+        if (result == rdma::RemoteHelloResult::NEED_MORE) {
+            return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+        }
+        if (result == rdma::RemoteHelloResult::ERROR) {
+            transport->_handshake.MarkFailed();
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+
+        bool negotiated = result == rdma::RemoteHelloResult::NEGOTIATED;
+        if (negotiated) {
+            ep->ApplyRemoteHello(remote);
+            transport->_handshake.SetPhase(S_ALLOC_QPCQ);
+            if (ep->AllocateResources() < 0) {
+                PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
+                              << socket->description();
+                negotiated = false;
+            } else {
+                transport->_handshake.SetPhase(S_BRINGUP_QP);
+                if (ep->BringUpQp(remote, true) < 0) {
+                    negotiated = false;
+                }
+            }
+        }
+        if (!negotiated) {
+            transport->_rdma_state = RDMA_OFF;
+        }
+
+        transport->_handshake.SetPhase(S_HELLO_SEND);
+        if (handshake->SendLocalHello() < 0) {
+            transport->_handshake.MarkFailed();
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+        socket->reset_parsing_context(rdma::ServerHandshakeContext::Create());
+        transport->_handshake.SetPhase(S_ACK_WAIT);
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+    }
+
+    if (source->size() < rdma::HELLO_ACK_LEN) {
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+    }
+    uint32_t flags_be = 0;
+    CHECK_EQ(source->cutn(&flags_be, rdma::HELLO_ACK_LEN),
+             rdma::HELLO_ACK_LEN);
+    const bool client_ack_ok =
+        (butil::NetToHost32(flags_be) & rdma::HELLO_ACK_RDMA_OK) != 0;
+    if (!client_ack_ok) {
+        // Keep any coalesced RPC bytes in source. After the release-published
+        // fallback, InputMessenger will continue parsing them as TCP data.
+        transport->_handshake.PublishFallback([transport]() {
+            transport->_rdma_state = RDMA_OFF;
+        });
+        socket->reset_parsing_context(NULL);
+        return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+    }
+
+    if (!source->empty()) {
+        // A successful RDMA upgrade must not carry application bytes on the
+        // TCP control connection after the ACK.
+        transport->_handshake.MarkFailed();
+        socket->reset_parsing_context(NULL);
+        return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+    }
+
+    if (transport->_rdma_state == RDMA_OFF) {
+        transport->_handshake.MarkFailed();
+        socket->reset_parsing_context(NULL);
+        return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+    }
+
+    transport->_rdma_state = RDMA_ON;
+    transport->_handshake.MarkEstablished();
+    socket->reset_parsing_context(NULL);
+    return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+}
+
 void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
     CHECK(_rdma_ep == NULL);
+    _handshake.Reset(socket);
+    _handshake_version = 0;
     if (options.socket_mode == SOCKET_MODE_RDMA) {
         _rdma_ep = new(std::nothrow)rdma::RdmaEndpoint(socket);
         if (!_rdma_ep) {
@@ -52,10 +342,10 @@ void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
         // Server-side RDMA sockets drive the handshake through the standard
         // InputMessenger path (ParseRdmaHandshake), so they use OnNewMessages
         // just like TCP sockets. Only client-side sockets, whose handshake
-        // (ProcessHandshakeAtClient) is an active blocking bthread relying on
-        // _read_butex woken by OnNewDataFromTcp, still need OnNewDataFromTcp.
+        // ProcessHandshakeAtClient is an active blocking bthread relying on
+        // SocketHandshakeIO being woken by OnNewDataFromTcp.
         if (options.user == static_cast<SocketUser*>(get_client_side_messenger())) {
-            _on_edge_trigger = rdma::RdmaEndpoint::OnNewDataFromTcp;
+            _on_edge_trigger = RdmaTransport::OnNewDataFromTcp;
         } else {
             _on_edge_trigger = InputMessenger::OnNewMessages;
         }
@@ -77,6 +367,8 @@ int RdmaTransport::Reset(int32_t expected_nref) {
         _rdma_ep->Reset();
         _rdma_state = RDMA_UNKNOWN;
     }
+    _handshake.Reset(_socket);
+    _handshake_version = 0;
     return 0;
 }
 
@@ -193,6 +485,25 @@ void RdmaTransport::Debug(std::ostream &os) {
     if (_rdma_state == RDMA_ON && _rdma_ep) {
         _rdma_ep->DebugInfo(os);
     }
+    const char* state = "UNKNOWN";
+    switch (_handshake.phase(butil::memory_order_relaxed)) {
+    case UNINIT: state = "UNINIT"; break;
+    case C_ALLOC_QPCQ: state = "C_ALLOC_QPCQ"; break;
+    case C_HELLO_SEND: state = "C_HELLO_SEND"; break;
+    case C_HELLO_WAIT: state = "C_HELLO_WAIT"; break;
+    case C_BRINGUP_QP: state = "C_BRINGUP_QP"; break;
+    case C_ACK_SEND: state = "C_ACK_SEND"; break;
+    case S_HELLO_WAIT: state = "S_HELLO_WAIT"; break;
+    case S_ALLOC_QPCQ: state = "S_ALLOC_QPCQ"; break;
+    case S_BRINGUP_QP: state = "S_BRINGUP_QP"; break;
+    case S_HELLO_SEND: state = "S_HELLO_SEND"; break;
+    case S_ACK_WAIT: state = "S_ACK_WAIT"; break;
+    case ESTABLISHED: state = "ESTABLISHED"; break;
+    case FALLBACK_TCP: state = "FALLBACK_TCP"; break;
+    case FAILED: state = "FAILED"; break;
+    }
+    os << "\nhandshake_state=" << state
+       << "\nhandshake_version=" << _handshake_version;
 }
 
 int RdmaTransport::ContextInitOrDie(bool serverOrNot, const void* _options) {

@@ -124,16 +124,13 @@ std::string HelloMessage::toString() const {
 UBShmEndpoint::UBShmEndpoint(Socket* s)
     : _socket(s)
     , _socket_id(s ? s->id() : INVALID_SOCKET_ID)
-    , _state(UNINIT)
     , _ub_ring(nullptr)
     , _cq_sid(INVALID_SOCKET_ID)
 {
-    _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
 }
 
 UBShmEndpoint::~UBShmEndpoint() {
     Reset();
-    bthread::butex_destroy(_read_butex);
 }
 
 void UBShmEndpoint::Reset() {
@@ -142,7 +139,6 @@ void UBShmEndpoint::Reset() {
     delete _ub_ring;
     _ub_ring = nullptr;
     _cq_sid = INVALID_SOCKET_ID;
-    _state = UNINIT;
 }
 
 void UBConnect::StartConnect(const Socket* socket,
@@ -155,8 +151,9 @@ void UBConnect::StartConnect(const Socket* socket,
         return;
     }
     if (!IsUBAvailable()) {
-        ub_transport->_ub_ep->_state = UBShmEndpoint::FALLBACK_TCP;
-        ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        ub_transport->_handshake.PublishFallback([ub_transport]() {
+            ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        });
         done(0, data);
         return;
     }
@@ -166,7 +163,7 @@ void UBConnect::StartConnect(const Socket* socket,
     bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
     bthread_attr_set_name(&attr, "UBProcessHandshakeAtClient");
     if (bthread_start_background(&tid, &attr,
-                UBShmEndpoint::ProcessHandshakeAtClient, ub_transport->_ub_ep) < 0) {
+                UBShmTransport::ProcessHandshakeAtClient, ub_transport) < 0) {
         LOG(FATAL) << "Fail to start handshake bthread";
         Run();
     } else {
@@ -180,7 +177,13 @@ void UBConnect::Run() {
     _done(errno, _data);
 }
 
-static void TryReadOnTcpDuringRdmaEst(Socket* s) {
+}  // namespace ubring
+
+// Keep the wire constants and endpoint resource implementation in ubring,
+// while the connection-control state machine belongs to the Transport layer.
+using namespace ubring;
+
+static void TryReadOnTcpDuringUbEst(Socket* s) {
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         uint8_t tmp;
@@ -208,29 +211,31 @@ static void TryReadOnTcpDuringRdmaEst(Socket* s) {
     }
 }
 
-void UBShmEndpoint::OnNewDataFromTcp(Socket* m) {
+void UBShmTransport::OnNewDataFromTcp(Socket* m) {
     auto* ub_transport = static_cast<UBShmTransport*>(m->_transport.get());
     UBShmEndpoint* ep = ub_transport->GetUBShmEp();
     CHECK(ep != NULL);
 
     int progress = Socket::PROGRESS_INIT;
     while (true) {
-        if (ep->_state == UNINIT) {
+        const int state = ub_transport->_handshake.phase();
+        if (state == UNINIT) {
             if (!m->CreatedByConnect()) {
                 if (!IsUBAvailable()) {
-                    ep->_state = FALLBACK_TCP;
-                    ub_transport->_ub_state = UBShmTransport::UB_OFF;
+                    ub_transport->_handshake.PublishFallback([ub_transport]() {
+                        ub_transport->_ub_state = UBShmTransport::UB_OFF;
+                    });
                     continue;
                 }
                 bthread_t tid;
-                ep->_state = S_HELLO_WAIT;
+                ub_transport->_handshake.SetPhase(S_HELLO_WAIT);
                 SocketUniquePtr s;
                 m->ReAddress(&s);
                 bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
                 bthread_attr_set_name(&attr, "UBProcessHandshakeAtServer");
                 if (bthread_start_background(&tid, &attr,
-                            ProcessHandshakeAtServer, ep) < 0) {
-                    ep->_state = UNINIT;
+                            ProcessHandshakeAtServer, ub_transport) < 0) {
+                    ub_transport->_handshake.SetPhase(UNINIT);
                     LOG(FATAL) << "Fail to start handshake bthread";
                 } else {
                     s.release();
@@ -240,14 +245,13 @@ void UBShmEndpoint::OnNewDataFromTcp(Socket* m) {
                 // starts handshake. This will be handled by client handshake.
                 // Ignore the exception here.
             }
-        } else if (ep->_state < ESTABLISHED) {  // during handshake
-            ep->_read_butex->fetch_add(1, butil::memory_order_release);
-            bthread::butex_wake(ep->_read_butex);
-        } else if (ep->_state == FALLBACK_TCP){  // handshake finishes
+        } else if (state < ESTABLISHED) {  // during handshake
+            ub_transport->_handshake.NotifyReadable();
+        } else if (state == FALLBACK_TCP){  // handshake finishes
             InputMessenger::OnNewMessages(m);
             return;
-        } else if (ep->_state == ESTABLISHED) {
-            TryReadOnTcpDuringRdmaEst(ep->_socket);
+        } else if (state == ESTABLISHED) {
+            TryReadOnTcpDuringUbEst(ep->_socket);
             return;
         }
         if (!m->MoreReadEvents(&progress)) {
@@ -264,72 +268,20 @@ bool HelloNegotiationValid(HelloMessage& msg) {
     return false;
 }
 
-static const int WAIT_TIMEOUT_MS = 50;
-
-int UBShmEndpoint::ReadFromFd(void* data, size_t len) {
-    CHECK(data != NULL);
-    int nr = 0;
-    size_t received = 0;
-    do {
-        const timespec duetime = butil::milliseconds_from_now(WAIT_TIMEOUT_MS);
-        nr = read(_socket->fd(), (uint8_t*)data + received, len - received);
-        if (nr < 0) {
-            if (errno == EAGAIN) {
-                const int expected_val = _read_butex->load(butil::memory_order_acquire);
-                if (bthread::butex_wait(_read_butex, expected_val, &duetime) < 0) {
-                    if (errno != EWOULDBLOCK && errno != ETIMEDOUT) {
-                        return -1;
-                    }
-                }
-            } else {
-                return -1;
-            }
-        } else if (nr == 0) {
-            errno = EEOF;
-            return -1;
-        } else {
-            received += nr;
-        }
-    } while (received < len);
-    return 0;
-}
-
-int UBShmEndpoint::WriteToFd(void* data, size_t len) {
-    CHECK(data != NULL);
-    int nw = 0;
-    size_t written = 0;
-    do {
-        const timespec duetime = butil::milliseconds_from_now(WAIT_TIMEOUT_MS);
-        nw = write(_socket->fd(), (uint8_t*)data + written, len - written);
-        if (nw < 0) {
-            if (errno == EAGAIN) {
-                if (_socket->WaitEpollOut(_socket->fd(), true, &duetime) < 0) {
-                    if (errno != ETIMEDOUT) {
-                        return -1;
-                    }
-                }
-            } else {
-                return -1;
-            }
-        } else {
-            written += nw;
-        }
-    } while (written < len);
-    return 0;
-}
-
-inline void UBShmEndpoint::TryReadOnTcp() {
+void UBShmTransport::TryReadOnTcp() {
     if (_socket->_nevent.fetch_add(1, butil::memory_order_acq_rel) == 0) {
-        if (_state == FALLBACK_TCP) {
+        const int state = _handshake.phase();
+        if (state == FALLBACK_TCP) {
             InputMessenger::OnNewMessages(_socket);
-        } else if (_state == ESTABLISHED) {
-            TryReadOnTcpDuringRdmaEst(_socket);
+        } else if (state == ESTABLISHED) {
+            TryReadOnTcpDuringUbEst(_socket);
         }
     }
 }
 
-void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
-    UBShmEndpoint* ep = static_cast<UBShmEndpoint*>(arg);
+void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
+    UBShmTransport* ub_transport = static_cast<UBShmTransport*>(arg);
+    UBShmEndpoint* ep = ub_transport->_ub_ep;
     SocketUniquePtr s(ep->_socket);
     UBConnect::RunGuard rg((UBConnect*)s->_app_connect.get());
 
@@ -338,21 +290,22 @@ void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
 
     uint8_t data[g_ub_hello_msg_len];
 
-    ep->_state = C_ALLOC_SHM;
-    auto* ub_transport = static_cast<UBShmTransport*>(s->_transport.get());
+    ub_transport->_handshake.SetPhase(C_ALLOC_SHM);
     size_t local_shm_len = (size_t)(FLAGS_data_queue_size) * MB_TO_BYTE;
     SHM local_trx_shm = {NULL, local_shm_len, 0, {0}, (uint32_t)s->fd()};
     auto shm_name_str = butil::endpoint2str(s->local_side());
     const char* shm_name = shm_name_str.c_str();
     if (ep->AllocateClientResources(&local_trx_shm, shm_name) < 0) {
         LOG(WARNING) << "Fallback to tcp:" << s->description();
-        ub_transport->_ub_state = UBShmTransport::UB_OFF;
-        ep->_state = FALLBACK_TCP;
+        errno = 0;
+        ub_transport->_handshake.PublishFallback([ub_transport]() {
+            ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        });
         return NULL;
     }
 
-    ep->_state = C_HELLO_SEND;
-    HelloMessage local_msg;
+    ub_transport->_handshake.SetPhase(C_HELLO_SEND);
+    HelloMessage local_msg{};
     local_msg.msg_len = g_ub_hello_msg_len;
     local_msg.hello_ver = g_ub_hello_version;
     local_msg.impl_ver = g_ub_impl_version;
@@ -360,49 +313,50 @@ void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
     memcpy(local_msg.shm_name, local_trx_shm.name, SHM_MAX_NAME_BUFF_LEN);
     memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
     local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-    if (ep->WriteToFd(data, g_ub_hello_msg_len) < 0) {
+    if (ub_transport->_handshake.WriteAll(data, g_ub_hello_msg_len) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to send hello message to server:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
     LOG_IF(INFO, FLAGS_ub_trace_verbose) << "client handshake message : " << local_msg.toString();
 
-    ep->_state = C_HELLO_WAIT;
-    if (ep->ReadFromFd(data, MAGIC_STR_LEN) < 0) {
+    ub_transport->_handshake.SetPhase(C_HELLO_WAIT);
+    if (ub_transport->_handshake.ReadExact(data, MAGIC_STR_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to get hello message from server:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
     if (memcmp(data, MAGIC_STR, MAGIC_STR_LEN) != 0) {
         LOG(WARNING) << "Read unexpected data during handshake:" << s->description();
         s->SetFailed(EPROTO, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(EPROTO));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
-    if (ep->ReadFromFd(data, HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) < 0) {
+    if (ub_transport->_handshake.ReadExact(
+            data, HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to get Hello Message from server:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
-    HelloMessage remote_msg;
+    HelloMessage remote_msg{};
     remote_msg.Deserialize(data);
     if (remote_msg.msg_len < HELLO_MSG_LEN_MIN) {
         LOG(WARNING) << "Fail to parse Hello Message length from server:"
                      << s->description();
         s->SetFailed(EPROTO, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(EPROTO));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
@@ -416,7 +370,7 @@ void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
                      << s->description();
         ub_transport->_ub_state = UBShmTransport::UB_OFF;
     } else {
-        ep->_state = C_MAP_REMOTE_SHM;
+        ub_transport->_handshake.SetPhase(C_MAP_REMOTE_SHM);
         if (ep->_ub_ring->UbrMapRemoteShm(&local_trx_shm, shm_name) < 0) {
             LOG(WARNING) << "Fail to map the remote shm, fallback to tcp:" << s->description();
             ub_transport->_ub_state = UBShmTransport::UB_OFF;
@@ -425,29 +379,31 @@ void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
         }
     }
 
-    ep->_state = C_ACK_SEND;
+    ub_transport->_handshake.SetPhase(C_ACK_SEND);
     uint32_t flags = 0;
     if (ub_transport->_ub_state != UBShmTransport::UB_OFF) {
         flags |= ACK_MSG_UB_OK;
     }
     uint32_t* tmp = (uint32_t*)data;
     *tmp = butil::HostToNet32(flags);
-    if (ep->WriteToFd(data, ACK_MSG_LEN) < 0) {
+    if (ub_transport->_handshake.WriteAll(data, ACK_MSG_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to send Ack Message to server:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
     if (ub_transport->_ub_state == UBShmTransport::UB_ON) {
-        ep->_state = ESTABLISHED;
+        ub_transport->_handshake.MarkEstablished();
         ep->_ub_ring->UbrUnlinkLocalShm();
         LOG_IF(INFO, FLAGS_ub_trace_verbose) 
             << "Client handshake ends (use ubring) on " << s->description();
     } else {
-        ep->_state = FALLBACK_TCP;
+        ub_transport->_handshake.PublishFallback([ub_transport]() {
+            ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        });
         LOG_IF(INFO, FLAGS_ub_trace_verbose) 
             << "Client handshake ends (use tcp) on " << s->description();
     }
@@ -457,8 +413,9 @@ void* UBShmEndpoint::ProcessHandshakeAtClient(void* arg) {
     return NULL;
 }
 
-void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
-    UBShmEndpoint* ep = static_cast<UBShmEndpoint*>(arg);
+void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
+    UBShmTransport* ub_transport = static_cast<UBShmTransport*>(arg);
+    UBShmEndpoint* ep = ub_transport->_ub_ep;
     SocketUniquePtr s(ep->_socket);
 
     LOG_IF(INFO, FLAGS_ub_trace_verbose)
@@ -466,37 +423,38 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
 
     uint8_t data[g_ub_hello_msg_len];
 
-    ep->_state = S_HELLO_WAIT;
-    if (ep->ReadFromFd(data, MAGIC_STR_LEN) < 0) {
+    ub_transport->_handshake.SetPhase(S_HELLO_WAIT);
+    if (ub_transport->_handshake.ReadExact(data, MAGIC_STR_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to read Hello Message from client:" << s->description() << " " << s->_remote_side;
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
-    auto* ub_transport = static_cast<UBShmTransport*>(s->_transport.get());
     if (memcmp(data, MAGIC_STR, MAGIC_STR_LEN) != 0) {
         LOG_IF(INFO, FLAGS_ub_trace_verbose) << "It seems that the "
             << "client does not use RDMA, fallback to TCP:"
             << s->description();
         s->_read_buf.append(data, MAGIC_STR_LEN);
-        ep->_state = FALLBACK_TCP;
-        ub_transport->_ub_state = UBShmTransport::UB_OFF;
-        ep->TryReadOnTcp();
+        ub_transport->_handshake.PublishFallback([ub_transport]() {
+            ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        });
+        ub_transport->TryReadOnTcp();
         return NULL;
     }
 
-    if (ep->ReadFromFd(data, g_ub_hello_msg_len - MAGIC_STR_LEN) < 0) {
+    if (ub_transport->_handshake.ReadExact(
+            data, g_ub_hello_msg_len - MAGIC_STR_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to read Hello Message from client:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
-    HelloMessage remote_msg;
+    HelloMessage remote_msg{};
     remote_msg.Deserialize(data);
     LOG_IF(INFO, FLAGS_ub_trace_verbose) << "server receive handshake message : " << remote_msg.toString();
     if (remote_msg.msg_len < HELLO_MSG_LEN_MIN) {
@@ -504,7 +462,7 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
                      << s->description();
         s->SetFailed(EPROTO, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(EPROTO));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
     if (remote_msg.msg_len > HELLO_MSG_LEN_MIN) {
@@ -517,7 +475,7 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
                      << s->description();
         ub_transport->_ub_state = UBShmTransport::UB_OFF;
     } else {
-        ep->_state = S_ALLOC_SHM;
+        ub_transport->_handshake.SetPhase(S_ALLOC_SHM);
         ubring::SHM remote_trx_shm = {NULL, remote_msg.len, 0, {0}, (uint32_t)ep->_socket->fd()};
         strncpy(remote_trx_shm.name, remote_msg.shm_name, SHM_MAX_NAME_BUFF_LEN);
 
@@ -544,8 +502,8 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
     }
 
-    ep->_state = S_HELLO_SEND;
-    HelloMessage local_msg;
+    ub_transport->_handshake.SetPhase(S_HELLO_SEND);
+    HelloMessage local_msg{};
     local_msg.msg_len = g_ub_hello_msg_len;
     if (ub_transport->_ub_state == UBShmTransport::UB_OFF) {
         local_msg.impl_ver = 0;
@@ -558,22 +516,22 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
     }
     memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
     local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-    if (ep->WriteToFd(data, g_ub_hello_msg_len) < 0) {
+    if (ub_transport->_handshake.WriteAll(data, g_ub_hello_msg_len) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to send Hello Message to client:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ub handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
-    ep->_state = S_ACK_WAIT;
-    if (ep->ReadFromFd(data, ACK_MSG_LEN) < 0) {
+    ub_transport->_handshake.SetPhase(S_ACK_WAIT);
+    if (ub_transport->_handshake.ReadExact(data, ACK_MSG_LEN) < 0) {
         const int saved_errno = errno;
         PLOG(WARNING) << "Fail to read ack message from client:" << s->description();
         s->SetFailed(saved_errno, "Fail to complete ubring handshake from %s: %s",
                 s->description().c_str(), berror(saved_errno));
-        ep->_state = FAILED;
+        ub_transport->_handshake.MarkFailed();
         return NULL;
     }
 
@@ -585,25 +543,28 @@ void* UBShmEndpoint::ProcessHandshakeAtServer(void* arg) {
                          << s->description();
             s->SetFailed(EPROTO, "Fail to complete ub handshake from %s: %s",
                     s->description().c_str(), berror(EPROTO));
-            ep->_state = FAILED;
+            ub_transport->_handshake.MarkFailed();
             return NULL;
         } else {
             ub_transport->_ub_state = UBShmTransport::UB_ON;
-            ep->_state = ESTABLISHED;
+            ub_transport->_handshake.MarkEstablished();
             ep->_ub_ring->UbrUnlinkLocalShm();
             LOG_IF(INFO, FLAGS_ub_trace_verbose) 
                 << "Server handshake ends (use ubring) on " << s->description();
         }
     } else {
-        ub_transport->_ub_state = UBShmTransport::UB_OFF;
-        ep->_state = FALLBACK_TCP;
+        ub_transport->_handshake.PublishFallback([ub_transport]() {
+            ub_transport->_ub_state = UBShmTransport::UB_OFF;
+        });
         LOG_IF(INFO, FLAGS_ub_trace_verbose) 
             << "Server handshake ends (use tcp) on " << s->description();
     }
-    ep->TryReadOnTcp();
+    ub_transport->TryReadOnTcp();
 
     return NULL;
 }
+
+namespace ubring {
 
 bool UBShmEndpoint::IsWritable() const {
     if (BAIDU_UNLIKELY(g_skip_ub_init)) {
@@ -679,11 +640,22 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM* local_trx_shm, const cha
     options.user = this;
     options.keytable_pool = _socket->_keytable_pool;
     if (Socket::Create(options, &_cq_sid) < 0) {
+        const int saved_errno = errno;
         PLOG(WARNING) << "Fail to create socket for cq";
+        delete _ub_ring;
+        _ub_ring = NULL;
+        _cq_sid = INVALID_SOCKET_ID;
+        errno = saved_errno;
         return -1;
     }
     int ret = _ub_ring->UbrAllocateLocalShm(local_trx_shm, shm_name);
     if (ret != 0) {
+        const int saved_errno = errno;
+        DeallocateResources();
+        delete _ub_ring;
+        _ub_ring = NULL;
+        _cq_sid = INVALID_SOCKET_ID;
+        errno = saved_errno;
         return ret;
     }
     PollerRegisterEvent(CqSidOp::ADD, EPOLLIN);
@@ -704,11 +676,22 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM* remote_trx_shm, ubring::
     options.user = this;
     options.keytable_pool = _socket->_keytable_pool;
     if (Socket::Create(options, &_cq_sid) < 0) {
+        const int saved_errno = errno;
         PLOG(WARNING) << "Fail to create socket for cq";
+        delete _ub_ring;
+        _ub_ring = NULL;
+        _cq_sid = INVALID_SOCKET_ID;
+        errno = saved_errno;
         return -1;
     }
     int ret = _ub_ring->UbrAllocateServerShm(remote_trx_shm, local_trx_shm);
     if (ret != 0) {
+        const int saved_errno = errno;
+        DeallocateResources();
+        delete _ub_ring;
+        _ub_ring = NULL;
+        _cq_sid = INVALID_SOCKET_ID;
+        errno = saved_errno;
         return ret;
     }
     // TODO mwj should polling start after the connection is established?

@@ -22,6 +22,7 @@
 #include "brpc/socket.h"
 #include "brpc/channel.h"
 #include "brpc/transport.h"
+#include "brpc/transport_handshake.h"
 
 namespace brpc {
 class RdmaTransport : public Transport {
@@ -31,6 +32,23 @@ friend class rdma::RdmaConnect;
 friend class rdma::RdmaHandshakeServerV2;
 friend class rdma::RdmaHandshakeServerV3;
 public:
+    enum HandshakeState {
+        UNINIT = 0x0,
+        C_ALLOC_QPCQ = 0x1,
+        C_HELLO_SEND = 0x2,
+        C_HELLO_WAIT = 0x3,
+        C_BRINGUP_QP = 0x4,
+        C_ACK_SEND = 0x5,
+        S_HELLO_WAIT = 0x11,
+        S_ALLOC_QPCQ = 0x12,
+        S_BRINGUP_QP = 0x13,
+        S_HELLO_SEND = 0x14,
+        S_ACK_WAIT = 0x15,
+        ESTABLISHED = handshake::ESTABLISHED,
+        FALLBACK_TCP = handshake::FALLBACK_TCP,
+        FAILED = handshake::FAILED
+    };
+
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;
     int Reset(int32_t expected_nref) override;
@@ -45,7 +63,17 @@ public:
         CHECK(_rdma_ep != NULL);
         return _rdma_ep;
     }
+    int handshake_phase() const {
+        return _handshake.phase();
+    }
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
+
+    // TCP control-plane callbacks. The endpoint is intentionally absent from
+    // these entry points and only participates through resource operations.
+    static void OnNewDataFromTcp(Socket* socket);
+    static void* ProcessHandshakeAtClient(void* arg);
+    static ParseResult ExecuteServerHandshake(butil::IOBuf* source,
+                                              Socket* socket);
 private:
     static bool OptionsAvailableForRdma(const ChannelOptions* opt);
     static bool OptionsAvailableOverRdma(const ServerOptions* opt);
@@ -61,6 +89,8 @@ private:
     // Should use RDMA or not
     RdmaState _rdma_state;
     std::shared_ptr<TcpTransport>  _tcp_transport;
+    handshake::SocketHandshakeIO _handshake;
+    int _handshake_version = 0;
 };
 } // namespace brpc
 #endif // BRPC_WITH_RDMA

@@ -21,6 +21,7 @@
 #include "brpc/socket.h"
 #include "brpc/channel.h"
 #include "brpc/transport.h"
+#include "brpc/transport_handshake.h"
 
 namespace brpc {
 class UBShmTransport : public Transport {
@@ -28,6 +29,22 @@ class UBShmTransport : public Transport {
     friend class ubring::UBShmEndpoint;
 friend class ubring::UBConnect;
 public:
+    enum HandshakeState {
+        UNINIT = 0x0,
+        C_ALLOC_SHM = 0x1,
+        C_HELLO_SEND = 0x2,
+        C_HELLO_WAIT = 0x3,
+        C_MAP_REMOTE_SHM = 0x4,
+        C_ACK_SEND = 0x5,
+        S_HELLO_WAIT = 0x11,
+        S_ALLOC_SHM = 0x12,
+        S_HELLO_SEND = 0x13,
+        S_ACK_WAIT = 0x14,
+        ESTABLISHED = handshake::ESTABLISHED,
+        FALLBACK_TCP = handshake::FALLBACK_TCP,
+        FAILED = handshake::FAILED
+    };
+
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;
     int Reset(int32_t expected_nref) override;
@@ -43,6 +60,9 @@ public:
         return _ub_ep;
     }
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
+    static void OnNewDataFromTcp(Socket* socket);
+    static void* ProcessHandshakeAtClient(void* arg);
+    static void* ProcessHandshakeAtServer(void* arg);
 private:
     static bool OptionsAvailableForUB(const ChannelOptions* opt);
     static bool OptionsAvailableOverUB(const ServerOptions* opt);
@@ -58,6 +78,9 @@ private:
     // Should use UB or not
     UBState _ub_state;
     std::shared_ptr<TcpTransport>  _tcp_transport;
+    handshake::SocketHandshakeIO _handshake;
+
+    void TryReadOnTcp();
 };
 } // namespace brpc
 #endif // BRPC_WITH_UBRING

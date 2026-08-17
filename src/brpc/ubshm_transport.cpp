@@ -30,6 +30,7 @@ extern SocketVarsCollector *g_vars;
 
 void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
     CHECK(_ub_ep == NULL);
+    _handshake.Reset(socket);
     if (options.socket_mode == SOCKET_MODE_UBRING) {
         _ub_ep = new(std::nothrow)ubring::UBShmEndpoint(socket);
         if (!_ub_ep) {
@@ -47,7 +48,7 @@ void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
     _default_connect = options.app_connect;
     _on_edge_trigger = options.on_edge_triggered_events;
     if (options.need_on_edge_trigger && _on_edge_trigger == NULL) {
-        _on_edge_trigger = ubring::UBShmEndpoint::OnNewDataFromTcp;
+        _on_edge_trigger = UBShmTransport::OnNewDataFromTcp;
     }
     _tcp_transport = std::make_shared<TcpTransport>();
     _tcp_transport->Init(socket, options);
@@ -66,6 +67,7 @@ int UBShmTransport::Reset(int32_t expected_nref) {
         _ub_ep->Reset();
         _ub_state = UB_UNKNOWN;
     }
+    _handshake.Reset(_socket);
     return 0;
 }
 
@@ -77,7 +79,7 @@ std::shared_ptr<AppConnect> UBShmTransport::Connect() {
 }
 
 int UBShmTransport::CutFromIOBuf(butil::IOBuf *buf) {
-    if (_ub_ep && _ub_state != UB_OFF) {
+    if (_ub_ep && _ub_state == UB_ON) {
         butil::IOBuf *data_arr[1] = {buf};
         return _ub_ep->CutFromIOBufList(data_arr, 1);
     } else {
@@ -86,7 +88,7 @@ int UBShmTransport::CutFromIOBuf(butil::IOBuf *buf) {
 }
 
 ssize_t UBShmTransport::CutFromIOBufList(butil::IOBuf **buf, size_t ndata) {
-    if (_ub_ep && _ub_state != UB_OFF) {
+    if (_ub_ep && _ub_state == UB_ON) {
         return _ub_ep->CutFromIOBufList(buf, ndata);
     }
     return _tcp_transport->CutFromIOBufList(buf, ndata);

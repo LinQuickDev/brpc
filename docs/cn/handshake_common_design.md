@@ -724,7 +724,7 @@ Hello valid
 
 ### 风险一：公共抽象过度绑定 Socket
 
-规避：公共组件只使用 `HandshakeIO`/`HandshakeInput`，不直接包含 `brpc/socket.h`。
+规避：状态发布和协议 adapter 不依赖 Endpoint；仅最外层 `SocketHandshakeIO` 适配器持有非 owning `Socket*`，集中封装 fd 等待与读写。后续如需脱离 brpc Socket 测试，可在该适配器之下再拆纯虚 `HandshakeIO`。
 
 ### 风险二：混淆不同长度字段语义
 
@@ -751,4 +751,52 @@ RDMA/URMA/UBSHM 的长度字段并不完全相同。规避：使用 `FrameSpec::
 私有：Hello payload、版本语义、资源协商、QP/Jetty/SHM 创建、数据面 completion
 ```
 
-实施上优先从 UBSHM 固定长度握手开始，再迁移 URMA 和 RDMA。这样可以先验证公共组件的接口，不需要一开始处理 RDMA/URMA 的 protobuf、多版本和复杂资源依赖。
+实施上以当前 RDMA 握手状态机为基线：先保留 #3350 已接入的标准 server 协议解析流程，再迁移 UBSHM，最后在 URMA 分支重新基于公共接口适配。这样可以直接继承已经过社区修复和测试的 fallback 语义。
+
+## 14. 方案 B 第一版实现约束
+
+第一版新增 `src/brpc/transport_handshake.*`，由 Transport 持有握手状态和 TCP 控制面 I/O：
+
+```mermaid
+flowchart LR
+    S["Socket"] --> T["RdmaTransport / UBShmTransport"]
+    T --> TCP["TcpTransport\n默认 active / fallback"]
+    T --> H["SocketHandshakeIO\nphase + ReadExact + WriteAll"]
+    T --> E["Endpoint\n资源准备与数据面"]
+    H -->|"NEGOTIATED"| E
+    H -->|"FALLBACK_TCP"| TCP
+    E -. "不再持有 handshake state、read butex 或 TCP fd I/O" .-> T
+```
+
+具体边界如下：
+
+- `RdmaTransport` 持有 client/server 状态机；server 继续通过 #3350 引入的 bRPC 标准协议解析流程执行增量握手。
+- `UBShmTransport` 持有 client/server 状态机；`UBShmEndpoint` 只保留 SHM/ring 资源和数据面操作。后续可把 UBSHM server 固定帧接入同一标准 parser。
+- `RdmaHandshake` 仍负责 v2/v3 wire codec，但 TCP 读写改为依赖 Transport 提供的公共 `SocketHandshakeIO`，不再调用 `RdmaEndpoint::ReadFromFd/WriteToFd`。
+- origin/master 暂无受版本控制的 URMA Transport；URMA 合入或 rebase 后只需按相同边界注入 `SocketHandshakeIO` 并把状态机移到 `UrmaTransport`，不应提交本地未跟踪的旧实现。
+
+### 14.1 必须继承的修复语义
+
+| 修复 | 公共约束 | 第一版落点 |
+|---|---|---|
+| #3347 | fallback 状态必须原子发布，事件线程用 acquire 读取 | `SocketHandshakeIO::PublishFallback/phase` |
+| #3406 | 必须先发布 Transport 的 TCP active/off 状态，再 release 发布 `FALLBACK_TCP` | `PublishFallback` 回调先执行，随后 release store |
+| #3424 | 高速资源准备失败是可降级错误；清理部分资源并保持 TCP 可用 | RDMA 保留事务式 `AllocateResources`；UBSHM 失败路径补充资源清理 |
+| #3425 | CQ re-arm 后同时补 poll send/recv CQ | 保留在 RDMA Endpoint 数据面，不移入握手组件 |
+| #3427 | 外部 Bazel workspace 下生成规则不能依赖主仓布局 | 公共实现不新增 proto；源码通过现有递归 glob 收录 |
+
+### 14.2 状态发布规则
+
+成功升级和回退只能由 Transport 发布：
+
+```cpp
+// Fallback: publish TCP selection first, then release-publish terminal phase.
+handshake.PublishFallback([transport]() {
+    transport->SetHighSpeedOff();
+});
+
+// Success: all endpoint resources are ready before publishing ESTABLISHED.
+handshake.MarkEstablished();
+```
+
+事件线程必须通过 acquire load 读取 phase。看到 `FALLBACK_TCP` 后可以直接恢复 `InputMessenger`；看到 `ESTABLISHED` 后才允许发送和接收高速数据。`UNKNOWN/NEGOTIATING` 状态不得路由到 Endpoint 数据面。

@@ -22,26 +22,17 @@
 #include <string.h>
 #include "butil/iobuf.h"
 #include "butil/logging.h"
-#include "butil/object_pool.h"
 #include "butil/raw_pack.h"
 #include "butil/sys_byteorder.h"
 #include "brpc/socket.h"
 #include "brpc/rdma/rdma_handshake.pb.h"
 #include "brpc/rdma/rdma_handshake_constants.h"
 #if BRPC_WITH_RDMA
-#include "brpc/rdma/rdma_endpoint.h"
+#include "brpc/rdma_transport.h"
 #endif
 
 namespace brpc {
 namespace rdma {
-
-ServerHandshakeContext* ServerHandshakeContext::Create() {
-    return butil::get_object<ServerHandshakeContext>();
-}
-
-void ServerHandshakeContext::Destroy() {
-    butil::return_object(this);
-}
 
 // Fallback-only server handshake. Used for any connection that is NOT in RDMA
 // mode: builds without RDMA (no RdmaEndpoint exists at all), and RDMA-enabled
@@ -204,7 +195,7 @@ ParseResult ExecuteServerHandshake(butil::IOBuf* source, Socket* socket) {
     // this connection is plain TCP, or RDMA not compiled at all) falls back.
 #if BRPC_WITH_RDMA
     if (socket->socket_mode() == SOCKET_MODE_RDMA) {
-        return RdmaEndpoint::ExecuteServerHandshake(source, socket);
+        return RdmaTransport::ExecuteServerHandshake(source, socket);
     }
 #endif
     return FallbackServerHandshake(source, socket);

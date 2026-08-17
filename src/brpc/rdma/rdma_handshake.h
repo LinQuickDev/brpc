@@ -25,6 +25,7 @@
 #include "butil/macros.h"
 #include "butil/containers/optional.h"
 #include "brpc/rdma/rdma_handshake_constants.h"
+#include "brpc/transport_handshake.h"
 
 namespace butil {
 class IOBuf;
@@ -37,9 +38,8 @@ class RdmaEndpoint;
 
 // Wire-format-agnostic representation of a peer's hello message.
 // Each protocol version (v2 binary, v3 protobuf) translates its own
-// wire format into this struct so the state-machine driver in
-// RdmaEndpoint::ProcessHandshakeAt{Client,Server} stays free of any
-// wire-format details.
+// wire format into this struct so the state-machine driver in RdmaTransport
+// stays free of any wire-format details.
 struct ParsedHello {
     uint32_t block_size;
     uint16_t sq_size;
@@ -90,7 +90,8 @@ struct HelloMessage {
 // Base class of an RDMA handshake, shared by both roles.
 class RdmaHandshake {
 public:
-    RdmaHandshake(RdmaEndpoint* ep, int version) : _ep(ep), _version(version) {}
+    RdmaHandshake(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, int version)
+        : _ep(ep), _io(io), _version(version) {}
     virtual ~RdmaHandshake() = default;
 
     DISALLOW_COPY_AND_ASSIGN(RdmaHandshake);
@@ -114,6 +115,7 @@ public:
 
 protected:
     RdmaEndpoint* _ep;
+    handshake::SocketHandshakeIO* _io;
     int _version;
 };
 
@@ -121,8 +123,9 @@ protected:
 // `_source` (an IOBuf filled by InputMessenger), never touching the fd.
 class ServerRdmaHandshake : public RdmaHandshake {
 public:
-    ServerRdmaHandshake(RdmaEndpoint* ep, butil::IOBuf* source, int version)
-        : RdmaHandshake(ep, version), _source(source) {}
+    ServerRdmaHandshake(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+                        butil::IOBuf* source, int version)
+        : RdmaHandshake(ep, io, version), _source(source) {}
 
 protected:
     butil::IOBuf* _source;
@@ -131,15 +134,17 @@ protected:
 // v2 handshake (legacy "RDMA" magic, 36B binary HelloMessage).
 class RdmaHandshakeClientV2 : public RdmaHandshake {
 public:
-    explicit RdmaHandshakeClientV2(RdmaEndpoint* ep) : RdmaHandshake(ep, 2) {}
+    RdmaHandshakeClientV2(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
+        : RdmaHandshake(ep, io, 2) {}
     int SendLocalHello() override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
 class RdmaHandshakeServerV2 : public ServerRdmaHandshake {
 public:
-    RdmaHandshakeServerV2(RdmaEndpoint* ep, butil::IOBuf* source)
-        : ServerRdmaHandshake(ep, source, 2) {}
+    RdmaHandshakeServerV2(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+                          butil::IOBuf* source)
+        : ServerRdmaHandshake(ep, io, source, 2) {}
     int SendLocalHello() override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
@@ -148,15 +153,17 @@ public:
 // [ "RDM3" 4B ][ pb_size 4B (big-endian) ][ RdmaHello protobuf bytes ]
 class RdmaHandshakeClientV3 : public RdmaHandshake {
 public:
-    explicit RdmaHandshakeClientV3(RdmaEndpoint* ep) : RdmaHandshake(ep, 3) {}
+    RdmaHandshakeClientV3(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
+        : RdmaHandshake(ep, io, 3) {}
     int SendLocalHello() override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
 class RdmaHandshakeServerV3 : public ServerRdmaHandshake {
 public:
-    RdmaHandshakeServerV3(RdmaEndpoint* ep, butil::IOBuf* source)
-        : ServerRdmaHandshake(ep, source, 3) {}
+    RdmaHandshakeServerV3(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+                          butil::IOBuf* source)
+        : ServerRdmaHandshake(ep, io, source, 3) {}
     int SendLocalHello() override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
@@ -168,7 +175,8 @@ public:
 //   2 (default) -> RdmaHandshakeClientV2
 //   3           -> RdmaHandshakeClientV3
 // Other values fall back to V2.
-std::unique_ptr<RdmaHandshake> CreateClientHandshake(RdmaEndpoint* ep);
+std::unique_ptr<RdmaHandshake> CreateClientHandshake(
+    RdmaEndpoint* ep, handshake::SocketHandshakeIO* io);
 
 // Pick the server-side handshake based on the 4B magic already read.
 // Returns NULL if `magic` is not a recognized RDMA magic
@@ -176,7 +184,8 @@ std::unique_ptr<RdmaHandshake> CreateClientHandshake(RdmaEndpoint* ep);
 //   "RDMA" -> RdmaHandshakeServerV2
 //   "RDM3" -> RdmaHandshakeServerV3
 std::unique_ptr<RdmaHandshake> CreateServerHandshakeByMagic(
-    RdmaEndpoint* ep, butil::IOBuf* source, const uint8_t magic[HELLO_MAGIC_LEN]);
+    RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, butil::IOBuf* source,
+    const uint8_t magic[HELLO_MAGIC_LEN]);
 
 }  // namespace rdma
 }  // namespace brpc

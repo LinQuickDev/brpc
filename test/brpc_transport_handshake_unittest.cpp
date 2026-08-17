@@ -15,30 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
-#define BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
+#include <gtest/gtest.h>
 
-#include "brpc/parse_result.h"
 #include "brpc/transport_handshake.h"
 
-namespace butil {
-class IOBuf;
+namespace brpc {
+namespace handshake {
+
+TEST(TransportHandshakeTest, publish_fallback_after_tcp_state) {
+    SocketHandshakeIO handshake;
+    int tcp_active = 0;
+
+    handshake.SetPhase(NEGOTIATING);
+    handshake.PublishFallback([&tcp_active]() { tcp_active = 1; });
+
+    ASSERT_EQ(1, tcp_active);
+    ASSERT_EQ(FALLBACK_TCP, handshake.phase());
 }
 
-namespace brpc {
-class Socket;
-namespace rdma {
+TEST(TransportHandshakeTest, reset_clears_terminal_state) {
+    SocketHandshakeIO handshake;
+    handshake.MarkEstablished();
+    ASSERT_EQ(ESTABLISHED, handshake.phase());
 
-using ServerHandshakeContext = handshake::ServerHandshakeContext;
+    handshake.Reset(NULL);
+    ASSERT_EQ(UNINITIALIZED, handshake.phase());
+}
 
-// The single server-side RDMA handshake entry for policy::ParseRdmaHandshake.
-// Returns a ParseResult ready to be handed back from the protocol parser:
-//   - not an RDMA magic / handshake finished -> PARSE_ERROR_TRY_OTHERS;
-//   - an RDMA magic but not enough bytes yet  -> PARSE_ERROR_NOT_ENOUGH_DATA;
-//   - IO/protocol error                       -> PARSE_ERROR_ABSOLUTELY_WRONG.
-ParseResult ExecuteServerHandshake(butil::IOBuf* source, Socket* socket);
-
-}  // namespace rdma
+}  // namespace handshake
 }  // namespace brpc
-
-#endif  // BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
