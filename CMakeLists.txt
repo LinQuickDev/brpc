@@ -31,6 +31,9 @@ option(WITH_URMA "With URMA (openEuler Unified Remote Memory Access)" OFF)
 option(DOWNLOAD_URMA_HEADERS
        "Download UMDK headers when WITH_URMA is enabled and headers are absent"
        ON)
+option(WITH_URMA_MOCK
+       "Explicitly allow linking brpc's URMA link-time mock when liburma is not found (WITH_URMA only). The mock cannot talk to real URMA hardware, so this must be opted into rather than silently substituted."
+       OFF)
 option(WITH_UBRING "With UB" OFF)
 option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
 option(WITH_DEBUG_LOCK "With debugging lock" OFF)
@@ -371,10 +374,17 @@ if(WITH_URMA)
     if(URMA_LIB)
         message(STATUS "Found URMA library: ${URMA_LIB}")
         set(URMA_USE_MOCK 0)
-    else()
+    elseif(WITH_URMA_MOCK)
         message(STATUS
-            "liburma not found; building with the URMA link-time mock")
+            "liburma not found; WITH_URMA_MOCK=ON, building with the URMA "
+            "link-time mock")
         set(URMA_USE_MOCK 1)
+    else()
+        message(FATAL_ERROR
+            "Fail to find liburma. Install liburma, set URMA_ROOT, or "
+            "explicitly opt into brpc's link-time mock with "
+            "-DWITH_URMA_MOCK=ON (the mock cannot talk to real URMA "
+            "hardware; only enable it for CI/tests without URMA hardware).")
     endif()
 endif()
 

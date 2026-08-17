@@ -20,7 +20,7 @@ WR。完成事件既可由 JFC 忙轮询获取，也可通过 JFCE 事件 fd 获
 ### CMake 编译
 
 ```bash
-# 带 URMA 支持编译 brpc
+# 带 URMA 支持编译 brpc（需要 liburma；无硬件/CI 场景见下方 mock 说明）
 cmake -B build -DWITH_URMA=ON
 make -C build -j$(nproc)
 
@@ -30,11 +30,22 @@ cmake -B build
 make -C build -j$(nproc)
 ```
 
+未安装 `liburma` 时（例如 CI 环境），需显式开启链接期 mock，而不是依赖
+隐式回退：
+
+```bash
+cmake -B build -DWITH_URMA=ON -DWITH_URMA_MOCK=ON
+make -C build -j$(nproc)
+```
+
 `WITH_URMA=ON` 使用上游 UMDK 头文件进行编译。CMake 优先使用系统安装的
 SDK；找不到头文件时，会参照 Mooncake 的 mock 构建方式下载固定版本的
 UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `liburma` 时使用
-真实硬件数据通路，否则链接 brpc 的 mock，使 URMA 代码和测试仍可在无硬件
-环境编译。
+真实硬件数据通路；否则默认直接报错终止构建，避免静默回退到 mock 而产出
+一个看似支持 URMA、实际无法访问真实硬件的产物。需要在无硬件环境（例如
+CI）编译和测试 URMA 代码时，显式传入 `-DWITH_URMA_MOCK=ON`
+（Make 对应 `config_brpc.sh --with-urma-mock`）以主动选择链接 brpc 的
+mock。
 
 ## 使用
 
