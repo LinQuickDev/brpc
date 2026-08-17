@@ -20,7 +20,7 @@ from a JFC either by busy polling or through a JFCE event fd.
 ### Build with CMake
 
 ```bash
-# Build brpc with URMA support
+# Build brpc with URMA support (requires liburma; see below for CI/mock builds)
 cmake -B build -DWITH_URMA=ON
 make -C build -j$(nproc)
 
@@ -30,13 +30,25 @@ cmake -B build
 make -C build -j$(nproc)
 ```
 
+Without `liburma` installed (e.g. in CI), explicitly opt into the link-time
+mock instead of relying on an implicit fallback:
+
+```bash
+cmake -B build -DWITH_URMA=ON -DWITH_URMA_MOCK=ON
+make -C build -j$(nproc)
+```
+
 `WITH_URMA=ON` compiles against upstream UMDK headers. CMake prefers an
 installed SDK and, following Mooncake's mock setup, downloads a pinned UMDK
 release when the headers are unavailable. Set `DOWNLOAD_URMA_HEADERS=OFF` to
 disable downloading.
-When `liburma` is found it is linked for the hardware data path. Otherwise,
-brpc uses its link-time mock so URMA code and tests can still be built without
-hardware.
+When `liburma` is found it is linked for the hardware data path. Otherwise
+the build fails by default, since silently falling back to the mock could
+mask a broken environment and ship a binary that looks URMA-capable but
+cannot reach real hardware. Pass `-DWITH_URMA_MOCK=ON`
+(`config_brpc.sh --with-urma-mock`) to explicitly opt into brpc's
+link-time mock so URMA code and tests can still be built without hardware
+(e.g. in CI).
 
 ### Build with Bazel
 
