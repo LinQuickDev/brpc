@@ -54,11 +54,12 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-urma,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-urma,with-urma-mock,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,with-riscv-zvbc,with-riscv-zbc,with-cpu-frequency,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
 WITH_THRIFT=0
 WITH_RDMA=0
 WITH_URMA=0
+WITH_URMA_MOCK=0
 WITH_MESALINK=0
 WITH_BTHREAD_TRACER=0
 WITH_ASAN=0
@@ -92,6 +93,7 @@ while true; do
         --with-thrift) WITH_THRIFT=1; shift 1 ;;
         --with-rdma) WITH_RDMA=1; shift 1 ;;
         --with-urma) WITH_URMA=1; shift 1 ;;
+        --with-urma-mock) WITH_URMA_MOCK=1; shift 1 ;;
         --with-mesalink) WITH_MESALINK=1; shift 1 ;;
         --with-bthread-tracer) WITH_BTHREAD_TRACER=1; shift 1 ;;
         --with-debug-bthread-sche-safety ) BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1; shift 1 ;;
@@ -554,9 +556,12 @@ if [ $WITH_URMA != 0 ]; then
         append_to_output_libs "$URMA_LIB"
         append_to_output "DYNAMIC_LINKINGS+=-lurma"
         append_to_output "URMA_USE_MOCK=0"
-    else
+    elif [ $WITH_URMA_MOCK != 0 ]; then
         append_to_output "URMA_USE_MOCK=1"
-        print_info "liburma not found; using URMA link-time mock"
+        print_info "liburma not found; --with-urma-mock given, using URMA link-time mock"
+    else
+        >&2 $ECHO "Fail to find liburma. Install liburma, or explicitly opt into brpc's link-time mock with --with-urma-mock (the mock cannot talk to real URMA hardware; only use it for CI/tests without URMA hardware)."
+        exit 1
     fi
 fi
 
