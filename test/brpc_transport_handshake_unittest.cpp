@@ -23,7 +23,7 @@ namespace brpc {
 namespace handshake {
 
 TEST(TransportHandshakeTest, publish_fallback_after_tcp_state) {
-    SocketHandshakeIO handshake;
+    HandshakeSession handshake;
     int tcp_active = 0;
 
     handshake.SetPhase(NEGOTIATING);
@@ -34,12 +34,15 @@ TEST(TransportHandshakeTest, publish_fallback_after_tcp_state) {
 }
 
 TEST(TransportHandshakeTest, reset_clears_terminal_state) {
-    SocketHandshakeIO handshake;
+    HandshakeSession handshake;
+    handshake.set_protocol_version(3);
     handshake.MarkEstablished();
     ASSERT_EQ(ESTABLISHED, handshake.phase());
+    ASSERT_EQ(3, handshake.protocol_version());
 
     handshake.Reset(NULL);
     ASSERT_EQ(UNINITIALIZED, handshake.phase());
+    ASSERT_EQ(0, handshake.protocol_version());
 }
 
 }  // namespace handshake

@@ -43,7 +43,6 @@ static const int WAIT_TIMEOUT_MS = 50;
 
 SocketHandshakeIO::SocketHandshakeIO(Socket* socket)
     : _socket(socket)
-    , _phase(UNINITIALIZED)
     , _read_butex(bthread::butex_create_checked<butil::atomic<int> >()) {
 }
 
@@ -53,7 +52,6 @@ SocketHandshakeIO::~SocketHandshakeIO() {
 
 void SocketHandshakeIO::Reset(Socket* socket) {
     _socket = socket;
-    _phase.store(UNINITIALIZED, butil::memory_order_relaxed);
 }
 
 void SocketHandshakeIO::NotifyReadable() {

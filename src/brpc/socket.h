@@ -70,6 +70,7 @@ class AuthContext;
 class EventDispatcher;
 class Stream;
 class Transport;
+class UpgradeTransport;
 
 // Set SO_SNDBUF/SO_RCVBUF according to socket_*_buffer_size flags.
 void SetSocketBufferOptions(int fd);
@@ -342,6 +343,7 @@ friend class VersionedRefWithId<Socket>;
 friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
 friend class Transport;
+friend class UpgradeTransport;
 friend class TcpTransport;
 friend class RdmaTransport;
 friend class TransportFactory;

@@ -21,16 +21,15 @@
 #if BRPC_WITH_RDMA
 #include "brpc/socket.h"
 #include "brpc/channel.h"
-#include "brpc/transport.h"
-#include "brpc/transport_handshake.h"
+#include "brpc/upgrade_transport.h"
 
 namespace brpc {
-class RdmaTransport : public Transport {
-friend class TransportFactory;
-friend class rdma::RdmaEndpoint;
-friend class rdma::RdmaConnect;
-friend class rdma::RdmaHandshakeServerV2;
-friend class rdma::RdmaHandshakeServerV3;
+class RdmaTransport : public UpgradeTransport {
+    friend class TransportFactory;
+    friend class rdma::RdmaEndpoint;
+    friend class rdma::RdmaConnect;
+    friend class rdma::RdmaHandshakeServerV2;
+    friend class rdma::RdmaHandshakeServerV3;
 public:
     enum HandshakeState {
         UNINIT = 0x0,
@@ -53,9 +52,6 @@ public:
     void Release() override;
     int Reset(int32_t expected_nref) override;
     std::shared_ptr<AppConnect> Connect() override;
-    int CutFromIOBuf(butil::IOBuf* buf) override;
-    ssize_t CutFromIOBufList(butil::IOBuf** buf, size_t ndata) override;
-    int WaitEpollOut(butil::atomic<int>* _epollout_butex, bool pollin, const timespec duetime) override;
     void ProcessEvent(bthread_attr_t attr) override;
     void QueueMessage(InputMessageClosure& inputMsg, int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream &os) override;
@@ -63,18 +59,20 @@ public:
         CHECK(_rdma_ep != NULL);
         return _rdma_ep;
     }
-    int handshake_phase() const {
-        return _handshake.phase();
-    }
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
 
     // TCP control-plane callbacks. The endpoint is intentionally absent from
     // these entry points and only participates through resource operations.
-    static void OnNewDataFromTcp(Socket* socket);
     static void* ProcessHandshakeAtClient(void* arg);
     static ParseResult ExecuteServerHandshake(butil::IOBuf* source,
                                               Socket* socket);
 private:
+    void SetHighSpeedAvailable(bool available) override;
+    ssize_t CutFromHighSpeedIOBufList(
+        butil::IOBuf** buf, size_t ndata) override;
+    int WaitHighSpeedEpollOut(butil::atomic<int>* epollout_butex,
+                              bool pollin, timespec duetime) override;
+
     static bool OptionsAvailableForRdma(const ChannelOptions* opt);
     static bool OptionsAvailableOverRdma(const ServerOptions* opt);
 
@@ -88,9 +86,6 @@ private:
     rdma::RdmaEndpoint* _rdma_ep = NULL;
     // Should use RDMA or not
     RdmaState _rdma_state;
-    std::shared_ptr<TcpTransport>  _tcp_transport;
-    handshake::SocketHandshakeIO _handshake;
-    int _handshake_version = 0;
 };
 } // namespace brpc
 #endif // BRPC_WITH_RDMA

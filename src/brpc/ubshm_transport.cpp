@@ -18,7 +18,6 @@
 #if BRPC_WITH_UBRING
 
 #include "brpc/ubshm_transport.h"
-#include "brpc/tcp_transport.h"
 #include "brpc/ubshm/ub_endpoint.h"
 #include "brpc/ubshm/ub_helper.h"
 
@@ -30,7 +29,6 @@ extern SocketVarsCollector *g_vars;
 
 void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
     CHECK(_ub_ep == NULL);
-    _handshake.Reset(socket);
     if (options.socket_mode == SOCKET_MODE_UBRING) {
         _ub_ep = new(std::nothrow)ubring::UBShmEndpoint(socket);
         if (!_ub_ep) {
@@ -44,14 +42,7 @@ void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
         _ub_state = UB_OFF;
         socket->_socket_mode = SOCKET_MODE_TCP;
     }
-    _socket = socket;
-    _default_connect = options.app_connect;
-    _on_edge_trigger = options.on_edge_triggered_events;
-    if (options.need_on_edge_trigger && _on_edge_trigger == NULL) {
-        _on_edge_trigger = UBShmTransport::OnNewDataFromTcp;
-    }
-    _tcp_transport = std::make_shared<TcpTransport>();
-    _tcp_transport->Init(socket, options);
+    InitUpgradeTransport(socket, options, UpgradeTransport::OnNewDataFromTcp);
 }
 
 void UBShmTransport::Release() {
@@ -67,7 +58,7 @@ int UBShmTransport::Reset(int32_t expected_nref) {
         _ub_ep->Reset();
         _ub_state = UB_UNKNOWN;
     }
-    _handshake.Reset(_socket);
+    ResetUpgradeTransport();
     return 0;
 }
 
@@ -78,57 +69,42 @@ std::shared_ptr<AppConnect> UBShmTransport::Connect() {
     return _default_connect;
 }
 
-int UBShmTransport::CutFromIOBuf(butil::IOBuf *buf) {
-    if (_ub_ep && _ub_state == UB_ON) {
-        butil::IOBuf *data_arr[1] = {buf};
-        return _ub_ep->CutFromIOBufList(data_arr, 1);
-    } else {
-        return _tcp_transport->CutFromIOBuf(buf);
-    }
+void UBShmTransport::SetHighSpeedAvailable(bool available) {
+    _ub_state = available ? UB_ON : UB_OFF;
 }
 
-ssize_t UBShmTransport::CutFromIOBufList(butil::IOBuf **buf, size_t ndata) {
-    if (_ub_ep && _ub_state == UB_ON) {
-        return _ub_ep->CutFromIOBufList(buf, ndata);
-    }
-    return _tcp_transport->CutFromIOBufList(buf, ndata);
+ssize_t UBShmTransport::CutFromHighSpeedIOBufList(
+    butil::IOBuf** buf, size_t ndata) {
+    CHECK(_ub_ep != NULL);
+    return _ub_ep->CutFromIOBufList(buf, ndata);
 }
 
-int UBShmTransport::WaitEpollOut(butil::atomic<int> *_epollout_butex,
-                                    bool pollin, const timespec duetime) {
-    // LOG(INFO) << "mwj pollin4=" << pollin << " duetime=" << butil::timespec_to_microseconds(duetime);
-    if (_ub_state == UB_ON) {
-        // LOG(INFO) << "mwj pollin1=" << pollin;
-        const int expected_val = _epollout_butex->load(butil::memory_order_acquire);
-        CHECK(_ub_ep != NULL);
-        if (!_ub_ep->IsWritable()) {
-            g_vars->nwaitepollout << 1;
-            _ub_ep->PollerRegisterEpollOut(pollin);
-            auto mwj_ret = bthread::butex_wait(_epollout_butex, expected_val, &duetime);
-            // LOG(INFO) << "mwj pollin2=" << pollin << " mwj_ret=" << mwj_ret;
-            if (mwj_ret < 0) {
-                if (errno != EAGAIN && errno != ETIMEDOUT) {
-                    const int saved_errno = errno;
-                    PLOG(WARNING) << "Fail to wait ub window of " << _socket;
-                    _socket->SetFailed(saved_errno,
-                                       "Fail to wait ub window of %s: %s",
-                                       _socket->description().c_str(),
-                                       berror(saved_errno));
-                }
-                if (_socket->Failed()) {
-                    // NOTE:
-                    // Different from TCP, we cannot find the UB channel
-                    // failed by writing to it. Thus we must check if it
-                    // is already failed here.
-                    return 1;
-                }
+int UBShmTransport::WaitHighSpeedEpollOut(
+    butil::atomic<int>* epollout_butex, bool pollin, timespec duetime) {
+    const int expected_val = epollout_butex->load(butil::memory_order_acquire);
+    CHECK(_ub_ep != NULL);
+    if (!_ub_ep->IsWritable()) {
+        g_vars->nwaitepollout << 1;
+        _ub_ep->PollerRegisterEpollOut(pollin);
+        const int rc = bthread::butex_wait(
+            epollout_butex, expected_val, &duetime);
+        if (rc < 0) {
+            if (errno != EAGAIN && errno != ETIMEDOUT) {
+                const int saved_errno = errno;
+                PLOG(WARNING) << "Fail to wait ub window of " << _socket;
+                _socket->SetFailed(saved_errno,
+                                   "Fail to wait ub window of %s: %s",
+                                   _socket->description().c_str(),
+                                   berror(saved_errno));
             }
-            _ub_ep->PollerUnRegisterEpollOut(pollin);
+            if (_socket->Failed()) {
+                // Unlike TCP, writing cannot discover an already failed UB
+                // channel, so check the Socket failure here.
+                return 1;
+            }
         }
-    } else {
-        return _tcp_transport->WaitEpollOut(_epollout_butex, pollin, duetime);
+        _ub_ep->PollerUnRegisterEpollOut(pollin);
     }
-    // LOG(INFO) << "mwj return 0";
     return 0;
 }
 

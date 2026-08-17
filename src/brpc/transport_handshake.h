@@ -39,7 +39,7 @@ struct ServerHandshakeContext : public Destroyable {
 };
 
 // Protocol adapters may use transport-specific intermediate values, but the
-// terminal values are shared so that the TCP event callback can make the same
+// terminal values are shared so that UpgradeTransport can make the same
 // acquire-side decision for RDMA, URMA and UBSHM.
 enum Phase {
     UNINITIALIZED = 0,
@@ -49,15 +49,44 @@ enum Phase {
     FAILED = 0x300,
 };
 
-// Owns all TCP-fd I/O and synchronization used while upgrading a connection.
-// High-speed endpoints deliberately do not own this object: they only prepare
-// and activate protocol-specific data-plane resources.
+// Owns TCP-fd I/O and its readable notification while upgrading a connection.
+// The handshake lifecycle is owned by HandshakeSession below.
 class SocketHandshakeIO {
 public:
     explicit SocketHandshakeIO(Socket* socket = NULL);
     ~SocketHandshakeIO();
 
     void Reset(Socket* socket);
+
+    void NotifyReadable();
+
+    // Read/write exactly len bytes. EAGAIN is handled by waiting for the
+    // socket event callback; EOF is reported as EEOF.
+    int ReadExact(void* data, size_t len);
+    int ReadExact(butil::IOPortal* data, size_t len);
+    int WriteAll(const void* data, size_t len);
+    int WriteAll(butil::IOBuf* data);
+
+private:
+    Socket* _socket;
+    butil::atomic<int>* _read_butex;
+
+    DISALLOW_COPY_AND_ASSIGN(SocketHandshakeIO);
+};
+
+// Owns one connection-upgrade attempt. Wire codecs and endpoint resource
+// operations remain protocol adapters, while this class provides the common
+// lifecycle, publication ordering and TCP control-plane I/O.
+class HandshakeSession {
+public:
+    explicit HandshakeSession(Socket* socket = NULL)
+        : _io(socket), _phase(UNINITIALIZED), _protocol_version(0) {}
+
+    void Reset(Socket* socket) {
+        _io.Reset(socket);
+        _protocol_version = 0;
+        _phase.store(UNINITIALIZED, butil::memory_order_relaxed);
+    }
 
     int phase(butil::memory_order order = butil::memory_order_acquire) const {
         return _phase.load(order);
@@ -66,6 +95,9 @@ public:
     void SetPhase(int phase) {
         _phase.store(phase, butil::memory_order_relaxed);
     }
+
+    int protocol_version() const { return _protocol_version; }
+    void set_protocol_version(int version) { _protocol_version = version; }
 
     void MarkEstablished() {
         _phase.store(ESTABLISHED, butil::memory_order_release);
@@ -85,21 +117,16 @@ public:
         _phase.store(FALLBACK_TCP, butil::memory_order_release);
     }
 
-    void NotifyReadable();
-
-    // Read/write exactly len bytes. EAGAIN is handled by waiting for the
-    // socket event callback; EOF is reported as EEOF.
-    int ReadExact(void* data, size_t len);
-    int ReadExact(butil::IOPortal* data, size_t len);
-    int WriteAll(const void* data, size_t len);
-    int WriteAll(butil::IOBuf* data);
+    SocketHandshakeIO* io() { return &_io; }
+    const SocketHandshakeIO* io() const { return &_io; }
+    void NotifyReadable() { _io.NotifyReadable(); }
 
 private:
-    Socket* _socket;
+    SocketHandshakeIO _io;
     butil::atomic<int> _phase;
-    butil::atomic<int>* _read_butex;
+    int _protocol_version;
 
-    DISALLOW_COPY_AND_ASSIGN(SocketHandshakeIO);
+    DISALLOW_COPY_AND_ASSIGN(HandshakeSession);
 };
 
 }  // namespace handshake
