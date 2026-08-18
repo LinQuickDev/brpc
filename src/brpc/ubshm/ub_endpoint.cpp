@@ -358,7 +358,6 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
     callbacks.phases = handshake::HandshakePhases{
         S_ALLOC_SHM, S_HELLO_SEND, S_HELLO_WAIT,
         S_ALLOC_SHM, 0, S_ACK_WAIT};
-    callbacks.blocking = true;
     callbacks.fallback_on_not_mine = true;
     callbacks.receive_remote_hello = [&]() {
         if (ub_transport->_handshake.io()->ReadExact(

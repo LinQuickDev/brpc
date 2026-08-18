@@ -20,10 +20,10 @@
 #if BRPC_WITH_UBRING
 #include "brpc/socket.h"
 #include "brpc/channel.h"
-#include "brpc/upgrade_transport.h"
+#include "brpc/adapter_transport.h"
 
 namespace brpc {
-class UBShmTransport : public UpgradeTransport {
+class UBShmTransport : public AdapterTransport {
     friend class TransportFactory;
     friend class ubring::UBShmEndpoint;
     friend class ubring::UBConnect;

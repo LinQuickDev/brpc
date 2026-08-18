@@ -274,11 +274,12 @@ StepResult HandshakeSession::RunServer(
             return FinishWithFailure(this, callbacks.on_failed);
         }
         SetPhase(callbacks.phases.ack_wait);
-        if (!callbacks.blocking) {
-            return STEP_NEED_MORE;
-        }
     }
 
+    // Always try the ACK callback once. For a non-blocking server it returns
+    // STEP_NEED_MORE when the ACK has not arrived; when Hello and ACK are
+    // coalesced in the input buffer this consumes the ACK without waiting for
+    // another socket edge.
     StepResult result = callbacks.receive_ack();
     if (result == STEP_NEED_MORE) {
         return STEP_NEED_MORE;

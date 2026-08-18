@@ -125,7 +125,6 @@ TEST(TransportHandshakeTest, server_driver_resumes_at_ack_wait) {
 
     ServerHandshakeCallbacks callbacks{};
     callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
-    callbacks.blocking = false;
     callbacks.fallback_on_not_mine = false;
     callbacks.receive_remote_hello = [&]() {
         ++hello_calls;
@@ -139,7 +138,7 @@ TEST(TransportHandshakeTest, server_driver_resumes_at_ack_wait) {
     };
     callbacks.receive_ack = [&]() {
         ++ack_calls;
-        return STEP_OK;
+        return ack_calls == 1 ? STEP_NEED_MORE : STEP_OK;
     };
     callbacks.set_high_speed_active = [&]() {
         high_speed_active = true;
@@ -150,11 +149,11 @@ TEST(TransportHandshakeTest, server_driver_resumes_at_ack_wait) {
     ASSERT_EQ(STEP_NEED_MORE, session.RunServer(callbacks));
     ASSERT_EQ(16, session.phase());
     ASSERT_EQ(1, hello_calls);
-    ASSERT_EQ(0, ack_calls);
+    ASSERT_EQ(1, ack_calls);
 
     ASSERT_EQ(STEP_OK, session.RunServer(callbacks));
     ASSERT_EQ(1, hello_calls);
-    ASSERT_EQ(1, ack_calls);
+    ASSERT_EQ(2, ack_calls);
     ASSERT_TRUE(high_speed_active);
     ASSERT_EQ(ESTABLISHED, session.phase());
 }
@@ -165,7 +164,6 @@ TEST(TransportHandshakeTest, server_driver_runs_blocking_handshake) {
 
     ServerHandshakeCallbacks callbacks{};
     callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
-    callbacks.blocking = true;
     callbacks.fallback_on_not_mine = true;
     callbacks.receive_remote_hello = [&]() {
         calls += "recv_hello ";
@@ -204,7 +202,6 @@ TEST(TransportHandshakeTest, server_driver_falls_back_for_other_protocol) {
 
     ServerHandshakeCallbacks callbacks{};
     callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
-    callbacks.blocking = true;
     callbacks.fallback_on_not_mine = true;
     callbacks.receive_remote_hello = []() { return STEP_NOT_MINE; };
     callbacks.prepare_local = []() { return STEP_ERROR; };

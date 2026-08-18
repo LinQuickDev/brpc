@@ -19,7 +19,7 @@
 
 #include "butil/logging.h"
 #include "brpc/destroyable.h"
-#include "brpc/rdma/rdma_handshake_server.h"
+#include "brpc/rdma_handshake_server.h"
 
 namespace brpc {
 namespace policy {

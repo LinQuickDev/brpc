@@ -43,9 +43,9 @@ RDMA 支持：
 
 相关代码：
 
-- `src/brpc/rdma/rdma_handshake.h`
-- `src/brpc/rdma/rdma_handshake.cpp`
-- `src/brpc/rdma/rdma_handshake_server.cpp`
+- `src/brpc/rdma_handshake.h`
+- `src/brpc/rdma_handshake.cpp`
+- `src/brpc/rdma_handshake_server.cpp`
 
 ### 2.2 URMA
 
@@ -118,9 +118,12 @@ Hello 中携带：
 
 ```text
 src/brpc/
-    upgrade_transport.h/.cpp     # TCP-first 路由、升级成功/回退发布
+    adapter_transport.h/.cpp     # TCP-first 路由、适配器切换与状态发布
     transport_handshake.h/.cpp   # HandshakeSession 与 SocketHandshakeIO
-    rdma_transport.h/.cpp        # RDMA 协议状态机与 Endpoint adapter
+    rdma_handshake.h/.cpp        # RDMA v2/v3 wire adapter
+    rdma_handshake_server.h/.cpp # RDMA 标准 server parser/fallback
+    rdma_handshake.proto         # RDMA v3 wire message
+    rdma_transport.h/.cpp        # RDMA 握手回调与 Endpoint adapter
     ubshm_transport.h/.cpp       # UBSHM 协议状态机与 Endpoint adapter
 ```
 
@@ -128,7 +131,7 @@ src/brpc/
 
 ```mermaid
 flowchart TB
-    S["Socket"] --> UT["UpgradeTransport\nTCP-first 路由与状态发布"]
+    S["Socket"] --> UT["AdapterTransport\nTCP-first 路由与状态发布"]
     UT --> TCP["TcpTransport\n默认数据面 / fallback"]
     UT --> HS["HandshakeSession\nclient/server driver + lifecycle"]
     HS --> IO["SocketHandshakeIO\nReadExact / WriteAll / readable butex"]
@@ -140,16 +143,16 @@ flowchart TB
     BA --> BE["UBShmEndpoint\nUBRing / Shared Memory"]
 ```
 
-`UpgradeTransport` 决定当前数据走 TCP 还是高速 Endpoint；`HandshakeSession` 驱动一次升级尝试的公共步骤；具体 adapter 通过回调完成 Hello/ACK wire codec 和资源协商。Endpoint 不持有 TCP Transport，也不执行 TCP fd 读写。
+`AdapterTransport` 决定当前数据走 TCP 还是高速 Endpoint；`HandshakeSession` 驱动一次升级尝试的公共步骤；具体 adapter 通过回调完成 Hello/ACK wire codec 和资源协商。Endpoint 不持有 TCP Transport，也不执行 TCP fd 读写。
 
 ## 4.1 选定架构：Handshake 位于 Transport 层
 
-默认先建立 TCP 连接，客户端可以请求升级到 RDMA、URMA 或 UBSHM。握手、升级决策、fallback 和 active transport 选择全部由 `UpgradeTransport` 负责。
+默认先建立 TCP 连接，客户端可以请求升级到 RDMA、URMA 或 UBSHM。握手、升级决策、fallback 和 active transport 选择全部由 `AdapterTransport` 负责。
 
 ```mermaid
 flowchart TB
     Socket["Socket"] --> T["RdmaTransport / UrmaTransport / UBShmTransport"]
-    T -. "继承" .-> UT["UpgradeTransport"]
+    T -. "继承" .-> UT["AdapterTransport"]
     UT --> TCP["TcpTransport\n默认控制面与 TCP 数据面"]
     UT --> HS["HandshakeSession\n连接协商 / 版本 / ACK / fallback"]
     HS --> IO["SocketHandshakeIO"]
@@ -172,7 +175,7 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant T as UpgradeTransport
+    participant T as AdapterTransport
     participant TCP as TcpTransport
     participant H as HandshakeSession
     participant E as High-speed Endpoint
@@ -206,7 +209,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant TCP as TcpTransport
-    participant T as UpgradeTransport
+    participant T as AdapterTransport
     participant H as HandshakeSession
     participant E as Selected Endpoint
     participant IM as InputMessenger
@@ -474,7 +477,7 @@ server 解析必须保留 `NEED_MORE_DATA`：
 ```text
 BuildHello -> FillLocalRdmaHello
 ParseHello -> ValidRdmaHello + TranslateHello
-Negotiate  -> ApplyRemoteHello + BringUpQp
+Negotiate  -> ApplyRemoteInfo + BringUpQp
 BuildAck   -> RDMA ACK
 ```
 
@@ -493,7 +496,7 @@ BuildAck   -> RDMA ACK
 ```text
 BuildHello -> FillLocalHelloV2/FillLocalHelloV3
 ParseHello -> ValidHello + ParsedHello
-Negotiate  -> ApplyRemoteHello + ImportPeer
+Negotiate  -> ApplyRemoteInfo + ImportPeer
 BuildAck   -> URMA ACK
 ```
 
@@ -521,22 +524,30 @@ UBSHM 是最适合优先迁移的实现，因为它只有固定长度 v2 协议�
 
 ## 8. 与现有 Endpoint 的关系
 
-不建议让 `RdmaEndpoint`、`UrmaEndpoint`、`UBShmEndpoint` 继承一个包含大量虚函数的“大 Endpoint 基类”。更合适的方式是组合：
+不建议让 `RdmaEndpoint`、`UrmaEndpoint`、`UBShmEndpoint` 继承一个包含大量虚函数的“大 Endpoint 基类”。握手组件组合在 Transport 层，Endpoint 只暴露资源接口：
 
 ```cpp
+class RdmaTransport : public AdapterTransport {
+    handshake::HandshakeSession _handshake;
+    RdmaEndpoint* _endpoint;
+    // 每次升级尝试创建一个 RdmaHandshakeAdapter。
+};
+
+class UrmaTransport : public AdapterTransport {
+    handshake::HandshakeSession _handshake;
+    UrmaEndpoint* _endpoint;
+    // 每次升级尝试创建一个 UrmaHandshakeAdapter。
+};
+
+class UBShmTransport : public AdapterTransport {
+    handshake::HandshakeSession _handshake;
+    UBShmEndpoint* _endpoint;
+    // 每次升级尝试创建一个 UBShmHandshakeAdapter。
+};
+
 class RdmaEndpoint {
-    handshake::HandshakeSession _handshake;
-    RdmaHandshakeAdapter _handshake_adapter;
-};
-
-class UrmaEndpoint {
-    handshake::HandshakeSession _handshake;
-    UrmaHandshakeAdapter _handshake_adapter;
-};
-
-class UBShmEndpoint {
-    handshake::HandshakeSession _handshake;
-    UBShmHandshakeAdapter _handshake_adapter;
+    RdmaResource* _resource;
+    // QP/CQ/MR and data path only.
 };
 ```
 
@@ -546,10 +557,9 @@ Endpoint 仍然拥有：
 - transport-specific resource；
 - endpoint state 的业务动作；
 - data path；
-- InputMessenger 回调；
 - transport-specific error handling。
 
-公共 driver 只拥有握手阶段和 protocol callback，不拥有 endpoint 生命周期。
+`AdapterTransport`/具体 Transport 拥有 TCP 路由、握手阶段、protocol callback 和 Endpoint 生命周期；公共 driver 不直接依赖 Endpoint 类型。
 
 ## 9. 兼容性和安全约束
 
@@ -703,13 +713,13 @@ RDMA/URMA/UBSHM 的长度字段并不完全相同。规避：使用 `FrameSpec::
 
 ## 14. 当前实现边界与后续迁移
 
-当前实现已经引入 `UpgradeTransport` 和 `HandshakeSession`，类关系如下：
+当前实现已经引入 `AdapterTransport` 和 `HandshakeSession`，类关系如下：
 
 ```mermaid
 classDiagram
     class Transport
     class TcpTransport
-    class UpgradeTransport {
+    class AdapterTransport {
         -HandshakeSession handshake
         -TcpTransport tcp_transport
         +CutFromIOBuf()
@@ -728,21 +738,23 @@ classDiagram
         +MarkFailed()
     }
     class RdmaTransport
+    class RdmaHandshakeAdapter
     class UBShmTransport
     class HighSpeedEndpoint
 
     Transport <|-- TcpTransport
-    Transport <|-- UpgradeTransport
-    UpgradeTransport <|-- RdmaTransport
-    UpgradeTransport <|-- UBShmTransport
-    UpgradeTransport *-- TcpTransport
-    UpgradeTransport *-- HandshakeSession
+    Transport <|-- AdapterTransport
+    AdapterTransport <|-- RdmaTransport
+    AdapterTransport <|-- UBShmTransport
+    AdapterTransport *-- TcpTransport
+    AdapterTransport *-- HandshakeSession
     HandshakeSession *-- SocketHandshakeIO
+    RdmaTransport --> RdmaHandshakeAdapter
     RdmaTransport --> HighSpeedEndpoint
     UBShmTransport --> HighSpeedEndpoint
 ```
 
-`UpgradeTransport` 是 TCP-first 的公共路由层：`UNINITIALIZED/NEGOTIATING/FALLBACK_TCP` 都走 `TcpTransport`，仅当 `HandshakeSession` release 发布 `ESTABLISHED` 后才调用高速 Endpoint 的发送与等待钩子。成功升级后的 TCP 控制连接只允许 EOF，不再接受应用数据。
+`AdapterTransport` 是 TCP-first 的公共路由层：`UNINITIALIZED/NEGOTIATING/FALLBACK_TCP` 都走 `TcpTransport`，仅当 `HandshakeSession` release 发布 `ESTABLISHED` 后才调用高速 Endpoint 的发送与等待钩子。成功升级后的 TCP 控制连接只允许 EOF，不再接受应用数据。
 
 `HandshakeSession::RunClient/RunServer` 统一执行资源准备、Hello 收发、远端参数协商、ACK 收发以及 established/fallback/failed 发布。RDMA/UBSHM 仅通过 callback 提供 wire codec 和资源操作；RDMA server 的 `STEP_NEED_MORE` 仍由 bRPC 标准 parser 增量驱动，UBSHM server 使用同一驱动的 blocking 模式。
 
@@ -750,12 +762,13 @@ classDiagram
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| TCP-first 路由 | 已实现 | RDMA/UBSHM 共同继承 `UpgradeTransport`，不再各自持有 `TcpTransport` |
+| TCP-first 路由 | 已实现 | RDMA/UBSHM 共同继承 `AdapterTransport`，不再各自持有 `TcpTransport` |
 | 公共握手处理 | 已实现 | `RunClient/RunServer` 统一 Hello、资源协商、ACK、fallback 和错误流程 |
-| RDMA client/server | 已迁移 | server 保留 #3350 的 bRPC 标准协议增量解析流程 |
+| RDMA client/server | 已迁移 | wire adapter、fallback server 和 v3 proto 已全部迁至 `src/brpc`；server 保留 #3350 的标准增量解析流程 |
 | UBSHM client/server | 已迁移公共驱动 | server 当前使用 blocking 模式；后续只需把输入方式迁移到标准 parser |
-| URMA | 待迁移 | origin/master 暂无受版本控制的 URMA Transport；合入后实现 `UpgradeTransport` 的数据面钩子并复用 `HandshakeSession` |
-| 通用 FrameCodec/Protocol adapter | 待实现 | 当前先复用 RDMA 已验证的 v2/v3 codec，避免一次改动 wire format 与 Transport 生命周期 |
+| URMA | 待迁移 | origin/master 暂无受版本控制的 URMA Transport；合入后实现 `AdapterTransport` 的数据面钩子并复用 `HandshakeSession` |
+| RDMA Protocol adapter | 已实现 | `RdmaHandshakeAdapter` 显式接收 enabled 状态，不再读取 Transport/Socket 私有状态 |
+| 通用 FrameCodec | 待实现 | 当前保留 RDMA 已验证的 v2/v3 framing，后续与 URMA/UBSHM 一起抽取 |
 
 ### 14.2 必须继承的修复语义
 
@@ -766,6 +779,7 @@ classDiagram
 | #3424 | 高速资源准备失败是可降级错误；清理部分资源并保持 TCP 可用 | RDMA 保留事务式 `AllocateResources`；失败后由公共 fallback 路径恢复 TCP |
 | #3425 | CQ re-arm 后同时补 poll send/recv CQ | 保留在 RDMA Endpoint 数据面，不移入握手组件 |
 | #3427 | 外部 Bazel workspace 下生成规则不能依赖主仓布局 | 公共实现不新增 proto；源码通过现有递归 glob 收录 |
+| server 同包 Hello/ACK | parser 只消费当前 Hello frame，不能清空后续 ACK/RPC；发送 Hello 后立即尝试解析已到达的 ACK | RDMA adapter 按声明长度消费扩展字段；`HandshakeSession::RunServer` 和 fallback parser 不强制等待下一次读事件 |
 
 ### 14.3 状态发布规则
 

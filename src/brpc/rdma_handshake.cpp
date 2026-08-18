@@ -17,8 +17,8 @@
 
 #if BRPC_WITH_RDMA
 
-#include "brpc/rdma/rdma_handshake.h"
-#include "brpc/rdma/rdma_handshake_constants.h"
+#include "brpc/rdma_handshake.h"
+#include "brpc/rdma_handshake_constants.h"
 
 #include <string.h>
 #include <algorithm>            // std::min
@@ -30,10 +30,7 @@
 #include "butil/raw_pack.h"      // RawPacker, RawUnpacker
 #include "brpc/socket.h"
 #include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma/rdma_helper.h"
-#include "brpc/rdma_transport.h"
-#include "brpc/rdma/rdma_handshake.pb.h"
-#include "butil/object_pool.h"
+#include "brpc/rdma_handshake.pb.h"
 
 namespace brpc {
 namespace rdma {
@@ -47,17 +44,30 @@ DECLARE_bool(rdma_trace_verbose);
 
 extern const uint16_t MIN_QP_SIZE;
 extern const uint16_t MIN_BLOCK_SIZE;
-extern uint32_t g_rdma_recv_block_size;
 extern bool g_skip_rdma_init;
-
-extern int (*IbvQueryEce)(ibv_qp*, ibv_ece*);
 
 DEFINE_bool(rdma_ece, false, "Enable end-to-end ECE (Enhanced Connection Establishment) "
                              "negotiation in the RDMA v3 handshake. Automatically degrades "
                              "to no-ECE when the peer, the local libibverbs, or set_ece "
                              "does not support it. Acts as a kill switch (default off).");
 
-DECLARE_bool(rdma_trace_verbose);
+void RdmaHandshakeAdapter::FillLocalHello(ParsedHello* local) const {
+    _ep->GetLocalConnectionInfo(local);
+}
+
+void RdmaHandshakeAdapter::PrepareClientEce() {
+    if (!FLAGS_rdma_ece) {
+        return;
+    }
+    ibv_ece ece;
+    const int rc = _ep->QueryLocalEce(&ece);
+    if (rc == 0) {
+        _ep->SetOutgoingEce(ece);
+    } else if (rc < 0) {
+        LOG_IF(WARNING, FLAGS_rdma_trace_verbose)
+            << "Fail to IbvQueryEce on client, ECE not advertised";
+    }
+}
 
 namespace v2_wire {
 
@@ -152,31 +162,30 @@ int DrainBytes(handshake::SocketHandshakeIO* io, size_t n) {
 
 }  // namespace v2_wire
 
-int RdmaHandshakeClientV2::SendLocalHello() {
-    RdmaEndpoint* ep = _ep;
+int RdmaClientHandshakeAdapterV2::SendLocalHello(bool enabled) {
+    CHECK(enabled);
     uint8_t data[HELLO_V2_MSG_LEN_MIN];
+    ParsedHello local{};
+    FillLocalHello(&local);
 
     v2_wire::HelloMessage local_msg{};
     local_msg.msg_len = HELLO_V2_MSG_LEN_MIN;
     local_msg.hello_ver = HELLO_V2_VERSION;
     local_msg.impl_ver = IMPL_V2_VERSION;
-    local_msg.block_size = g_rdma_recv_block_size;
-    local_msg.sq_size = ep->_sq_size;
-    local_msg.rq_size = ep->_rq_size;
-    local_msg.lid = GetRdmaLid();
-    local_msg.gid = GetRdmaGid();
-    if (BAIDU_LIKELY(ep->_resource)) {
-        local_msg.qp_num = ep->_resource->qp->qp_num;
-    } else {
-        // Only happens in UT
-        local_msg.qp_num = 0;
-    }
+    local_msg.block_size = local.block_size;
+    local_msg.sq_size = local.sq_size;
+    local_msg.rq_size = local.rq_size;
+    local_msg.lid = local.lid;
+    local_msg.gid = local.gid;
+    local_msg.qp_num = local.qp_num;
     fast_memcpy(data, HELLO_MAGIC, 4);
     local_msg.Serialize((char*)data + 4);
     return _io->WriteAll(data, HELLO_V2_MSG_LEN_MIN);
 }
 
-RemoteHelloResult RdmaHandshakeClientV2::ReceiveAndParseRemoteHello(ParsedHello* remote) {
+RemoteHelloResult
+RdmaClientHandshakeAdapterV2::ReceiveAndParseRemoteHello(
+    ParsedHello* remote) {
     uint8_t magic[HELLO_MAGIC_LEN];
     if (_io->ReadExact(magic, HELLO_MAGIC_LEN) < 0) {
         return RemoteHelloResult::ERROR;
@@ -191,7 +200,9 @@ RemoteHelloResult RdmaHandshakeClientV2::ReceiveAndParseRemoteHello(ParsedHello*
 
 // Parse one complete v2 client hello out of `_source` (non-blocking).
 // v2 hello: [ "RDMA" 4B ][ msg_len 2B ][ 34B ... ], base total = 40B.
-RemoteHelloResult RdmaHandshakeServerV2::ReceiveAndParseRemoteHello(ParsedHello* remote) {
+RemoteHelloResult
+RdmaServerHandshakeAdapterV2::ReceiveAndParseRemoteHello(
+    ParsedHello* remote) {
     butil::IOBuf* source = _source;
     constexpr size_t HDR_LEN = HELLO_MAGIC_LEN + 2;
     if (source->size() < HDR_LEN) {
@@ -217,9 +228,11 @@ RemoteHelloResult RdmaHandshakeServerV2::ReceiveAndParseRemoteHello(ParsedHello*
     CHECK_EQ(source->pop_front(HELLO_MAGIC_LEN), HELLO_MAGIC_LEN);
     uint8_t body[HELLO_V2_MSG_LEN_MIN - HELLO_MAGIC_LEN];  // 36B
     CHECK_EQ(source->cutn(body, sizeof(body)), sizeof(body));
-    if (!source->empty()) {
-        // Drain unknown trailing bytes.
-        source->clear();
+    const size_t extension_len = msg_len - HELLO_V2_MSG_LEN_MIN;
+    if (extension_len != 0) {
+        // Consume only this frame's optional extension. A coalesced ACK or RPC
+        // belongs to the next parser stage and must remain in source.
+        CHECK_EQ(source->pop_front(extension_len), extension_len);
     }
 
     v2_wire::HelloMessage remote_msg{};
@@ -231,12 +244,11 @@ RemoteHelloResult RdmaHandshakeServerV2::ReceiveAndParseRemoteHello(ParsedHello*
     return RemoteHelloResult::NEGOTIATED;
 }
 
-int RdmaHandshakeServerV2::SendLocalHello() {
+int RdmaServerHandshakeAdapterV2::SendLocalHello(bool enabled) {
     uint8_t data[HELLO_V2_MSG_LEN_MIN];
     v2_wire::HelloMessage local_msg{};
     local_msg.msg_len = HELLO_V2_MSG_LEN_MIN;
-    auto rdma_transport = static_cast<RdmaTransport*>(_ep->_socket->_transport.get());
-    if (rdma_transport->_rdma_state == RdmaTransport::RDMA_OFF) {
+    if (!enabled) {
         local_msg.hello_ver = 0;
         local_msg.impl_ver = 0;
         local_msg.block_size = 0;
@@ -246,19 +258,16 @@ int RdmaHandshakeServerV2::SendLocalHello() {
         memset(local_msg.gid.raw, 0, sizeof(local_msg.gid.raw));
         local_msg.qp_num     = 0;
     } else {
+        ParsedHello local{};
+        FillLocalHello(&local);
         local_msg.hello_ver = HELLO_V2_VERSION;
         local_msg.impl_ver = IMPL_V2_VERSION;
-        local_msg.block_size = g_rdma_recv_block_size;
-        local_msg.sq_size = _ep->_sq_size;
-        local_msg.rq_size = _ep->_rq_size;
-        local_msg.lid = GetRdmaLid();
-        local_msg.gid = GetRdmaGid();
-        if (BAIDU_LIKELY(_ep->_resource)) {
-            local_msg.qp_num = _ep->_resource->qp->qp_num;
-        } else {
-            // Only happens in UT
-            local_msg.qp_num = 0;
-        }
+        local_msg.block_size = local.block_size;
+        local_msg.sq_size = local.sq_size;
+        local_msg.rq_size = local.rq_size;
+        local_msg.lid = local.lid;
+        local_msg.gid = local.gid;
+        local_msg.qp_num = local.qp_num;
     }
     fast_memcpy(data, HELLO_MAGIC, 4);
     local_msg.Serialize((char*)data + 4);
@@ -292,19 +301,14 @@ bool ValidRdmaHello(const RdmaHello& msg) {
     return true;
 }
 
-void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg) {
-    msg->set_block_size(g_rdma_recv_block_size);
-    msg->set_sq_size(ep->_sq_size);
-    msg->set_rq_size(ep->_rq_size);
-    msg->set_lid(GetRdmaLid());
-    ibv_gid gid = GetRdmaGid();
-    msg->set_gid(reinterpret_cast<const char*>(gid.raw), sizeof(gid.raw));
-    if (BAIDU_LIKELY(ep->_resource)) {
-        msg->set_qp_num(ep->_resource->qp->qp_num);
-    } else {
-        // Only happens in UT
-        msg->set_qp_num(0);
-    }
+void FillLocalRdmaHello(const ParsedHello& local, RdmaHello* msg) {
+    msg->set_block_size(local.block_size);
+    msg->set_sq_size(local.sq_size);
+    msg->set_rq_size(local.rq_size);
+    msg->set_lid(local.lid);
+    msg->set_gid(reinterpret_cast<const char*>(local.gid.raw),
+                 sizeof(local.gid.raw));
+    msg->set_qp_num(local.qp_num);
 
     // Advertise ECE only when enabled. Role-dependent payload:
     //   Client hello: the locally queried ECE capabilities;
@@ -315,11 +319,11 @@ void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg) {
     // _outgoing_ece in a role-specific way: client side stores its locally
     // queried capabilities; server side stores the reduced/negotiated ECE
     // after RTS. nullopt -> omit the field (peer degrades to no-ECE).
-    if (FLAGS_rdma_ece && ep->_outgoing_ece.has_value()) {
+    if (FLAGS_rdma_ece && local.ece.has_value()) {
         RdmaEce* ece = msg->mutable_ece();
-        ece->set_vendor_id(ep->_outgoing_ece->vendor_id);
-        ece->set_options(ep->_outgoing_ece->options);
-        ece->set_comp_mask(ep->_outgoing_ece->comp_mask);
+        ece->set_vendor_id(local.ece->vendor_id);
+        ece->set_options(local.ece->options);
+        ece->set_comp_mask(local.ece->comp_mask);
     }
 }
 
@@ -387,28 +391,23 @@ void TranslateHello(const RdmaHello& msg, ParsedHello* out) {
 
 }  // namespace v3_wire
 
-int RdmaHandshakeClientV3::SendLocalHello() {
+int RdmaClientHandshakeAdapterV3::SendLocalHello(bool enabled) {
+    CHECK(enabled);
     // Query local ECE capabilities so they can be advertised in the client
     // hello. v3-only. Best-effort: any failure or missing API just means we
     // won't advertise ECE (the peer then degrades to no-ECE establishment).
-    if (FLAGS_rdma_ece && IbvQueryEce != NULL &&
-        _ep->_resource && _ep->_resource->qp) {
-        ibv_ece ece;
-        if (IbvQueryEce(_ep->_resource->qp, &ece) == 0) {
-            _ep->_outgoing_ece = ece;
-        } else {
-            LOG_IF(WARNING, FLAGS_rdma_trace_verbose)
-                << "Fail to IbvQueryEce on client, ECE not advertised: "
-                << _ep->_socket->description();
-        }
-    }
+    PrepareClientEce();
 
+    ParsedHello local{};
+    FillLocalHello(&local);
     RdmaHello local_msg{};
-    v3_wire::FillLocalRdmaHello(_ep, &local_msg);
+    v3_wire::FillLocalRdmaHello(local, &local_msg);
     return v3_wire::WriteV3Hello(_io, local_msg);
 }
 
-RemoteHelloResult RdmaHandshakeClientV3::ReceiveAndParseRemoteHello(ParsedHello* remote) {
+RemoteHelloResult
+RdmaClientHandshakeAdapterV3::ReceiveAndParseRemoteHello(
+    ParsedHello* remote) {
     uint8_t magic[HELLO_MAGIC_LEN];
     if (_io->ReadExact(magic, HELLO_MAGIC_LEN) < 0) {
         return RemoteHelloResult::ERROR;
@@ -431,7 +430,9 @@ RemoteHelloResult RdmaHandshakeClientV3::ReceiveAndParseRemoteHello(ParsedHello*
 
 // Parse one complete v3 client hello out of `_source` (non-blocking).
 // v3 hello: [ "RDM3" 4B ][ pb_size 4B (big-endian) ][ RdmaHello ]
-RemoteHelloResult RdmaHandshakeServerV3::ReceiveAndParseRemoteHello(ParsedHello* remote) {
+RemoteHelloResult
+RdmaServerHandshakeAdapterV3::ReceiveAndParseRemoteHello(
+    ParsedHello* remote) {
     constexpr size_t HDR_LEN = HELLO_MAGIC_LEN + HELLO_V3_PB_SIZE_LEN;
     if (_source->size() < HDR_LEN) {
         // pb_size has not fully arrived yet.
@@ -470,10 +471,9 @@ RemoteHelloResult RdmaHandshakeServerV3::ReceiveAndParseRemoteHello(ParsedHello*
     return RemoteHelloResult::NEGOTIATED;
 }
 
-int RdmaHandshakeServerV3::SendLocalHello() {
+int RdmaServerHandshakeAdapterV3::SendLocalHello(bool enabled) {
     RdmaHello local_msg{};
-    auto rdma_transport = static_cast<RdmaTransport*>(_ep->_socket->_transport.get());
-    if (rdma_transport->_rdma_state == RdmaTransport::RDMA_OFF) {
+    if (!enabled) {
         // Un-negotiable hello: all body fields are zero so the client's
         // rejects it and downgrades to TCP on the same connection.
         local_msg.set_block_size(0);
@@ -483,32 +483,36 @@ int RdmaHandshakeServerV3::SendLocalHello() {
         local_msg.set_gid(std::string(sizeof(ibv_gid), '\0'));
         local_msg.set_qp_num(0);
     } else {
-        v3_wire::FillLocalRdmaHello(_ep, &local_msg);
+        ParsedHello local{};
+        FillLocalHello(&local);
+        v3_wire::FillLocalRdmaHello(local, &local_msg);
     }
     return v3_wire::WriteV3Hello(_io, local_msg);
 }
 
-std::unique_ptr<RdmaHandshake> CreateClientHandshake(
+std::unique_ptr<RdmaHandshakeAdapter> CreateClientHandshakeAdapter(
     RdmaEndpoint* ep, handshake::SocketHandshakeIO* io) {
     switch (FLAGS_rdma_client_handshake_version) {
     case 3:
-        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV3(ep, io));
+        return std::unique_ptr<RdmaHandshakeAdapter>(
+            new RdmaClientHandshakeAdapterV3(ep, io));
     case 2:
     default:
-        return std::unique_ptr<RdmaHandshake>(new RdmaHandshakeClientV2(ep, io));
+        return std::unique_ptr<RdmaHandshakeAdapter>(
+            new RdmaClientHandshakeAdapterV2(ep, io));
     }
 }
 
-std::unique_ptr<RdmaHandshake> CreateServerHandshakeByMagic(
+std::unique_ptr<RdmaHandshakeAdapter> CreateServerHandshakeAdapterByMagic(
     RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, butil::IOBuf* source,
     const uint8_t magic[HELLO_MAGIC_LEN]) {
     if (memcmp(magic, HELLO_MAGIC, HELLO_MAGIC_LEN) == 0) {
-        return std::unique_ptr<RdmaHandshake>(
-                new RdmaHandshakeServerV2(ep, io, source));
+        return std::unique_ptr<RdmaHandshakeAdapter>(
+            new RdmaServerHandshakeAdapterV2(ep, io, source));
     }
     if (memcmp(magic, HELLO_MAGIC_V3, HELLO_MAGIC_LEN) == 0) {
-        return std::unique_ptr<RdmaHandshake>(
-                new RdmaHandshakeServerV3(ep, io, source));
+        return std::unique_ptr<RdmaHandshakeAdapter>(
+            new RdmaServerHandshakeAdapterV3(ep, io, source));
     }
     return NULL;
 }

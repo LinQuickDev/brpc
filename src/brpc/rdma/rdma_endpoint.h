@@ -31,7 +31,6 @@
 #include "butil/containers/mpsc_queue.h"
 #include "butil/containers/optional.h"
 #include "brpc/socket.h"
-#include "brpc/rdma/rdma_handshake_server.h"
 
 
 namespace brpc {
@@ -43,18 +42,17 @@ DECLARE_bool(rdma_use_polling);
 DECLARE_int32(rdma_poller_num);
 DECLARE_bool(rdma_disable_bthread);
 
-class RdmaHandshakeClientV2;
-class RdmaHandshakeServerV2;
-class RdmaHandshakeClientV3;
-class RdmaHandshakeServerV3;
-struct ParsedHello;
-enum class RemoteHelloResult;
-class RdmaHello;
-class RdmaEndpoint;
-
-namespace v3_wire {
-    void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg);
-}  // namespace v3_wire
+// Wire-independent RDMA connection parameters consumed by resource setup.
+// Transport adapters translate their protocol-specific payload into this DTO.
+struct RdmaConnectionInfo {
+    uint32_t block_size;
+    uint16_t sq_size;
+    uint16_t rq_size;
+    uint16_t lid;
+    ibv_gid gid;
+    uint32_t qp_num;
+    butil::optional<ibv_ece> ece;
+};
 
 class RdmaConnect : public AppConnect {
 public:
@@ -90,43 +88,10 @@ struct RdmaResource {
 class BAIDU_CACHELINE_ALIGNMENT RdmaEndpoint : public SocketUser {
 friend class RdmaConnect;
 friend class Socket;
-friend class RdmaHandshakeClientV2;
-friend class RdmaHandshakeServerV2;
-friend class RdmaHandshakeClientV3;
-friend class RdmaHandshakeServerV3;
 friend class ::brpc::RdmaTransport;
-friend void v3_wire::FillLocalRdmaHello(const RdmaEndpoint*, RdmaHello*);
 public:
     explicit RdmaEndpoint(Socket* s);
     ~RdmaEndpoint() override;
-
-#ifdef UNIT_TEST
-    // Compatibility view for existing handshake tests. Production builds do
-    // not store handshake state in the endpoint; the value is read from the
-    // owning transport.
-    enum State {
-        UNINIT = 0x0,
-        C_ALLOC_QPCQ = 0x1,
-        C_HELLO_SEND = 0x2,
-        C_HELLO_WAIT = 0x3,
-        C_BRINGUP_QP = 0x4,
-        C_ACK_SEND = 0x5,
-        S_HELLO_WAIT = 0x11,
-        S_ALLOC_QPCQ = 0x12,
-        S_BRINGUP_QP = 0x13,
-        S_HELLO_SEND = 0x14,
-        S_ACK_WAIT = 0x15,
-        ESTABLISHED = 0x100,
-        FALLBACK_TCP = 0x200,
-        FAILED = 0x300
-    };
-    struct StateView {
-        explicit StateView(Socket* socket) : _socket(socket) {}
-        operator State() const;
-        Socket* _socket;
-    };
-    StateView _state;
-#endif
 
     // Global initialization
     // Return 0 if success, -1 if failed and errno set
@@ -144,6 +109,12 @@ public:
     // Whether the endpoint can send more data
     bool IsWritable() const;
 
+    // Resource information consumed by the transport-level RDMA adapter.
+    void GetLocalConnectionInfo(RdmaConnectionInfo* local) const;
+    // Returns 0 on success, 1 when ECE query is unavailable, -1 on error.
+    int QueryLocalEce(ibv_ece* ece) const;
+    void SetOutgoingEce(const ibv_ece& ece);
+
     // For debug
     void DebugInfo(std::ostream& os,
                    butil::StringPiece connector = "\n") const;
@@ -158,7 +129,7 @@ public:
 
 private:
     // Allocate resources. On failure the endpoint is left with no RDMA
-    // resource attached, so that the handshake can safely fall back to TCP.
+    // resource attached, so the caller can safely continue without RDMA.
     // Return 0 if success, -1 if failed and errno set
     int AllocateResources();
 
@@ -208,18 +179,17 @@ private:
     int DoPostRecv(void* block, size_t block_size);
 
     // Copy negotiated remote parameters into the endpoint and compute the
-    // SQ/RQ window capacities. Called by RdmaTransport after the peer's hello
-    // has been validated.
-    void ApplyRemoteHello(const ParsedHello& remote);
+    // SQ/RQ window capacities.
+    void ApplyRemoteInfo(const RdmaConnectionInfo& remote);
 
     // Bringup the QP from RESET state to RTS state.
     // Arguments:
-    //   remote: parsed remote hello. Provides the remote LID/GID/QP
+    //   remote: negotiated peer parameters. Provides the remote LID/GID/QP
     //           number for the RTR transition, and (on v3) the peer's
     //           ECE to set during the INIT->RTR transition.
     //   is_server: true on the server side, false on the client side.
     // Returns 0 on success, -1 on failed and errno set.
-    int BringUpQp(const ParsedHello& remote, bool is_server);
+    int BringUpQp(const RdmaConnectionInfo& remote, bool is_server);
 
     // Get event from comp channel and ack the events
     int GetAndAckEvents(SocketUniquePtr& s);
@@ -239,11 +209,7 @@ private:
     // Not owner
     Socket* _socket;
 
-    // ECE payload to advertise in the next local hello:
-    //   Client: the locally queried ECE capabilities (filled
-    //           before C_HELLO_SEND);
-    //   Server: the reduced/negotiated ECE queried after the
-    //           QP reached RTS (filled in BringUpQp).
+    // ECE payload prepared by resource setup and consumed by the RDMA adapter.
     butil::optional<ibv_ece> _outgoing_ece;
 
     // rdma resource

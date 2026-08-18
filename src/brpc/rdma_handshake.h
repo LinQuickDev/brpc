@@ -24,7 +24,8 @@
 #include <infiniband/verbs.h>
 #include "butil/macros.h"
 #include "butil/containers/optional.h"
-#include "brpc/rdma/rdma_handshake_constants.h"
+#include "brpc/rdma/rdma_endpoint.h"
+#include "brpc/rdma_handshake_constants.h"
 #include "brpc/transport_handshake.h"
 
 namespace butil {
@@ -34,26 +35,11 @@ class IOBuf;
 namespace brpc {
 namespace rdma {
 
-class RdmaEndpoint;
-
 // Wire-format-agnostic representation of a peer's hello message.
 // Each protocol version (v2 binary, v3 protobuf) translates its own
 // wire format into this struct so the state-machine driver in RdmaTransport
 // stays free of any wire-format details.
-struct ParsedHello {
-    uint32_t block_size;
-    uint16_t sq_size;
-    uint16_t rq_size;
-    uint16_t lid;
-    ibv_gid  gid;
-    uint32_t qp_num;
-    // ECE (Enhanced Connection Establishment), v3 handshake only.
-    // nullopt means the peer did not advertise any ECE (either it disabled
-    // ECE, its lib does not support ECE, or it is a v2 peer). When engaged:
-    //   - on the server side: the client's queried ECE capabilities;
-    //   - on the client side: the server's reduced/negotiated ECE.
-    butil::optional<ibv_ece> ece;
-};
+using ParsedHello = RdmaConnectionInfo;
 
 // Result of reading/parsing a peer's hello (see ReceiveAndParseRemoteHello).
 enum class RemoteHelloResult {
@@ -88,13 +74,14 @@ struct HelloMessage {
 }  // namespace v2_wire
 
 // Base class of an RDMA handshake, shared by both roles.
-class RdmaHandshake {
+class RdmaHandshakeAdapter {
 public:
-    RdmaHandshake(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, int version)
+    RdmaHandshakeAdapter(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, int version)
         : _ep(ep), _io(io), _version(version) {}
-    virtual ~RdmaHandshake() = default;
+    virtual ~RdmaHandshakeAdapter() = default;
 
-    DISALLOW_COPY_AND_ASSIGN(RdmaHandshake);
+    DISALLOW_COPY_AND_ASSIGN(RdmaHandshakeAdapter);
 
     // Wire-level protocol version (2 for "RDMA", 3 for "RDM3").
     int ProtocolVersion() const { return _version; }
@@ -108,12 +95,19 @@ public:
     //   - v2: zero hello_ver/impl_ver so the peer's HelloNegotiationValid
     //         rejects it;
     //   - v3: qp_num==0 so the peer's ValidRdmaHello rejects it.
-    virtual int SendLocalHello() = 0;
+    virtual int SendLocalHello(bool enabled) = 0;
 
     // Read and parse the peer's hello into *remote.
     virtual RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) = 0;
 
 protected:
+    // Translate the endpoint's local resource state into the wire-independent
+    // adapter representation. Endpoint internals never leak into the codec.
+    void FillLocalHello(ParsedHello* local) const;
+
+    // Best-effort v3 client ECE preparation. Failure only disables ECE.
+    void PrepareClientEce();
+
     RdmaEndpoint* _ep;
     handshake::SocketHandshakeIO* _io;
     int _version;
@@ -121,50 +115,55 @@ protected:
 
 // Server-side handshake base: parses the remote hello non-blockingly out of
 // `_source` (an IOBuf filled by InputMessenger), never touching the fd.
-class ServerRdmaHandshake : public RdmaHandshake {
+class RdmaServerHandshakeAdapter : public RdmaHandshakeAdapter {
 public:
-    ServerRdmaHandshake(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
-                        butil::IOBuf* source, int version)
-        : RdmaHandshake(ep, io, version), _source(source) {}
+    RdmaServerHandshakeAdapter(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+        butil::IOBuf* source, int version)
+        : RdmaHandshakeAdapter(ep, io, version), _source(source) {}
 
 protected:
     butil::IOBuf* _source;
 };
 
 // v2 handshake (legacy "RDMA" magic, 36B binary HelloMessage).
-class RdmaHandshakeClientV2 : public RdmaHandshake {
+class RdmaClientHandshakeAdapterV2 : public RdmaHandshakeAdapter {
 public:
-    RdmaHandshakeClientV2(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
-        : RdmaHandshake(ep, io, 2) {}
-    int SendLocalHello() override;
+    RdmaClientHandshakeAdapterV2(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
+        : RdmaHandshakeAdapter(ep, io, 2) {}
+    int SendLocalHello(bool enabled) override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
-class RdmaHandshakeServerV2 : public ServerRdmaHandshake {
+class RdmaServerHandshakeAdapterV2 : public RdmaServerHandshakeAdapter {
 public:
-    RdmaHandshakeServerV2(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
-                          butil::IOBuf* source)
-        : ServerRdmaHandshake(ep, io, source, 2) {}
-    int SendLocalHello() override;
+    RdmaServerHandshakeAdapterV2(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+        butil::IOBuf* source)
+        : RdmaServerHandshakeAdapter(ep, io, source, 2) {}
+    int SendLocalHello(bool enabled) override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
 // v3 handshake (new "RDM3" magic, protobuf RdmaHello).
 // [ "RDM3" 4B ][ pb_size 4B (big-endian) ][ RdmaHello protobuf bytes ]
-class RdmaHandshakeClientV3 : public RdmaHandshake {
+class RdmaClientHandshakeAdapterV3 : public RdmaHandshakeAdapter {
 public:
-    RdmaHandshakeClientV3(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
-        : RdmaHandshake(ep, io, 3) {}
-    int SendLocalHello() override;
+    RdmaClientHandshakeAdapterV3(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io)
+        : RdmaHandshakeAdapter(ep, io, 3) {}
+    int SendLocalHello(bool enabled) override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
-class RdmaHandshakeServerV3 : public ServerRdmaHandshake {
+class RdmaServerHandshakeAdapterV3 : public RdmaServerHandshakeAdapter {
 public:
-    RdmaHandshakeServerV3(RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
-                          butil::IOBuf* source)
-        : ServerRdmaHandshake(ep, io, source, 3) {}
-    int SendLocalHello() override;
+    RdmaServerHandshakeAdapterV3(
+        RdmaEndpoint* ep, handshake::SocketHandshakeIO* io,
+        butil::IOBuf* source)
+        : RdmaServerHandshakeAdapter(ep, io, source, 3) {}
+    int SendLocalHello(bool enabled) override;
     RemoteHelloResult ReceiveAndParseRemoteHello(ParsedHello* remote) override;
 };
 
@@ -172,18 +171,18 @@ public:
 //
 // Pick the client-side handshake based on
 // FLAGS_rdma_client_handshake_version:
-//   2 (default) -> RdmaHandshakeClientV2
-//   3           -> RdmaHandshakeClientV3
+//   2 (default) -> RdmaClientHandshakeAdapterV2
+//   3           -> RdmaClientHandshakeAdapterV3
 // Other values fall back to V2.
-std::unique_ptr<RdmaHandshake> CreateClientHandshake(
+std::unique_ptr<RdmaHandshakeAdapter> CreateClientHandshakeAdapter(
     RdmaEndpoint* ep, handshake::SocketHandshakeIO* io);
 
 // Pick the server-side handshake based on the 4B magic already read.
 // Returns NULL if `magic` is not a recognized RDMA magic
 // (the caller should then fallback to TCP).
-//   "RDMA" -> RdmaHandshakeServerV2
-//   "RDM3" -> RdmaHandshakeServerV3
-std::unique_ptr<RdmaHandshake> CreateServerHandshakeByMagic(
+//   "RDMA" -> RdmaServerHandshakeAdapterV2
+//   "RDM3" -> RdmaServerHandshakeAdapterV3
+std::unique_ptr<RdmaHandshakeAdapter> CreateServerHandshakeAdapterByMagic(
     RdmaEndpoint* ep, handshake::SocketHandshakeIO* io, butil::IOBuf* source,
     const uint8_t magic[HELLO_MAGIC_LEN]);
 

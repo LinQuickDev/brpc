@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "brpc/upgrade_transport.h"
+#include "brpc/adapter_transport.h"
 
 #include <cstdint>
 #include <errno.h>
@@ -26,7 +26,7 @@
 
 namespace brpc {
 
-void UpgradeTransport::InitUpgradeTransport(
+void AdapterTransport::InitAdapterTransport(
     Socket* socket, const SocketOptions& options,
     const OnEdgeTrigger& default_on_edge) {
     _socket = socket;
@@ -40,11 +40,11 @@ void UpgradeTransport::InitUpgradeTransport(
     _tcp_transport->Init(socket, options);
 }
 
-void UpgradeTransport::ResetUpgradeTransport() {
+void AdapterTransport::ResetAdapterTransport() {
     _handshake.Reset(_socket);
 }
 
-int UpgradeTransport::CutFromIOBuf(butil::IOBuf* buf) {
+int AdapterTransport::CutFromIOBuf(butil::IOBuf* buf) {
     if (_handshake.phase() == handshake::ESTABLISHED) {
         butil::IOBuf* data[1] = {buf};
         return CutFromHighSpeedIOBufList(data, 1);
@@ -52,7 +52,7 @@ int UpgradeTransport::CutFromIOBuf(butil::IOBuf* buf) {
     return _tcp_transport->CutFromIOBuf(buf);
 }
 
-ssize_t UpgradeTransport::CutFromIOBufList(
+ssize_t AdapterTransport::CutFromIOBufList(
     butil::IOBuf** buf, size_t ndata) {
     if (_handshake.phase() == handshake::ESTABLISHED) {
         return CutFromHighSpeedIOBufList(buf, ndata);
@@ -60,7 +60,7 @@ ssize_t UpgradeTransport::CutFromIOBufList(
     return _tcp_transport->CutFromIOBufList(buf, ndata);
 }
 
-int UpgradeTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
+int AdapterTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
                                     bool pollin, timespec duetime) {
     if (_handshake.phase() == handshake::ESTABLISHED) {
         return WaitHighSpeedEpollOut(epollout_butex, pollin, duetime);
@@ -68,17 +68,17 @@ int UpgradeTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
     return _tcp_transport->WaitEpollOut(epollout_butex, pollin, duetime);
 }
 
-void UpgradeTransport::FallbackToTcp() {
+void AdapterTransport::FallbackToTcp() {
     _handshake.PublishFallback([this]() {
         SetHighSpeedAvailable(false);
     });
 }
 
-void UpgradeTransport::OnNewDataFromTcp(Socket* socket) {
-    static_cast<UpgradeTransport*>(socket->_transport.get())->ProcessTcpEvent();
+void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
+    static_cast<AdapterTransport*>(socket->_transport.get())->ProcessTcpEvent();
 }
 
-void UpgradeTransport::ProcessTcpEvent() {
+void AdapterTransport::ProcessTcpEvent() {
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         const int phase = _handshake.phase();
@@ -104,7 +104,7 @@ void UpgradeTransport::ProcessTcpEvent() {
     }
 }
 
-void UpgradeTransport::CheckUnexpectedTcpData() {
+void AdapterTransport::CheckUnexpectedTcpData() {
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         uint8_t byte;
@@ -131,7 +131,7 @@ void UpgradeTransport::CheckUnexpectedTcpData() {
     }
 }
 
-void UpgradeTransport::TryReadOnTcp() {
+void AdapterTransport::TryReadOnTcp() {
     if (_socket->_nevent.fetch_add(1, butil::memory_order_acq_rel) != 0) {
         return;
     }

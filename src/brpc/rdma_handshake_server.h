@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
-#define BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
+#ifndef BRPC_RDMA_HANDSHAKE_SERVER_H
+#define BRPC_RDMA_HANDSHAKE_SERVER_H
 
 #include "brpc/parse_result.h"
 #include "brpc/transport_handshake.h"
@@ -41,4 +41,4 @@ ParseResult ExecuteServerHandshake(butil::IOBuf* source, Socket* socket);
 }  // namespace rdma
 }  // namespace brpc
 
-#endif  // BRPC_RDMA_RDMA_HANDSHAKE_SERVER_H
+#endif  // BRPC_RDMA_HANDSHAKE_SERVER_H

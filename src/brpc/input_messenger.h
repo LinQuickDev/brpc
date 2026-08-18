@@ -34,7 +34,7 @@ class UBShmEndpoint;
 }
 class TcpTransport;
 class RdmaTransport;
-class UpgradeTransport;
+class AdapterTransport;
 struct InputMessageHandler {
     // The callback to cut a message from `source'.
     // Returned message will be passed to process_request or process_response
@@ -98,7 +98,7 @@ class InputMessenger : public SocketUser {
 friend class Socket;
 friend class TcpTransport;
 friend class RdmaTransport;
-friend class UpgradeTransport;
+friend class AdapterTransport;
 friend class rdma::RdmaEndpoint;
 friend class ubring::UBShmEndpoint;
 public:

@@ -42,7 +42,7 @@ void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
         _ub_state = UB_OFF;
         socket->_socket_mode = SOCKET_MODE_TCP;
     }
-    InitUpgradeTransport(socket, options, UpgradeTransport::OnNewDataFromTcp);
+    InitAdapterTransport(socket, options, AdapterTransport::OnNewDataFromTcp);
 }
 
 void UBShmTransport::Release() {
@@ -58,7 +58,7 @@ int UBShmTransport::Reset(int32_t expected_nref) {
         _ub_ep->Reset();
         _ub_state = UB_UNKNOWN;
     }
-    ResetUpgradeTransport();
+    ResetAdapterTransport();
     return 0;
 }
 

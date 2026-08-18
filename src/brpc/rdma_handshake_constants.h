@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_RDMA_RDMA_HANDSHAKE_CONSTANTS_H
-#define BRPC_RDMA_RDMA_HANDSHAKE_CONSTANTS_H
+#ifndef BRPC_RDMA_HANDSHAKE_CONSTANTS_H
+#define BRPC_RDMA_HANDSHAKE_CONSTANTS_H
 
 namespace brpc {
 namespace rdma {
@@ -53,4 +53,4 @@ constexpr uint32_t HELLO_ACK_RDMA_OK = 0x1;
 }  // namespace rdma
 }  // namespace brpc
 
-#endif  // BRPC_RDMA_RDMA_HANDSHAKE_CONSTANTS_H
+#endif  // BRPC_RDMA_HANDSHAKE_CONSTANTS_H

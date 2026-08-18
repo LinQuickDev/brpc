@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "brpc/rdma/rdma_handshake_server.h"
+#include "brpc/rdma_handshake_server.h"
 
 #include <limits>
 #include <string>
@@ -25,8 +25,8 @@
 #include "butil/raw_pack.h"
 #include "butil/sys_byteorder.h"
 #include "brpc/socket.h"
-#include "brpc/rdma/rdma_handshake.pb.h"
-#include "brpc/rdma/rdma_handshake_constants.h"
+#include "brpc/rdma_handshake.pb.h"
+#include "brpc/rdma_handshake_constants.h"
 #if BRPC_WITH_RDMA
 #include "brpc/rdma_transport.h"
 #endif
@@ -173,9 +173,9 @@ static ParseResult FallbackServerHandshake(butil::IOBuf* source, Socket* socket)
         if (SendUnnegotiableHello(socket, version) < 0) {
             return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
         }
-        // Wait for the client ACK across subsequent reads.
+        // Keep the phase across subsequent reads, then immediately try the
+        // ACK path below in case Hello and ACK arrived in one TCP packet.
         socket->reset_parsing_context(ServerHandshakeContext::Create());
-        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
 
     // Phase 2: drain the 4B ACK.

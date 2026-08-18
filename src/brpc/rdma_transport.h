@@ -21,15 +21,13 @@
 #if BRPC_WITH_RDMA
 #include "brpc/socket.h"
 #include "brpc/channel.h"
-#include "brpc/upgrade_transport.h"
+#include "brpc/adapter_transport.h"
 
 namespace brpc {
-class RdmaTransport : public UpgradeTransport {
+class RdmaTransport : public AdapterTransport {
     friend class TransportFactory;
     friend class rdma::RdmaEndpoint;
     friend class rdma::RdmaConnect;
-    friend class rdma::RdmaHandshakeServerV2;
-    friend class rdma::RdmaHandshakeServerV3;
 public:
     enum HandshakeState {
         UNINIT = 0x0,

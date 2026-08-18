@@ -31,8 +31,6 @@
 #include "brpc/rdma/rdma_helper.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma_transport.h"
-#include "brpc/rdma/rdma_handshake.h"
-#include "brpc/rdma/rdma_handshake_constants.h"
 
 DECLARE_int32(task_group_ntags);
 
@@ -53,8 +51,7 @@ extern int (*IbvQueryEce)(ibv_qp*, ibv_ece*);
 extern int (*IbvSetEce)(ibv_qp*, ibv_ece*);
 extern bool g_skip_rdma_init;
 
-// Only for UT: force AllocateResources() to fail, so that the "fallback to TCP" path
-// of the handshake can be tested without a real RDMA device.
+// Only for UT: force AllocateResources() to fail without a real RDMA device.
 bool g_fail_resource_alloc_for_test = false;
 
 DEFINE_int32(rdma_sq_size, 128, "SQ size for RDMA");
@@ -110,12 +107,7 @@ RdmaResource::~RdmaResource() {
 }
 
 RdmaEndpoint::RdmaEndpoint(Socket* s)
-#ifdef UNIT_TEST
-    : _state(s)
-    , _socket(s)
-#else
     : _socket(s)
-#endif
     , _resource(NULL)
     , _send_cq_events(0)
     , _recv_cq_events(0)
@@ -151,14 +143,6 @@ RdmaEndpoint::RdmaEndpoint(Socket* s)
     }
 }
 
-#ifdef UNIT_TEST
-RdmaEndpoint::StateView::operator State() const {
-    const RdmaTransport* transport =
-        static_cast<const RdmaTransport*>(_socket->_transport.get());
-    return static_cast<State>(transport->handshake_phase());
-}
-#endif
-
 RdmaEndpoint::~RdmaEndpoint() {
     Reset();
 }
@@ -190,7 +174,7 @@ void RdmaEndpoint::Reset() {
     _new_rq_wrs.store(0, butil::memory_order_relaxed);
 }
 
-void RdmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
+void RdmaEndpoint::ApplyRemoteInfo(const RdmaConnectionInfo& remote) {
     _remote_recv_block_size = remote.block_size;
     _local_window_capacity = std::min(_sq_size, remote.rq_size) - RESERVED_WR_NUM;
     _remote_window_capacity = std::min(_rq_size, remote.sq_size) - RESERVED_WR_NUM;
@@ -199,24 +183,33 @@ void RdmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
     _sq_window_size.store(_local_window_capacity, butil::memory_order_relaxed);
 }
 
-// Client-side handshake entry: the state machine.
-//
-//   C_ALLOC_QPCQ
-//     |
-//     v
-//   C_HELLO_SEND  (hs->SendLocalHello)
-//     |
-//     v
-//   C_HELLO_WAIT  (hs->ReceiveAndParseRemoteHello)
-//     |
-//     v
-//   [negotiation: ApplyRemoteHello + C_BRINGUP_QP]
-//     |
-//     v
-//   C_ACK_SEND
-//     |
-//     v
-//   ESTABLISHED / FALLBACK_TCP
+void RdmaEndpoint::GetLocalConnectionInfo(RdmaConnectionInfo* local) const {
+    CHECK(local != NULL);
+    local->block_size = g_rdma_recv_block_size;
+    local->sq_size = _sq_size;
+    local->rq_size = _rq_size;
+    local->lid = GetRdmaLid();
+    local->gid = GetRdmaGid();
+    local->qp_num = BAIDU_LIKELY(_resource)
+        ? _resource->qp->qp_num : 0;
+    local->ece.reset();
+    if (_outgoing_ece.has_value()) {
+        local->ece = _outgoing_ece;
+    }
+}
+
+int RdmaEndpoint::QueryLocalEce(ibv_ece* ece) const {
+    if (ece == NULL || IbvQueryEce == NULL ||
+        _resource == NULL || _resource->qp == NULL) {
+        return 1;
+    }
+    return IbvQueryEce(_resource->qp, ece) == 0 ? 0 : -1;
+}
+
+void RdmaEndpoint::SetOutgoingEce(const ibv_ece& ece) {
+    _outgoing_ece = ece;
+}
+
 bool RdmaEndpoint::IsWritable() const {
     if (BAIDU_UNLIKELY(g_skip_rdma_init)) {
         // Just for UT
@@ -735,7 +728,8 @@ int RdmaEndpoint::DoAllocateResources() {
     return 0;
 }
 
-int RdmaEndpoint::BringUpQp(const ParsedHello& remote, bool is_server) {
+int RdmaEndpoint::BringUpQp(
+    const RdmaConnectionInfo& remote, bool is_server) {
     if (BAIDU_UNLIKELY(g_skip_rdma_init)) {
         // For UT
         return 0;
@@ -763,7 +757,7 @@ int RdmaEndpoint::BringUpQp(const ParsedHello& remote, bool is_server) {
     // End-to-end model:
     //   Server: `remote->ece' is the client's queried ECE; set it here,
     //           then after RTS we query the reduced/negotiated ECE and
-    //           send it back in the server hello.
+    //           return it in the server negotiation response.
     //   Client: `remote->ece' is the server's reduced ECE;
     //           just set it here.
     bool use_ece = true;
@@ -832,7 +826,7 @@ int RdmaEndpoint::BringUpQp(const ParsedHello& remote, bool is_server) {
 
     // On the server side, now that the QP reached RTS, query the reduced/negotiated
     // ECE (the subset of enhancements supported by both peers) so it can be returned
-    // to the client in the server hello.
+    // to the client in the server negotiation response.
     if (is_server && use_ece && IbvQueryEce != NULL && remote.ece.has_value()) {
         ibv_ece ece;
         int qerr = IbvQueryEce(_resource->qp, &ece);

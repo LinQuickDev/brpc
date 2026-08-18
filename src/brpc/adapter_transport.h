@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_UPGRADE_TRANSPORT_H
-#define BRPC_UPGRADE_TRANSPORT_H
+#ifndef BRPC_ADAPTER_TRANSPORT_H
+#define BRPC_ADAPTER_TRANSPORT_H
 
 #include <memory>
 
@@ -29,7 +29,7 @@ class TcpTransport;
 
 // A TCP-first transport that may switch its data plane after a successful
 // handshake. TCP remains usable before negotiation and after fallback.
-class UpgradeTransport : public Transport {
+class AdapterTransport : public Transport {
 public:
     int CutFromIOBuf(butil::IOBuf* buf) override;
     ssize_t CutFromIOBufList(butil::IOBuf** buf, size_t ndata) override;
@@ -42,12 +42,12 @@ public:
     static void OnNewDataFromTcp(Socket* socket);
 
 protected:
-    UpgradeTransport() = default;
-    ~UpgradeTransport() override = default;
+    AdapterTransport() = default;
+    ~AdapterTransport() override = default;
 
-    void InitUpgradeTransport(Socket* socket, const SocketOptions& options,
+    void InitAdapterTransport(Socket* socket, const SocketOptions& options,
                               const OnEdgeTrigger& default_on_edge);
-    void ResetUpgradeTransport();
+    void ResetAdapterTransport();
 
     void FallbackToTcp();
     void TryReadOnTcp();
@@ -73,4 +73,4 @@ private:
 
 }  // namespace brpc
 
-#endif  // BRPC_UPGRADE_TRANSPORT_H
+#endif  // BRPC_ADAPTER_TRANSPORT_H

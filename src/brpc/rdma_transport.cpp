@@ -22,9 +22,9 @@
 #include "brpc/event_dispatcher.h"
 #include "brpc/input_messenger.h"
 #include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma/rdma_handshake.h"
-#include "brpc/rdma/rdma_handshake_constants.h"
-#include "brpc/rdma/rdma_handshake_server.h"
+#include "brpc/rdma_handshake.h"
+#include "brpc/rdma_handshake_constants.h"
+#include "brpc/rdma_handshake_server.h"
 #include "brpc/rdma/rdma_helper.h"
 
 namespace brpc {
@@ -85,8 +85,9 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
     LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
         << "Start handshake on " << socket->description();
 
-    std::unique_ptr<rdma::RdmaHandshake> protocol =
-        rdma::CreateClientHandshake(ep, transport->_handshake.io());
+    std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol =
+        rdma::CreateClientHandshakeAdapter(
+            ep, transport->_handshake.io());
     CHECK(protocol != NULL);
     transport->_handshake.set_protocol_version(protocol->ProtocolVersion());
     rdma::ParsedHello remote{};
@@ -107,7 +108,7 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
         return handshake::STEP_FALLBACK;
     };
     callbacks.send_local_hello = [&]() {
-        if (protocol->SendLocalHello() == 0) {
+        if (protocol->SendLocalHello(true) == 0) {
             return handshake::STEP_OK;
         }
         const int saved_errno = errno;
@@ -132,7 +133,7 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
         return handshake::STEP_ERROR;
     };
     callbacks.negotiate_resources = [&]() {
-        ep->ApplyRemoteHello(remote);
+        ep->ApplyRemoteInfo(remote);
         if (ep->BringUpQp(remote, false) == 0) {
             return handshake::STEP_OK;
         }
@@ -183,13 +184,12 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
     rdma::RdmaEndpoint* ep = transport->_rdma_ep;
     CHECK(ep != NULL);
 
-    std::unique_ptr<rdma::RdmaHandshake> protocol;
+    std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol;
     rdma::ParsedHello remote{};
     handshake::ServerHandshakeCallbacks callbacks{};
     callbacks.phases = handshake::HandshakePhases{
         S_ALLOC_QPCQ, S_HELLO_SEND, S_HELLO_WAIT,
         S_BRINGUP_QP, 0, S_ACK_WAIT};
-    callbacks.blocking = false;
     callbacks.fallback_on_not_mine = false;
     callbacks.receive_remote_hello = [&]() {
         if (source->size() < rdma::HELLO_MAGIC_LEN) {
@@ -197,7 +197,7 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
         }
         uint8_t magic[rdma::HELLO_MAGIC_LEN];
         CHECK_EQ(source->copy_to(magic, sizeof(magic)), sizeof(magic));
-        protocol = rdma::CreateServerHandshakeByMagic(
+        protocol = rdma::CreateServerHandshakeAdapterByMagic(
             ep, transport->_handshake.io(), source, magic);
         if (protocol == NULL) {
             return handshake::STEP_NOT_MINE;
@@ -218,7 +218,7 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
         return handshake::STEP_FALLBACK;
     };
     callbacks.prepare_local = [&]() {
-        ep->ApplyRemoteHello(remote);
+        ep->ApplyRemoteInfo(remote);
         if (ep->AllocateResources() < 0) {
             PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
                           << socket->description();
@@ -234,9 +234,9 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
         }
         return handshake::STEP_OK;
     };
-    callbacks.send_local_hello = [&](bool) {
+    callbacks.send_local_hello = [&](bool enabled) {
         CHECK(protocol != NULL);
-        return protocol->SendLocalHello() == 0
+        return protocol->SendLocalHello(enabled) == 0
             ? handshake::STEP_OK : handshake::STEP_ERROR;
     };
     callbacks.receive_ack = [&]() {
@@ -305,12 +305,12 @@ void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
         // ProcessHandshakeAtClient is an active blocking bthread relying on
         // HandshakeSession being woken by OnNewDataFromTcp.
         if (options.user == static_cast<SocketUser*>(get_client_side_messenger())) {
-            default_on_edge = UpgradeTransport::OnNewDataFromTcp;
+            default_on_edge = AdapterTransport::OnNewDataFromTcp;
         } else {
             default_on_edge = InputMessenger::OnNewMessages;
         }
     }
-    InitUpgradeTransport(socket, options, default_on_edge);
+    InitAdapterTransport(socket, options, default_on_edge);
 }
 
 void RdmaTransport::Release() {
@@ -326,7 +326,7 @@ int RdmaTransport::Reset(int32_t expected_nref) {
         _rdma_ep->Reset();
         _rdma_state = RDMA_UNKNOWN;
     }
-    ResetUpgradeTransport();
+    ResetAdapterTransport();
     return 0;
 }
 

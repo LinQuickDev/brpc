@@ -40,7 +40,7 @@ struct ServerHandshakeContext : public Destroyable {
 };
 
 // Protocol adapters may use transport-specific intermediate values, but the
-// terminal values are shared so that UpgradeTransport can make the same
+// terminal values are shared so that AdapterTransport can make the same
 // acquire-side decision for RDMA, URMA and UBSHM.
 enum Phase {
     UNINITIALIZED = 0,
@@ -81,11 +81,10 @@ struct ClientHandshakeCallbacks {
     std::function<void()> on_failed;
 };
 
-// The server driver can operate incrementally (InputMessenger parser) or run
-// through ACK_WAIT in one blocking handshake bthread.
+// The server driver is independent of the input mode. A parser callback can
+// return STEP_NEED_MORE, while a blocking callback waits before returning.
 struct ServerHandshakeCallbacks {
     HandshakePhases phases;
-    bool blocking;
     bool fallback_on_not_mine;
     std::function<StepResult()> receive_remote_hello;
     std::function<StepResult()> prepare_local;
