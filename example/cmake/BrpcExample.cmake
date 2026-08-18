@@ -123,6 +123,10 @@ macro(brpc_example_find_common_deps out_libs)
 
     find_package(OpenSSL REQUIRED)
 
+    find_library(URMA_LIB NAMES urma)
+    if(NOT URMA_LIB)
+        set(URMA_LIB "")
+    endif()
 
     set(_common_libs
         Threads::Threads
@@ -133,6 +137,7 @@ macro(brpc_example_find_common_deps out_libs)
         ${OPENSSL_CRYPTO_LIBRARY}
         ${OPENSSL_SSL_LIBRARY}
         ${THRIFT_LIB}
+        ${URMA_LIB}
         dl
     )
 
