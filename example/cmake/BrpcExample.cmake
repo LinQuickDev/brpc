@@ -86,12 +86,12 @@ macro(brpc_example_find_common_deps out_libs)
         )
     endif()
 
-    # brpc built with -DWITH_URMA=ON carries undefined urma_* symbols, so every
-    # example has to link liburma. Search by best effort: when brpc was built
-    # without URMA the symbols are absent and the library is not needed.
-    find_library(_brpc_example_urma_lib NAMES urma NO_CACHE)
-    if(NOT _brpc_example_urma_lib)
-        set(_brpc_example_urma_lib "")
+
+    # brpc built with -DWITH_URMA=ON carries undefined urma_* symbols. Link
+    # liburma when the header is present, which indicates a URMA-capable build.
+    set(_brpc_example_urma_lib "")
+    if(EXISTS "/usr/lib64/liburma.so" OR EXISTS "/usr/lib/liburma.so")
+        set(_brpc_example_urma_lib "urma")
     endif()
 
     find_path(BRPC_INCLUDE_PATH NAMES brpc/server.h)
