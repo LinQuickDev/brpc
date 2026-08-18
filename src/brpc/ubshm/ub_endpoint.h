@@ -46,7 +46,7 @@ DECLARE_bool(ub_disable_bthread);
 
 struct HelloMessage {
     void Serialize(void* data) const;
-    void Deserialize(void* data);
+    void Deserialize(const void* data);
     std::string toString() const;
 
     uint16_t msg_len;

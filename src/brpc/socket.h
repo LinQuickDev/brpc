@@ -61,6 +61,9 @@ namespace ubring {
     class UBShmEndpoint;
     class UBConnect;
 }
+namespace handshake {
+class SocketHandshakeIO;
+}
 class Socket;
 class AuthContext;
 class EventDispatcher;
@@ -336,6 +339,7 @@ friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
 friend class Transport;
 friend class AdapterTransport;
+friend class handshake::SocketHandshakeIO;
 friend class TcpTransport;
 friend class RdmaTransport;
 friend class TransportFactory;

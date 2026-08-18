@@ -85,8 +85,8 @@ void HelloMessage::Serialize(void* data) const {
     memcpy(current_pos, shm_name, SHM_MAX_NAME_BUFF_LEN);
 }
 
-void HelloMessage::Deserialize(void* data) {
-    char* current_pos = static_cast<char*>(data);
+void HelloMessage::Deserialize(const void* data) {
+    const char* current_pos = static_cast<const char*>(data);
     uint16_t net_msg_len;
     memcpy(&net_msg_len, current_pos, sizeof(net_msg_len));
     msg_len = butil::NetToHost16(net_msg_len);
@@ -209,6 +209,34 @@ bool HelloNegotiationValid(HelloMessage& msg) {
     return false;
 }
 
+static handshake::HandshakeCodec MakeUBHandshakeCodec() {
+    handshake::HandshakeCodec codec{};
+    codec.protocol_version = 2;
+    codec.hello_frame = handshake::FrameSpec(
+        MAGIC_STR, MAGIC_STR_LEN, HELLO_MSG_LEN_MIN, HELLO_MSG_LEN_MIN,
+        handshake::FrameSpec::FIXED);
+    codec.ack_frame = handshake::FrameSpec(
+        NULL, 0, ACK_MSG_LEN, ACK_MSG_LEN, handshake::FrameSpec::FIXED);
+    codec.build_ack = [](bool enabled, std::string* payload) {
+        const uint32_t flags_be = butil::HostToNet32(
+            enabled ? ACK_MSG_UB_OK : 0);
+        payload->assign(reinterpret_cast<const char*>(&flags_be),
+                        sizeof(flags_be));
+        return handshake::STEP_OK;
+    };
+    codec.parse_ack = [](const std::string& payload, bool* enabled) {
+        if (payload.size() != ACK_MSG_LEN) {
+            errno = EPROTO;
+            return handshake::STEP_ERROR;
+        }
+        uint32_t flags_be = 0;
+        memcpy(&flags_be, payload.data(), sizeof(flags_be));
+        *enabled = (butil::NetToHost32(flags_be) & ACK_MSG_UB_OK) != 0;
+        return handshake::STEP_OK;
+    };
+    return codec;
+}
+
 void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
     UBShmTransport* ub_transport = static_cast<UBShmTransport*>(arg);
     UBShmEndpoint* ep = ub_transport->_ub_ep;
@@ -218,7 +246,6 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
     LOG_IF(INFO, FLAGS_ub_trace_verbose) 
         << "Start handshake on " << s->_local_side;
 
-    uint8_t data[g_ub_hello_msg_len];
     size_t local_shm_len = (size_t)(FLAGS_data_queue_size) * MB_TO_BYTE;
     SHM local_trx_shm = {NULL, local_shm_len, 0, {0}, (uint32_t)s->fd()};
     auto shm_name_str = butil::endpoint2str(s->local_side());
@@ -229,15 +256,9 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
     callbacks.phases = handshake::HandshakePhases{
         C_ALLOC_SHM, C_HELLO_SEND, C_HELLO_WAIT,
         C_MAP_REMOTE_SHM, C_ACK_SEND, 0};
-    callbacks.prepare_local = [&]() {
-        if (ep->AllocateClientResources(&local_trx_shm, shm_name) == 0) {
-            return handshake::STEP_OK;
-        }
-        LOG(WARNING) << "Fallback to tcp:" << s->description();
-        errno = 0;
-        return handshake::STEP_FALLBACK;
-    };
-    callbacks.send_local_hello = [&]() {
+    callbacks.codec = MakeUBHandshakeCodec();
+    callbacks.codec.build_hello = [&](bool enabled, std::string* payload) {
+        CHECK(enabled);
         HelloMessage local_msg{};
         local_msg.msg_len = g_ub_hello_msg_len;
         local_msg.hello_ver = g_ub_hello_version;
@@ -245,50 +266,20 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
         local_msg.len = local_shm_len;
         memcpy(local_msg.shm_name, local_trx_shm.name,
                SHM_MAX_NAME_BUFF_LEN);
-        memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
-        local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-        if (ub_transport->handshake_session()->io()->WriteAll(
-                data, g_ub_hello_msg_len) == 0) {
-            LOG_IF(INFO, FLAGS_ub_trace_verbose)
-                << "client handshake message : " << local_msg.toString();
-            return handshake::STEP_OK;
-        }
-        const int saved_errno = errno;
-        PLOG(WARNING) << "Fail to send hello message to server:"
-                      << s->description();
-        s->SetFailed(saved_errno,
-                     "Fail to complete ubring handshake from %s: %s",
-                     s->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
+        payload->assign(HELLO_MSG_LEN_MIN - MAGIC_STR_LEN, '\0');
+        local_msg.Serialize(&(*payload)[0]);
+        LOG_IF(INFO, FLAGS_ub_trace_verbose)
+            << "client handshake message : " << local_msg.toString();
+        return handshake::STEP_OK;
     };
-    callbacks.receive_remote_hello = [&]() {
-        if (ub_transport->handshake_session()->io()->ReadExact(
-                data, MAGIC_STR_LEN) < 0) {
-            const int saved_errno = errno;
-            s->SetFailed(saved_errno,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(saved_errno));
+    callbacks.codec.parse_hello = [&](const std::string& payload) {
+        if (payload.size() != HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) {
+            errno = EPROTO;
             return handshake::STEP_ERROR;
         }
-        if (memcmp(data, MAGIC_STR, MAGIC_STR_LEN) != 0) {
-            s->SetFailed(EPROTO,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(EPROTO));
-            return handshake::STEP_ERROR;
-        }
-        if (ub_transport->handshake_session()->io()->ReadExact(
-                data, HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) < 0) {
-            const int saved_errno = errno;
-            s->SetFailed(saved_errno,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(saved_errno));
-            return handshake::STEP_ERROR;
-        }
-        remote_msg.Deserialize(data);
+        remote_msg.Deserialize(payload.data());
         if (remote_msg.msg_len < HELLO_MSG_LEN_MIN) {
-            s->SetFailed(EPROTO,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(EPROTO));
+            errno = EPROTO;
             return handshake::STEP_ERROR;
         }
         if (!HelloNegotiationValid(remote_msg)) {
@@ -298,6 +289,14 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
         }
         return handshake::STEP_OK;
     };
+    callbacks.prepare_resources = [&]() {
+        if (ep->AllocateClientResources(&local_trx_shm, shm_name) == 0) {
+            return handshake::STEP_OK;
+        }
+        LOG(WARNING) << "Fallback to tcp:" << s->description();
+        errno = 0;
+        return handshake::STEP_FALLBACK;
+    };
     callbacks.negotiate_resources = [&]() {
         if (ep->_ub_ring->UbrMapRemoteShm(&local_trx_shm, shm_name) == 0) {
             return handshake::STEP_OK;
@@ -306,26 +305,18 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
                      << s->description();
         return handshake::STEP_FALLBACK;
     };
-    callbacks.send_ack = [&](bool enabled) {
-        uint32_t* flags = (uint32_t*)data;
-        *flags = butil::HostToNet32(enabled ? ACK_MSG_UB_OK : 0);
-        if (ub_transport->handshake_session()->io()->WriteAll(
-                data, ACK_MSG_LEN) == 0) {
-            return handshake::STEP_OK;
-        }
-        const int saved_errno = errno;
-        s->SetFailed(saved_errno,
-                     "Fail to complete ubring handshake from %s: %s",
-                     s->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
-    };
     callbacks.set_high_speed_active = [ub_transport]() {
         ub_transport->SetHighSpeedAvailable(true);
     };
     callbacks.set_tcp_active = [ub_transport]() {
         ub_transport->SetHighSpeedAvailable(false);
     };
-    callbacks.on_failed = []() {};
+    callbacks.on_failed = [&]() {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        s->SetFailed(saved_errno,
+                     "Fail to complete ubring handshake from %s: %s",
+                     s->description().c_str(), berror(saved_errno));
+    };
 
     const handshake::StepResult result =
         ub_transport->handshake_session()->RunClient(callbacks);
@@ -351,43 +342,25 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
     LOG_IF(INFO, FLAGS_ub_trace_verbose)
         << "Start handshake on " << s->description();
 
-    uint8_t data[g_ub_hello_msg_len];
     HelloMessage remote_msg{};
-    bool local_enabled = false;
 
     handshake::ServerHandshakeCallbacks callbacks{};
     callbacks.phases = handshake::HandshakePhases{
         S_ALLOC_SHM, S_HELLO_SEND, S_HELLO_WAIT,
         S_ALLOC_SHM, 0, S_ACK_WAIT};
     callbacks.fallback_on_not_mine = true;
-    callbacks.receive_remote_hello = [&]() {
-        if (ub_transport->handshake_session()->io()->ReadExact(
-                data, MAGIC_STR_LEN) < 0) {
-            const int saved_errno = errno;
-            s->SetFailed(saved_errno,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(saved_errno));
+    callbacks.input = NULL;
+    handshake::HandshakeCodec codec = MakeUBHandshakeCodec();
+    codec.parse_hello = [&](const std::string& payload) {
+        if (payload.size() != HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) {
+            errno = EPROTO;
             return handshake::STEP_ERROR;
         }
-        if (memcmp(data, MAGIC_STR, MAGIC_STR_LEN) != 0) {
-            s->_read_buf.append(data, MAGIC_STR_LEN);
-            return handshake::STEP_NOT_MINE;
-        }
-        if (ub_transport->handshake_session()->io()->ReadExact(
-                data, g_ub_hello_msg_len - MAGIC_STR_LEN) < 0) {
-            const int saved_errno = errno;
-            s->SetFailed(saved_errno,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(saved_errno));
-            return handshake::STEP_ERROR;
-        }
-        remote_msg.Deserialize(data);
+        remote_msg.Deserialize(payload.data());
         LOG_IF(INFO, FLAGS_ub_trace_verbose)
             << "server receive handshake message : " << remote_msg.toString();
         if (remote_msg.msg_len < HELLO_MSG_LEN_MIN) {
-            s->SetFailed(EPROTO,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(EPROTO));
+            errno = EPROTO;
             return handshake::STEP_ERROR;
         }
         if (!HelloNegotiationValid(remote_msg)) {
@@ -395,7 +368,22 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
         }
         return handshake::STEP_OK;
     };
-    callbacks.prepare_local = [&]() {
+    codec.build_hello = [&](bool enabled, std::string* payload) {
+        HelloMessage local_msg{};
+        local_msg.msg_len = g_ub_hello_msg_len;
+        if (enabled) {
+            local_msg.hello_ver = g_ub_hello_version;
+            local_msg.impl_ver = g_ub_impl_version;
+            local_msg.len = (FLAGS_data_queue_size) * MB_TO_BYTE;
+            memcpy(local_msg.shm_name, remote_msg.shm_name,
+                   SHM_MAX_NAME_BUFF_LEN);
+        }
+        payload->assign(HELLO_MSG_LEN_MIN - MAGIC_STR_LEN, '\0');
+        local_msg.Serialize(&(*payload)[0]);
+        return handshake::STEP_OK;
+    };
+    callbacks.codecs.push_back(codec);
+    callbacks.prepare_resources = [&]() {
         ubring::SHM remote_trx_shm = {
             NULL, remote_msg.len, 0, {0}, (uint32_t)ep->_socket->fd()};
         strncpy(remote_trx_shm.name, remote_msg.shm_name, SHM_MAX_NAME_BUFF_LEN);
@@ -428,50 +416,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
     callbacks.negotiate_resources = []() {
         return handshake::STEP_OK;
     };
-    callbacks.send_local_hello = [&](bool enabled) {
-        local_enabled = enabled;
-        HelloMessage local_msg{};
-        local_msg.msg_len = g_ub_hello_msg_len;
-        if (enabled) {
-            local_msg.hello_ver = g_ub_hello_version;
-            local_msg.impl_ver = g_ub_impl_version;
-            local_msg.len = (FLAGS_data_queue_size) * MB_TO_BYTE;
-            memcpy(local_msg.shm_name, remote_msg.shm_name,
-                   SHM_MAX_NAME_BUFF_LEN);
-        }
-        memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
-        local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-        if (ub_transport->handshake_session()->io()->WriteAll(
-                data, g_ub_hello_msg_len) == 0) {
-            return handshake::STEP_OK;
-        }
-        const int saved_errno = errno;
-        s->SetFailed(saved_errno,
-                     "Fail to complete ub handshake from %s: %s",
-                     s->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
-    };
-    callbacks.receive_ack = [&]() {
-        if (ub_transport->handshake_session()->io()->ReadExact(
-                data, ACK_MSG_LEN) < 0) {
-            const int saved_errno = errno;
-            s->SetFailed(saved_errno,
-                         "Fail to complete ubring handshake from %s: %s",
-                         s->description().c_str(), berror(saved_errno));
-            return handshake::STEP_ERROR;
-        }
-        uint32_t* flags = (uint32_t*)data;
-        const bool client_enabled =
-            (butil::NetToHost32(*flags) & ACK_MSG_UB_OK) != 0;
-        if (!client_enabled) {
-            return handshake::STEP_FALLBACK;
-        }
-        if (!local_enabled) {
-            s->SetFailed(EPROTO,
-                         "Fail to complete ub handshake from %s: %s",
-                         s->description().c_str(), berror(EPROTO));
-            return handshake::STEP_ERROR;
-        }
+    callbacks.validate_established = []() {
         return handshake::STEP_OK;
     };
     callbacks.set_high_speed_active = [ub_transport]() {
@@ -480,7 +425,12 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
     callbacks.set_tcp_active = [ub_transport]() {
         ub_transport->SetHighSpeedAvailable(false);
     };
-    callbacks.on_failed = []() {};
+    callbacks.on_failed = [&]() {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        s->SetFailed(saved_errno,
+                     "Fail to complete ubring handshake from %s: %s",
+                     s->description().c_str(), berror(saved_errno));
+    };
 
     const handshake::StepResult result =
         ub_transport->handshake_session()->RunServer(callbacks);

@@ -20,11 +20,13 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
+#include <vector>
 
 #include "butil/atomicops.h"
-#include "butil/iobuf.h"
 #include "butil/macros.h"
 #include "brpc/destroyable.h"
+#include "brpc/handshake/handshake_frame.h"
 
 namespace brpc {
 
@@ -67,15 +69,26 @@ struct HandshakePhases {
     int ack_wait;
 };
 
-// Protocol-specific operations invoked by the common client driver. A
-// callback reports what happened but does not advance the session phase.
+// A protocol describes only its fields and resource-independent wire values.
+// HandshakeSession owns framing and I/O through FrameCodec. The callbacks may
+// retain strongly typed parsed state in their protocol adapter.
+struct HandshakeCodec {
+    int protocol_version;
+    FrameSpec hello_frame;
+    FrameSpec ack_frame;
+    std::function<StepResult(bool, std::string*)> build_hello;
+    std::function<StepResult(const std::string&)> parse_hello;
+    std::function<StepResult(bool, std::string*)> build_ack;
+    std::function<StepResult(const std::string&, bool*)> parse_ack;
+};
+
+// Resource-specific operations invoked by the common client driver. Wire I/O
+// and field codec invocation are owned by HandshakeSession.
 struct ClientHandshakeCallbacks {
     HandshakePhases phases;
-    std::function<StepResult()> prepare_local;
-    std::function<StepResult()> send_local_hello;
-    std::function<StepResult()> receive_remote_hello;
+    HandshakeCodec codec;
+    std::function<StepResult()> prepare_resources;
     std::function<StepResult()> negotiate_resources;
-    std::function<StepResult(bool)> send_ack;
     std::function<void()> set_high_speed_active;
     std::function<void()> set_tcp_active;
     std::function<void()> on_failed;
@@ -86,52 +99,32 @@ struct ClientHandshakeCallbacks {
 struct ServerHandshakeCallbacks {
     HandshakePhases phases;
     bool fallback_on_not_mine;
-    std::function<StepResult()> receive_remote_hello;
-    std::function<StepResult()> prepare_local;
+    // Buffered parsers may offer multiple codecs (RDMA v2/v3). Blocking
+    // server handshakes currently provide exactly one codec.
+    std::vector<HandshakeCodec> codecs;
+    HandshakeInput* input;
+    std::function<StepResult()> prepare_resources;
     std::function<StepResult()> negotiate_resources;
-    std::function<StepResult(bool)> send_local_hello;
-    std::function<StepResult()> receive_ack;
+    std::function<StepResult()> validate_established;
     std::function<void()> set_high_speed_active;
     std::function<void()> set_tcp_active;
     std::function<void()> on_failed;
 };
 
-// Owns TCP-fd I/O and its readable notification while upgrading a connection.
-// The handshake lifecycle is owned by HandshakeSession below.
-class SocketHandshakeIO {
-public:
-    explicit SocketHandshakeIO(Socket* socket = NULL);
-    ~SocketHandshakeIO();
-
-    void Reset(Socket* socket);
-
-    void NotifyReadable();
-
-    // Read/write exactly len bytes. EAGAIN is handled by waiting for the
-    // socket event callback; EOF is reported as EEOF.
-    int ReadExact(void* data, size_t len);
-    int ReadExact(butil::IOPortal* data, size_t len);
-    int WriteAll(const void* data, size_t len);
-    int WriteAll(butil::IOBuf* data);
-
-private:
-    Socket* _socket;
-    butil::atomic<int>* _read_butex;
-
-    DISALLOW_COPY_AND_ASSIGN(SocketHandshakeIO);
-};
-
-// Owns one connection-upgrade attempt. Wire codecs and endpoint resource
-// operations remain protocol adapters, while this class provides the common
-// lifecycle, publication ordering and TCP control-plane I/O.
+// Owns one connection-upgrade attempt, invokes the protocol field codec and
+// resource callbacks, and provides common framing, TCP control-plane I/O,
+// lifecycle and publication ordering.
 class HandshakeSession {
 public:
     explicit HandshakeSession(Socket* socket = NULL)
-        : _io(socket), _phase(UNINITIALIZED), _protocol_version(0) {}
+        : _socket_io(socket), _io(&_socket_io), _phase(UNINITIALIZED),
+          _protocol_version(0), _local_enabled(false) {}
 
     void Reset(Socket* socket) {
-        _io.Reset(socket);
+        _socket_io.Reset(socket);
+        _io = &_socket_io;
         _protocol_version = 0;
+        _local_enabled = false;
         _phase.store(UNINITIALIZED, butil::memory_order_relaxed);
     }
 
@@ -164,17 +157,33 @@ public:
         _phase.store(FALLBACK_TCP, butil::memory_order_release);
     }
 
-    SocketHandshakeIO* io() { return &_io; }
-    const SocketHandshakeIO* io() const { return &_io; }
-    void NotifyReadable() { _io.NotifyReadable(); }
+    void NotifyReadable() { _socket_io.NotifyReadable(); }
+
+    // Injects an in-memory stream in common-component unit tests. Reset()
+    // restores the Socket-backed implementation.
+    void SetIOForTest(HandshakeIO* io) { _io = io; }
 
     StepResult RunClient(const ClientHandshakeCallbacks& callbacks);
     StepResult RunServer(const ServerHandshakeCallbacks& callbacks);
 
 private:
-    SocketHandshakeIO _io;
+    StepResult SendHello(const HandshakeCodec& codec, bool enabled);
+    StepResult ReceiveHello(const HandshakeCodec& codec,
+                            HandshakeInput* input,
+                            bool push_back_on_not_mine,
+                            bool* magic_matched = NULL);
+    StepResult SendAck(const HandshakeCodec& codec, bool enabled);
+    StepResult ReceiveAck(const HandshakeCodec& codec,
+                          HandshakeInput* input, bool* enabled);
+    StepResult SelectAndReceiveHello(
+        const std::vector<HandshakeCodec>& codecs, HandshakeInput* input,
+        bool push_back_on_not_mine, const HandshakeCodec** selected);
+
+    SocketHandshakeIO _socket_io;
+    HandshakeIO* _io;
     butil::atomic<int> _phase;
     int _protocol_version;
+    bool _local_enabled;
 
     DISALLOW_COPY_AND_ASSIGN(HandshakeSession);
 };

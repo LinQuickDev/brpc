@@ -18,7 +18,6 @@
 #if BRPC_WITH_RDMA
 
 #include "brpc/rdma_transport.h"
-#include "butil/sys_byteorder.h"
 #include "brpc/adapter_transport.h"
 #include "brpc/event_dispatcher.h"
 #include "brpc/input_messenger.h"
@@ -113,18 +112,16 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
         << "Start handshake on " << socket->description();
 
     std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol =
-        rdma::CreateClientHandshakeAdapter(
-            ep, transport->handshake_session()->io());
+        rdma::CreateClientHandshakeAdapter(ep);
     CHECK(protocol != NULL);
-    transport->handshake_session()->set_protocol_version(
-        protocol->ProtocolVersion());
     rdma::ParsedHello remote{};
 
     handshake::ClientHandshakeCallbacks callbacks{};
     callbacks.phases = handshake::HandshakePhases{
         C_ALLOC_QPCQ, C_HELLO_SEND, C_HELLO_WAIT,
         C_BRINGUP_QP, C_ACK_SEND, 0};
-    callbacks.prepare_local = [&]() {
+    callbacks.codec = protocol->MakeCodec(&remote);
+    callbacks.prepare_resources = [&]() {
         if (ep->AllocateResources() == 0) {
             return handshake::STEP_OK;
         }
@@ -135,31 +132,6 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
         errno = 0;
         return handshake::STEP_FALLBACK;
     };
-    callbacks.send_local_hello = [&]() {
-        if (protocol->SendLocalHello(true) == 0) {
-            return handshake::STEP_OK;
-        }
-        const int saved_errno = errno;
-        socket->SetFailed(saved_errno,
-                          "Fail to complete rdma handshake from %s: %s",
-                          socket->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
-    };
-    callbacks.receive_remote_hello = [&]() {
-        const rdma::RemoteHelloResult result =
-            protocol->ReceiveAndParseRemoteHello(&remote);
-        if (result == rdma::RemoteHelloResult::NEGOTIATED) {
-            return handshake::STEP_OK;
-        }
-        if (result != rdma::RemoteHelloResult::ERROR) {
-            return handshake::STEP_FALLBACK;
-        }
-        const int saved_errno = errno;
-        socket->SetFailed(saved_errno,
-                          "Fail to complete rdma handshake from %s: %s",
-                          socket->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
-    };
     callbacks.negotiate_resources = [&]() {
         ep->ApplyRemoteInfo(remote);
         if (ep->BringUpQp(remote, false) == 0) {
@@ -169,26 +141,18 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
                      << socket->description();
         return handshake::STEP_FALLBACK;
     };
-    callbacks.send_ack = [&](bool enabled) {
-        const uint32_t flags_be = butil::HostToNet32(
-            enabled ? rdma::HELLO_ACK_RDMA_OK : 0);
-        if (transport->handshake_session()->io()->WriteAll(
-                &flags_be, rdma::HELLO_ACK_LEN) == 0) {
-            return handshake::STEP_OK;
-        }
-        const int saved_errno = errno;
-        socket->SetFailed(saved_errno,
-                          "Fail to complete rdma handshake from %s: %s",
-                          socket->description().c_str(), berror(saved_errno));
-        return handshake::STEP_ERROR;
-    };
     callbacks.set_high_speed_active = [transport]() {
         transport->SetHighSpeedAvailable(true);
     };
     callbacks.set_tcp_active = [transport]() {
         transport->SetHighSpeedAvailable(false);
     };
-    callbacks.on_failed = []() {};
+    callbacks.on_failed = [&]() {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        socket->SetFailed(saved_errno,
+                          "Fail to complete rdma handshake from %s: %s",
+                          socket->description().c_str(), berror(saved_errno));
+    };
 
     const handshake::StepResult result =
         transport->handshake_session()->RunClient(callbacks);
@@ -211,41 +175,31 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
     rdma::RdmaEndpoint* ep = transport->_rdma_ep;
     CHECK(ep != NULL);
 
-    std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol;
     rdma::ParsedHello remote{};
+    std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter> > protocols =
+        rdma::CreateServerHandshakeAdapters(ep);
+    handshake::IOBufHandshakeInput input(source);
     handshake::ServerHandshakeCallbacks callbacks{};
     callbacks.phases = handshake::HandshakePhases{
         S_ALLOC_QPCQ, S_HELLO_SEND, S_HELLO_WAIT,
         S_BRINGUP_QP, 0, S_ACK_WAIT};
     callbacks.fallback_on_not_mine = false;
-    callbacks.receive_remote_hello = [&]() {
-        if (source->size() < rdma::HELLO_MAGIC_LEN) {
-            return handshake::STEP_NEED_MORE;
-        }
-        uint8_t magic[rdma::HELLO_MAGIC_LEN];
-        CHECK_EQ(source->copy_to(magic, sizeof(magic)), sizeof(magic));
-        protocol = rdma::CreateServerHandshakeAdapterByMagic(
-            ep, transport->handshake_session()->io(), source, magic);
-        if (protocol == NULL) {
-            return handshake::STEP_NOT_MINE;
-        }
-        transport->handshake_session()->set_protocol_version(
-            protocol->ProtocolVersion());
-        const rdma::RemoteHelloResult result =
-            protocol->ReceiveAndParseRemoteHello(&remote);
-        if (result == rdma::RemoteHelloResult::NEED_MORE) {
-            return handshake::STEP_NEED_MORE;
-        }
-        if (result == rdma::RemoteHelloResult::ERROR) {
-            return handshake::STEP_ERROR;
-        }
-        if (result == rdma::RemoteHelloResult::NEGOTIATED) {
-            return handshake::STEP_OK;
-        }
-        transport->_rdma_state = RDMA_OFF;
-        return handshake::STEP_FALLBACK;
-    };
-    callbacks.prepare_local = [&]() {
+    callbacks.input = &input;
+    for (size_t i = 0; i < protocols.size(); ++i) {
+        handshake::HandshakeCodec codec = protocols[i]->MakeCodec(&remote);
+        const std::function<handshake::StepResult(const std::string&)>
+            parse_hello = codec.parse_hello;
+        codec.parse_hello = [transport, parse_hello](
+            const std::string& payload) {
+            const handshake::StepResult result = parse_hello(payload);
+            if (result == handshake::STEP_FALLBACK) {
+                transport->_rdma_state = RDMA_OFF;
+            }
+            return result;
+        };
+        callbacks.codecs.push_back(codec);
+    }
+    callbacks.prepare_resources = [&]() {
         ep->ApplyRemoteInfo(remote);
         if (ep->AllocateResources() < 0) {
             PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
@@ -262,24 +216,7 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
         }
         return handshake::STEP_OK;
     };
-    callbacks.send_local_hello = [&](bool enabled) {
-        CHECK(protocol != NULL);
-        return protocol->SendLocalHello(enabled) == 0
-            ? handshake::STEP_OK : handshake::STEP_ERROR;
-    };
-    callbacks.receive_ack = [&]() {
-        if (source->size() < rdma::HELLO_ACK_LEN) {
-            return handshake::STEP_NEED_MORE;
-        }
-        uint32_t flags_be = 0;
-        CHECK_EQ(source->cutn(&flags_be, rdma::HELLO_ACK_LEN),
-                 rdma::HELLO_ACK_LEN);
-        const bool client_ack_ok =
-            (butil::NetToHost32(flags_be) & rdma::HELLO_ACK_RDMA_OK) != 0;
-        if (!client_ack_ok) {
-            // Keep coalesced RPC bytes for InputMessenger after fallback.
-            return handshake::STEP_FALLBACK;
-        }
+    callbacks.validate_established = [&]() {
         if (!source->empty() || transport->_rdma_state == RDMA_OFF) {
             return handshake::STEP_ERROR;
         }

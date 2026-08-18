@@ -53,6 +53,7 @@ public:
 
     int handshake_phase() const { return _handshake.phase(); }
     int handshake_version() const { return _handshake.protocol_version(); }
+    handshake::HandshakeSession* handshake_session() { return &_handshake; }
     Transport* high_speed_transport() const {
         return _high_speed_transport.get();
     }
@@ -67,7 +68,6 @@ private:
     ~AdapterTransport() override;
 
     Transport* ActiveTransport() const;
-    handshake::HandshakeSession* handshake_session() { return &_handshake; }
     void SetHighSpeedAvailable(bool available);
     void StartServerHandshake();
     void FallbackToTcp();
