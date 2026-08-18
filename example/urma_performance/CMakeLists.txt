@@ -27,13 +27,6 @@ brpc_example_find_common_deps(DYNAMIC_LIB)
 protobuf_generate_cpp(PROTO_SRC PROTO_HEADER test.proto)
 set(BRPC_EXAMPLE_WITH_URMA ON)
 
-find_library(URMA_LIB NAMES urma)
-if(URMA_LIB)
-    list(APPEND DYNAMIC_LIB ${URMA_LIB})
-else()
-    message(STATUS
-        "liburma not found; using the URMA implementation linked into brpc")
-endif()
 
 add_executable(urma_performance_client client.cpp ${PROTO_SRC} ${PROTO_HEADER})
 brpc_example_configure_target(urma_performance_client)
