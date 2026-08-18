@@ -21,11 +21,14 @@
 #if BRPC_WITH_RDMA
 #include "brpc/socket.h"
 #include "brpc/channel.h"
-#include "brpc/adapter_transport.h"
+#include "brpc/transport.h"
+#include "brpc/transport_handshake.h"
 
 namespace brpc {
-class RdmaTransport : public AdapterTransport {
+class AdapterTransport;
+class RdmaTransport : public Transport {
     friend class TransportFactory;
+    friend class AdapterTransport;
     friend class rdma::RdmaEndpoint;
     friend class rdma::RdmaConnect;
 public:
@@ -50,6 +53,10 @@ public:
     void Release() override;
     int Reset(int32_t expected_nref) override;
     std::shared_ptr<AppConnect> Connect() override;
+    int CutFromIOBuf(butil::IOBuf* buf) override;
+    ssize_t CutFromIOBufList(butil::IOBuf** buf, size_t ndata) override;
+    int WaitEpollOut(butil::atomic<int>* epollout_butex,
+                     bool pollin, timespec duetime) override;
     void ProcessEvent(bthread_attr_t attr) override;
     void QueueMessage(InputMessageClosure& inputMsg, int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream &os) override;
@@ -57,7 +64,13 @@ public:
         CHECK(_rdma_ep != NULL);
         return _rdma_ep;
     }
+    static RdmaTransport* Get(const Socket* socket);
+    static RdmaTransport* Get(const SocketUniquePtr& socket) {
+        return Get(socket.get());
+    }
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
+    int handshake_phase() const;
+    int handshake_version() const;
 
     // TCP control-plane callbacks. The endpoint is intentionally absent from
     // these entry points and only participates through resource operations.
@@ -65,11 +78,10 @@ public:
     static ParseResult ExecuteServerHandshake(butil::IOBuf* source,
                                               Socket* socket);
 private:
-    void SetHighSpeedAvailable(bool available) override;
-    ssize_t CutFromHighSpeedIOBufList(
-        butil::IOBuf** buf, size_t ndata) override;
-    int WaitHighSpeedEpollOut(butil::atomic<int>* epollout_butex,
-                              bool pollin, timespec duetime) override;
+    AdapterTransport* adapter_transport() const;
+    handshake::HandshakeSession* handshake_session() const;
+    void FallbackToTcp();
+    void SetHighSpeedAvailable(bool available);
 
     static bool OptionsAvailableForRdma(const ChannelOptions* opt);
     static bool OptionsAvailableOverRdma(const ServerOptions* opt);

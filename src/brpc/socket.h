@@ -945,8 +945,10 @@ private:
     SSL* _ssl_session;               // owner
     std::shared_ptr<SocketSSLContext> _ssl_ctx;
 
-    // Should use SOCKET_MODE_RDMA or SOCKET_MODE_TCP or Other, default is SOCKET_MODE_TCP Transport
+    // Requested provider: SOCKET_MODE_TCP, SOCKET_MODE_RDMA or another mode.
     SocketMode _socket_mode;
+    // The top-level AdapterTransport, which selects TCP or the requested
+    // accelerated Transport.
     std::unique_ptr<Transport> _transport;
 
     // Pass from controller, for progressive reading.

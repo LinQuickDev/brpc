@@ -144,7 +144,7 @@ void UBShmEndpoint::Reset() {
 void UBConnect::StartConnect(const Socket* socket,
                                void (*done)(int err, void* data),
                                void* data) {
-    auto* ub_transport = static_cast<UBShmTransport*>(socket->_transport.get());
+    UBShmTransport* ub_transport = UBShmTransport::Get(socket);
     CHECK(ub_transport->_ub_ep != NULL);
     SocketUniquePtr s;
     if (Socket::Address(socket->id(), &s) != 0) {
@@ -187,14 +187,14 @@ void UBShmTransport::StartServerHandshake() {
         return;
     }
     bthread_t tid;
-    _handshake.SetPhase(S_HELLO_WAIT);
+    handshake_session()->SetPhase(S_HELLO_WAIT);
     SocketUniquePtr socket;
     _socket->ReAddress(&socket);
     bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
     bthread_attr_set_name(&attr, "UBProcessHandshakeAtServer");
     if (bthread_start_background(
             &tid, &attr, ProcessHandshakeAtServer, this) < 0) {
-        _handshake.SetPhase(UNINIT);
+        handshake_session()->SetPhase(UNINIT);
         LOG(FATAL) << "Fail to start handshake bthread";
     } else {
         socket.release();
@@ -247,7 +247,7 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
                SHM_MAX_NAME_BUFF_LEN);
         memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
         local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-        if (ub_transport->_handshake.io()->WriteAll(
+        if (ub_transport->handshake_session()->io()->WriteAll(
                 data, g_ub_hello_msg_len) == 0) {
             LOG_IF(INFO, FLAGS_ub_trace_verbose)
                 << "client handshake message : " << local_msg.toString();
@@ -262,7 +262,7 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
         return handshake::STEP_ERROR;
     };
     callbacks.receive_remote_hello = [&]() {
-        if (ub_transport->_handshake.io()->ReadExact(
+        if (ub_transport->handshake_session()->io()->ReadExact(
                 data, MAGIC_STR_LEN) < 0) {
             const int saved_errno = errno;
             s->SetFailed(saved_errno,
@@ -276,7 +276,7 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
                          s->description().c_str(), berror(EPROTO));
             return handshake::STEP_ERROR;
         }
-        if (ub_transport->_handshake.io()->ReadExact(
+        if (ub_transport->handshake_session()->io()->ReadExact(
                 data, HELLO_MSG_LEN_MIN - MAGIC_STR_LEN) < 0) {
             const int saved_errno = errno;
             s->SetFailed(saved_errno,
@@ -309,7 +309,8 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
     callbacks.send_ack = [&](bool enabled) {
         uint32_t* flags = (uint32_t*)data;
         *flags = butil::HostToNet32(enabled ? ACK_MSG_UB_OK : 0);
-        if (ub_transport->_handshake.io()->WriteAll(data, ACK_MSG_LEN) == 0) {
+        if (ub_transport->handshake_session()->io()->WriteAll(
+                data, ACK_MSG_LEN) == 0) {
             return handshake::STEP_OK;
         }
         const int saved_errno = errno;
@@ -327,7 +328,7 @@ void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
     callbacks.on_failed = []() {};
 
     const handshake::StepResult result =
-        ub_transport->_handshake.RunClient(callbacks);
+        ub_transport->handshake_session()->RunClient(callbacks);
     if (result == handshake::STEP_OK) {
         ep->_ub_ring->UbrUnlinkLocalShm();
         LOG_IF(INFO, FLAGS_ub_trace_verbose) 
@@ -360,7 +361,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
         S_ALLOC_SHM, 0, S_ACK_WAIT};
     callbacks.fallback_on_not_mine = true;
     callbacks.receive_remote_hello = [&]() {
-        if (ub_transport->_handshake.io()->ReadExact(
+        if (ub_transport->handshake_session()->io()->ReadExact(
                 data, MAGIC_STR_LEN) < 0) {
             const int saved_errno = errno;
             s->SetFailed(saved_errno,
@@ -372,7 +373,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
             s->_read_buf.append(data, MAGIC_STR_LEN);
             return handshake::STEP_NOT_MINE;
         }
-        if (ub_transport->_handshake.io()->ReadExact(
+        if (ub_transport->handshake_session()->io()->ReadExact(
                 data, g_ub_hello_msg_len - MAGIC_STR_LEN) < 0) {
             const int saved_errno = errno;
             s->SetFailed(saved_errno,
@@ -440,7 +441,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
         }
         memcpy(data, MAGIC_STR, MAGIC_STR_LEN);
         local_msg.Serialize((char*)data + MAGIC_STR_LEN);
-        if (ub_transport->_handshake.io()->WriteAll(
+        if (ub_transport->handshake_session()->io()->WriteAll(
                 data, g_ub_hello_msg_len) == 0) {
             return handshake::STEP_OK;
         }
@@ -451,7 +452,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
         return handshake::STEP_ERROR;
     };
     callbacks.receive_ack = [&]() {
-        if (ub_transport->_handshake.io()->ReadExact(
+        if (ub_transport->handshake_session()->io()->ReadExact(
                 data, ACK_MSG_LEN) < 0) {
             const int saved_errno = errno;
             s->SetFailed(saved_errno,
@@ -482,7 +483,7 @@ void* UBShmTransport::ProcessHandshakeAtServer(void* arg) {
     callbacks.on_failed = []() {};
 
     const handshake::StepResult result =
-        ub_transport->_handshake.RunServer(callbacks);
+        ub_transport->handshake_session()->RunServer(callbacks);
     if (result == handshake::STEP_OK) {
         ep->_ub_ring->UbrUnlinkLocalShm();
         LOG_IF(INFO, FLAGS_ub_trace_verbose)
@@ -654,7 +655,7 @@ void UBShmEndpoint::PollIn(UBShmEndpoint* ep, uint32_t ep_event) {
     if (Socket::Address(ep->_socket_id, &s) < 0) {
         return;
     }
-    auto* ub_transport = static_cast<UBShmTransport*>(s->_transport.get());
+    UBShmTransport* ub_transport = UBShmTransport::Get(s.get());
     CHECK(ep == ub_transport->_ub_ep);
 
     InputMessageClosure last_msg;
@@ -716,7 +717,7 @@ void UBShmEndpoint::PollOut(UBShmEndpoint* ep, uint32_t ep_event) {
     if (Socket::Address(ep->_socket_id, &s) < 0) {
         return;
     }
-    auto* ub_transport = static_cast<UBShmTransport*>(s->_transport.get());
+    UBShmTransport* ub_transport = UBShmTransport::Get(s.get());
     CHECK(ep == ub_transport->_ub_ep);
     if (ep->IsWritable()) {
         s->WakeAsEpollOut();

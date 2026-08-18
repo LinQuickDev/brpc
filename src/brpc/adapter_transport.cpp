@@ -22,56 +22,172 @@
 #include <unistd.h>
 
 #include "brpc/input_messenger.h"
+#include "brpc/rdma_transport.h"
 #include "brpc/tcp_transport.h"
+#include "brpc/ubshm_transport.h"
 
 namespace brpc {
 
-void AdapterTransport::InitAdapterTransport(
-    Socket* socket, const SocketOptions& options,
-    const OnEdgeTrigger& default_on_edge) {
+AdapterTransport::~AdapterTransport() = default;
+
+AdapterTransport* AdapterTransport::Get(Socket* socket) {
+    CHECK(socket != NULL);
+    return static_cast<AdapterTransport*>(socket->_transport.get());
+}
+
+const AdapterTransport* AdapterTransport::Get(const Socket* socket) {
+    CHECK(socket != NULL);
+    return static_cast<const AdapterTransport*>(socket->_transport.get());
+}
+
+void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
+    CHECK_EQ(_mode, options.socket_mode);
     _socket = socket;
     _default_connect = options.app_connect;
     _on_edge_trigger = options.on_edge_triggered_events;
     if (options.need_on_edge_trigger && _on_edge_trigger == NULL) {
-        _on_edge_trigger = default_on_edge;
+        if (_mode == SOCKET_MODE_TCP) {
+            _on_edge_trigger = InputMessenger::OnNewMessages;
+#if BRPC_WITH_RDMA
+        } else if (_mode == SOCKET_MODE_RDMA &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            // RDMA server handshake is parsed by InputMessenger.
+            _on_edge_trigger = InputMessenger::OnNewMessages;
+#endif
+        } else {
+            _on_edge_trigger = OnNewDataFromTcp;
+        }
     }
     _handshake.Reset(socket);
-    _tcp_transport = std::make_shared<TcpTransport>();
+    _tcp_transport.reset(new TcpTransport);
     _tcp_transport->Init(socket, options);
+
+    switch (_mode) {
+#if BRPC_WITH_RDMA
+    case SOCKET_MODE_RDMA:
+        _high_speed_transport.reset(new RdmaTransport);
+        break;
+#endif
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        _high_speed_transport.reset(new UBShmTransport);
+        break;
+#endif
+    default:
+        break;
+    }
+    if (_high_speed_transport) {
+        _high_speed_transport->Init(socket, options);
+    }
 }
 
-void AdapterTransport::ResetAdapterTransport() {
+void AdapterTransport::Release() {
+    if (_high_speed_transport) {
+        _high_speed_transport->Release();
+    }
+    _tcp_transport->Release();
+}
+
+int AdapterTransport::Reset(int32_t expected_nref) {
+    if (_high_speed_transport) {
+        _high_speed_transport->Reset(expected_nref);
+    }
+    _tcp_transport->Reset(expected_nref);
     _handshake.Reset(_socket);
+    return 0;
+}
+
+std::shared_ptr<AppConnect> AdapterTransport::Connect() {
+    if (_high_speed_transport) {
+        return _high_speed_transport->Connect();
+    }
+    return _tcp_transport->Connect();
+}
+
+Transport* AdapterTransport::ActiveTransport() const {
+    if (_high_speed_transport &&
+        _handshake.phase() == handshake::ESTABLISHED) {
+        return _high_speed_transport.get();
+    }
+    return _tcp_transport.get();
 }
 
 int AdapterTransport::CutFromIOBuf(butil::IOBuf* buf) {
-    if (_handshake.phase() == handshake::ESTABLISHED) {
-        butil::IOBuf* data[1] = {buf};
-        return CutFromHighSpeedIOBufList(data, 1);
-    }
-    return _tcp_transport->CutFromIOBuf(buf);
+    return ActiveTransport()->CutFromIOBuf(buf);
 }
 
 ssize_t AdapterTransport::CutFromIOBufList(
     butil::IOBuf** buf, size_t ndata) {
-    if (_handshake.phase() == handshake::ESTABLISHED) {
-        return CutFromHighSpeedIOBufList(buf, ndata);
-    }
-    return _tcp_transport->CutFromIOBufList(buf, ndata);
+    return ActiveTransport()->CutFromIOBufList(buf, ndata);
 }
 
 int AdapterTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
                                     bool pollin, timespec duetime) {
-    if (_handshake.phase() == handshake::ESTABLISHED) {
-        return WaitHighSpeedEpollOut(epollout_butex, pollin, duetime);
+    return ActiveTransport()->WaitEpollOut(
+        epollout_butex, pollin, duetime);
+}
+
+void AdapterTransport::ProcessEvent(bthread_attr_t attr) {
+    ActiveTransport()->ProcessEvent(attr);
+}
+
+void AdapterTransport::QueueMessage(InputMessageClosure& input_msg,
+                                    int* num_bthread_created,
+                                    bool last_msg) {
+    ActiveTransport()->QueueMessage(
+        input_msg, num_bthread_created, last_msg);
+}
+
+void AdapterTransport::Debug(std::ostream& os) {
+    if (_high_speed_transport) {
+        _high_speed_transport->Debug(os);
     }
-    return _tcp_transport->WaitEpollOut(epollout_butex, pollin, duetime);
 }
 
 void AdapterTransport::FallbackToTcp() {
     _handshake.PublishFallback([this]() {
         SetHighSpeedAvailable(false);
     });
+}
+
+void AdapterTransport::SetHighSpeedAvailable(bool available) {
+    if (!_high_speed_transport) {
+        return;
+    }
+    switch (_mode) {
+#if BRPC_WITH_RDMA
+    case SOCKET_MODE_RDMA:
+        static_cast<RdmaTransport*>(_high_speed_transport.get())
+            ->SetHighSpeedAvailable(available);
+        break;
+#endif
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        static_cast<UBShmTransport*>(_high_speed_transport.get())
+            ->SetHighSpeedAvailable(available);
+        break;
+#endif
+    default:
+        break;
+    }
+}
+
+void AdapterTransport::StartServerHandshake() {
+    if (!_high_speed_transport) {
+        return;
+    }
+    switch (_mode) {
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        static_cast<UBShmTransport*>(_high_speed_transport.get())
+            ->StartServerHandshake();
+        break;
+#endif
+    default:
+        // RDMA uses the standard InputMessenger protocol parser.
+        break;
+    }
 }
 
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
@@ -83,7 +199,7 @@ void AdapterTransport::ProcessTcpEvent() {
     while (true) {
         const int phase = _handshake.phase();
         if (phase == handshake::UNINITIALIZED) {
-            if (!_socket->CreatedByConnect()) {
+            if (!_socket->CreatedByConnect() && _high_speed_transport) {
                 StartServerHandshake();
                 if (_handshake.phase() != handshake::UNINITIALIZED) {
                     continue;

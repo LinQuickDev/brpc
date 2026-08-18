@@ -20,11 +20,14 @@
 #if BRPC_WITH_UBRING
 #include "brpc/socket.h"
 #include "brpc/channel.h"
-#include "brpc/adapter_transport.h"
+#include "brpc/transport.h"
+#include "brpc/transport_handshake.h"
 
 namespace brpc {
-class UBShmTransport : public AdapterTransport {
+class AdapterTransport;
+class UBShmTransport : public Transport {
     friend class TransportFactory;
+    friend class AdapterTransport;
     friend class ubring::UBShmEndpoint;
     friend class ubring::UBConnect;
 public:
@@ -48,6 +51,10 @@ public:
     void Release() override;
     int Reset(int32_t expected_nref) override;
     std::shared_ptr<AppConnect> Connect() override;
+    int CutFromIOBuf(butil::IOBuf* buf) override;
+    ssize_t CutFromIOBufList(butil::IOBuf** buf, size_t ndata) override;
+    int WaitEpollOut(butil::atomic<int>* epollout_butex,
+                     bool pollin, timespec duetime) override;
     void ProcessEvent(bthread_attr_t attr) override;
     void QueueMessage(InputMessageClosure& inputMsg, int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream &os) override;
@@ -55,16 +62,19 @@ public:
         CHECK(_ub_ep != NULL);
         return _ub_ep;
     }
+    static UBShmTransport* Get(const Socket* socket);
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
+    int handshake_phase() const;
+    int handshake_version() const;
     static void* ProcessHandshakeAtClient(void* arg);
     static void* ProcessHandshakeAtServer(void* arg);
 private:
-    void SetHighSpeedAvailable(bool available) override;
-    ssize_t CutFromHighSpeedIOBufList(
-        butil::IOBuf** buf, size_t ndata) override;
-    int WaitHighSpeedEpollOut(butil::atomic<int>* epollout_butex,
-                              bool pollin, timespec duetime) override;
-    void StartServerHandshake() override;
+    AdapterTransport* adapter_transport() const;
+    handshake::HandshakeSession* handshake_session() const;
+    void FallbackToTcp();
+    void TryReadOnTcp();
+    void SetHighSpeedAvailable(bool available);
+    void StartServerHandshake();
 
     static bool OptionsAvailableForUB(const ChannelOptions* opt);
     static bool OptionsAvailableOverUB(const ServerOptions* opt);

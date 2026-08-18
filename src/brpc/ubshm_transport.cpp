@@ -18,6 +18,7 @@
 #if BRPC_WITH_UBRING
 
 #include "brpc/ubshm_transport.h"
+#include "brpc/adapter_transport.h"
 #include "brpc/ubshm/ub_endpoint.h"
 #include "brpc/ubshm/ub_helper.h"
 
@@ -27,22 +28,50 @@ DECLARE_bool(usercode_in_pthread);
 
 extern SocketVarsCollector *g_vars;
 
+UBShmTransport* UBShmTransport::Get(const Socket* socket) {
+    const AdapterTransport* adapter = AdapterTransport::Get(socket);
+    Transport* transport = adapter->high_speed_transport();
+    CHECK(transport != NULL);
+    return static_cast<UBShmTransport*>(transport);
+}
+
+AdapterTransport* UBShmTransport::adapter_transport() const {
+    return AdapterTransport::Get(_socket);
+}
+
+handshake::HandshakeSession* UBShmTransport::handshake_session() const {
+    return adapter_transport()->handshake_session();
+}
+
+int UBShmTransport::handshake_phase() const {
+    return adapter_transport()->handshake_phase();
+}
+
+int UBShmTransport::handshake_version() const {
+    return adapter_transport()->handshake_version();
+}
+
+void UBShmTransport::FallbackToTcp() {
+    adapter_transport()->FallbackToTcp();
+}
+
+void UBShmTransport::TryReadOnTcp() {
+    adapter_transport()->TryReadOnTcp();
+}
+
 void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
     CHECK(_ub_ep == NULL);
-    if (options.socket_mode == SOCKET_MODE_UBRING) {
-        _ub_ep = new(std::nothrow)ubring::UBShmEndpoint(socket);
-        if (!_ub_ep) {
-            const int saved_errno = errno;
-            PLOG(ERROR) << "Fail to create UBShmEndpoint";
-            socket->SetFailed(
-                saved_errno, "Fail to create UBShmEndpoint: %s", berror(saved_errno));
-        }
-        _ub_state = UB_UNKNOWN;
-    } else {
-        _ub_state = UB_OFF;
-        socket->_socket_mode = SOCKET_MODE_TCP;
+    _socket = socket;
+    _default_connect = options.app_connect;
+    _on_edge_trigger = NULL;
+    _ub_ep = new(std::nothrow)ubring::UBShmEndpoint(socket);
+    if (!_ub_ep) {
+        const int saved_errno = errno;
+        PLOG(ERROR) << "Fail to create UBShmEndpoint";
+        socket->SetFailed(
+            saved_errno, "Fail to create UBShmEndpoint: %s", berror(saved_errno));
     }
-    InitAdapterTransport(socket, options, AdapterTransport::OnNewDataFromTcp);
+    _ub_state = UB_UNKNOWN;
 }
 
 void UBShmTransport::Release() {
@@ -58,7 +87,6 @@ int UBShmTransport::Reset(int32_t expected_nref) {
         _ub_ep->Reset();
         _ub_state = UB_UNKNOWN;
     }
-    ResetAdapterTransport();
     return 0;
 }
 
@@ -73,13 +101,18 @@ void UBShmTransport::SetHighSpeedAvailable(bool available) {
     _ub_state = available ? UB_ON : UB_OFF;
 }
 
-ssize_t UBShmTransport::CutFromHighSpeedIOBufList(
+int UBShmTransport::CutFromIOBuf(butil::IOBuf* buf) {
+    butil::IOBuf* data[1] = {buf};
+    return static_cast<int>(CutFromIOBufList(data, 1));
+}
+
+ssize_t UBShmTransport::CutFromIOBufList(
     butil::IOBuf** buf, size_t ndata) {
     CHECK(_ub_ep != NULL);
     return _ub_ep->CutFromIOBufList(buf, ndata);
 }
 
-int UBShmTransport::WaitHighSpeedEpollOut(
+int UBShmTransport::WaitEpollOut(
     butil::atomic<int>* epollout_butex, bool pollin, timespec duetime) {
     const int expected_val = epollout_butex->load(butil::memory_order_acquire);
     CHECK(_ub_ep != NULL);

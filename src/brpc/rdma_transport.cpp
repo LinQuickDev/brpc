@@ -19,6 +19,7 @@
 
 #include "brpc/rdma_transport.h"
 #include "butil/sys_byteorder.h"
+#include "brpc/adapter_transport.h"
 #include "brpc/event_dispatcher.h"
 #include "brpc/input_messenger.h"
 #include "brpc/rdma/rdma_endpoint.h"
@@ -40,8 +41,7 @@ DECLARE_bool(rdma_trace_verbose);
 void RdmaConnect::StartConnect(const Socket* socket,
                                void (*done)(int err, void* data),
                                void* data) {
-    RdmaTransport* transport =
-        static_cast<RdmaTransport*>(socket->_transport.get());
+    RdmaTransport* transport = RdmaTransport::Get(socket);
     CHECK(transport->_rdma_ep != NULL);
     SocketUniquePtr ptr;
     if (Socket::Address(socket->id(), &ptr) != 0) {
@@ -75,6 +75,33 @@ void RdmaConnect::Run() {
 
 }  // namespace rdma
 
+RdmaTransport* RdmaTransport::Get(const Socket* socket) {
+    const AdapterTransport* adapter = AdapterTransport::Get(socket);
+    Transport* transport = adapter->high_speed_transport();
+    CHECK(transport != NULL);
+    return static_cast<RdmaTransport*>(transport);
+}
+
+AdapterTransport* RdmaTransport::adapter_transport() const {
+    return AdapterTransport::Get(_socket);
+}
+
+handshake::HandshakeSession* RdmaTransport::handshake_session() const {
+    return adapter_transport()->handshake_session();
+}
+
+int RdmaTransport::handshake_phase() const {
+    return adapter_transport()->handshake_phase();
+}
+
+int RdmaTransport::handshake_version() const {
+    return adapter_transport()->handshake_version();
+}
+
+void RdmaTransport::FallbackToTcp() {
+    adapter_transport()->FallbackToTcp();
+}
+
 void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
     RdmaTransport* transport = static_cast<RdmaTransport*>(arg);
     rdma::RdmaEndpoint* ep = transport->_rdma_ep;
@@ -87,9 +114,10 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
 
     std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol =
         rdma::CreateClientHandshakeAdapter(
-            ep, transport->_handshake.io());
+            ep, transport->handshake_session()->io());
     CHECK(protocol != NULL);
-    transport->_handshake.set_protocol_version(protocol->ProtocolVersion());
+    transport->handshake_session()->set_protocol_version(
+        protocol->ProtocolVersion());
     rdma::ParsedHello remote{};
 
     handshake::ClientHandshakeCallbacks callbacks{};
@@ -144,7 +172,7 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
     callbacks.send_ack = [&](bool enabled) {
         const uint32_t flags_be = butil::HostToNet32(
             enabled ? rdma::HELLO_ACK_RDMA_OK : 0);
-        if (transport->_handshake.io()->WriteAll(
+        if (transport->handshake_session()->io()->WriteAll(
                 &flags_be, rdma::HELLO_ACK_LEN) == 0) {
             return handshake::STEP_OK;
         }
@@ -163,7 +191,7 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
     callbacks.on_failed = []() {};
 
     const handshake::StepResult result =
-        transport->_handshake.RunClient(callbacks);
+        transport->handshake_session()->RunClient(callbacks);
     if (result == handshake::STEP_OK) {
         LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
             << "Client handshake ends (use rdma v"
@@ -179,8 +207,7 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
 
 ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
                                                    Socket* socket) {
-    RdmaTransport* transport =
-        static_cast<RdmaTransport*>(socket->_transport.get());
+    RdmaTransport* transport = RdmaTransport::Get(socket);
     rdma::RdmaEndpoint* ep = transport->_rdma_ep;
     CHECK(ep != NULL);
 
@@ -198,11 +225,12 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
         uint8_t magic[rdma::HELLO_MAGIC_LEN];
         CHECK_EQ(source->copy_to(magic, sizeof(magic)), sizeof(magic));
         protocol = rdma::CreateServerHandshakeAdapterByMagic(
-            ep, transport->_handshake.io(), source, magic);
+            ep, transport->handshake_session()->io(), source, magic);
         if (protocol == NULL) {
             return handshake::STEP_NOT_MINE;
         }
-        transport->_handshake.set_protocol_version(protocol->ProtocolVersion());
+        transport->handshake_session()->set_protocol_version(
+            protocol->ProtocolVersion());
         const rdma::RemoteHelloResult result =
             protocol->ReceiveAndParseRemoteHello(&remote);
         if (result == rdma::RemoteHelloResult::NEED_MORE) {
@@ -266,9 +294,9 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
     callbacks.on_failed = []() {};
 
     const handshake::StepResult result =
-        transport->_handshake.RunServer(callbacks);
+        transport->handshake_session()->RunServer(callbacks);
     if (result == handshake::STEP_NEED_MORE) {
-        if (transport->_handshake.phase() == S_ACK_WAIT &&
+        if (transport->handshake_phase() == S_ACK_WAIT &&
             socket->parsing_context() == NULL) {
             socket->reset_parsing_context(
                 rdma::ServerHandshakeContext::Create());
@@ -284,33 +312,17 @@ ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
 
 void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
     CHECK(_rdma_ep == NULL);
-    if (options.socket_mode == SOCKET_MODE_RDMA) {
-        _rdma_ep = new(std::nothrow)rdma::RdmaEndpoint(socket);
-        if (!_rdma_ep) {
-            const int saved_errno = errno;
-            PLOG(ERROR) << "Fail to create RdmaEndpoint";
-            socket->SetFailed(
-                saved_errno, "Fail to create RdmaEndpoint: %s", berror(saved_errno));
-        }
-        _rdma_state = RDMA_UNKNOWN;
-    } else {
-        _rdma_state = RDMA_OFF;
-        socket->_socket_mode = SOCKET_MODE_TCP;
+    _socket = socket;
+    _default_connect = options.app_connect;
+    _on_edge_trigger = NULL;
+    _rdma_ep = new(std::nothrow)rdma::RdmaEndpoint(socket);
+    if (!_rdma_ep) {
+        const int saved_errno = errno;
+        PLOG(ERROR) << "Fail to create RdmaEndpoint";
+        socket->SetFailed(
+            saved_errno, "Fail to create RdmaEndpoint: %s", berror(saved_errno));
     }
-    OnEdgeTrigger default_on_edge;
-    if (options.need_on_edge_trigger) {
-        // Server-side RDMA sockets drive the handshake through the standard
-        // InputMessenger path (ParseRdmaHandshake), so they use OnNewMessages
-        // just like TCP sockets. Only client-side sockets, whose handshake
-        // ProcessHandshakeAtClient is an active blocking bthread relying on
-        // HandshakeSession being woken by OnNewDataFromTcp.
-        if (options.user == static_cast<SocketUser*>(get_client_side_messenger())) {
-            default_on_edge = AdapterTransport::OnNewDataFromTcp;
-        } else {
-            default_on_edge = InputMessenger::OnNewMessages;
-        }
-    }
-    InitAdapterTransport(socket, options, default_on_edge);
+    _rdma_state = RDMA_UNKNOWN;
 }
 
 void RdmaTransport::Release() {
@@ -326,7 +338,6 @@ int RdmaTransport::Reset(int32_t expected_nref) {
         _rdma_ep->Reset();
         _rdma_state = RDMA_UNKNOWN;
     }
-    ResetAdapterTransport();
     return 0;
 }
 
@@ -341,13 +352,18 @@ void RdmaTransport::SetHighSpeedAvailable(bool available) {
     _rdma_state = available ? RDMA_ON : RDMA_OFF;
 }
 
-ssize_t RdmaTransport::CutFromHighSpeedIOBufList(
+int RdmaTransport::CutFromIOBuf(butil::IOBuf* buf) {
+    butil::IOBuf* data[1] = {buf};
+    return static_cast<int>(CutFromIOBufList(data, 1));
+}
+
+ssize_t RdmaTransport::CutFromIOBufList(
     butil::IOBuf** buf, size_t ndata) {
     CHECK(_rdma_ep != NULL);
     return _rdma_ep->CutFromIOBufList(buf, ndata);
 }
 
-int RdmaTransport::WaitHighSpeedEpollOut(
+int RdmaTransport::WaitEpollOut(
     butil::atomic<int>* epollout_butex, bool, timespec duetime) {
     const int expected_val = epollout_butex->load(butil::memory_order_acquire);
     CHECK(_rdma_ep != NULL);
@@ -427,7 +443,7 @@ void RdmaTransport::Debug(std::ostream &os) {
         _rdma_ep->DebugInfo(os);
     }
     const char* state = "UNKNOWN";
-    switch (_handshake.phase(butil::memory_order_relaxed)) {
+    switch (handshake_session()->phase(butil::memory_order_relaxed)) {
     case UNINIT: state = "UNINIT"; break;
     case C_ALLOC_QPCQ: state = "C_ALLOC_QPCQ"; break;
     case C_HELLO_SEND: state = "C_HELLO_SEND"; break;

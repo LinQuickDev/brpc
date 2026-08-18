@@ -1041,7 +1041,7 @@ void RdmaEndpoint::PollCq(Socket* m) {
     if (Socket::Address(ep->_socket->id(), &s) < 0) {
         return;
     }
-    auto* rdma_transport = static_cast<RdmaTransport*>(s->_transport.get());
+    RdmaTransport* rdma_transport = RdmaTransport::Get(s.get());
     CHECK(ep == rdma_transport->_rdma_ep);
 
     bool send = false;

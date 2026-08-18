@@ -20,55 +20,65 @@
 
 #include <memory>
 
+#include "brpc/socket_mode.h"
 #include "brpc/transport.h"
 #include "brpc/transport_handshake.h"
 
 namespace brpc {
 
 class TcpTransport;
+class RdmaTransport;
+class UBShmTransport;
 
-// A TCP-first transport that may switch its data plane after a successful
+// The top-level Transport installed in Socket. It starts on TcpTransport and
+// may switch to an independent RDMA/URMA/UBSHM Transport after a successful
 // handshake. TCP remains usable before negotiation and after fallback.
 class AdapterTransport : public Transport {
+    friend class TransportFactory;
+    friend class RdmaTransport;
+    friend class UBShmTransport;
 public:
+    void Init(Socket* socket, const SocketOptions& options) override;
+    void Release() override;
+    int Reset(int32_t expected_nref) override;
+    std::shared_ptr<AppConnect> Connect() override;
     int CutFromIOBuf(butil::IOBuf* buf) override;
     ssize_t CutFromIOBufList(butil::IOBuf** buf, size_t ndata) override;
     int WaitEpollOut(butil::atomic<int>* epollout_butex,
                      bool pollin, timespec duetime) override;
+    void ProcessEvent(bthread_attr_t attr) override;
+    void QueueMessage(InputMessageClosure& input_msg,
+                      int* num_bthread_created, bool last_msg) override;
+    void Debug(std::ostream& os) override;
 
     int handshake_phase() const { return _handshake.phase(); }
     int handshake_version() const { return _handshake.protocol_version(); }
+    Transport* high_speed_transport() const {
+        return _high_speed_transport.get();
+    }
+
+    static AdapterTransport* Get(Socket* socket);
+    static const AdapterTransport* Get(const Socket* socket);
 
     static void OnNewDataFromTcp(Socket* socket);
 
-protected:
-    AdapterTransport() = default;
-    ~AdapterTransport() override = default;
+private:
+    explicit AdapterTransport(SocketMode mode) : _mode(mode) {}
+    ~AdapterTransport() override;
 
-    void InitAdapterTransport(Socket* socket, const SocketOptions& options,
-                              const OnEdgeTrigger& default_on_edge);
-    void ResetAdapterTransport();
-
+    Transport* ActiveTransport() const;
+    handshake::HandshakeSession* handshake_session() { return &_handshake; }
+    void SetHighSpeedAvailable(bool available);
+    void StartServerHandshake();
     void FallbackToTcp();
     void TryReadOnTcp();
-
-    virtual void SetHighSpeedAvailable(bool available) = 0;
-    virtual ssize_t CutFromHighSpeedIOBufList(
-        butil::IOBuf** buf, size_t ndata) = 0;
-    virtual int WaitHighSpeedEpollOut(butil::atomic<int>* epollout_butex,
-                                      bool pollin, timespec duetime) = 0;
-
-    // Called only for an accepted socket whose handshake phase is still
-    // UNINITIALIZED. Protocols parsed by InputMessenger can leave this as a
-    // no-op and install InputMessenger::OnNewMessages on server sockets.
-    virtual void StartServerHandshake() {}
-
-    handshake::HandshakeSession _handshake;
-    std::shared_ptr<TcpTransport> _tcp_transport;
-
-private:
     void ProcessTcpEvent();
     void CheckUnexpectedTcpData();
+
+    SocketMode _mode;
+    handshake::HandshakeSession _handshake;
+    std::unique_ptr<TcpTransport> _tcp_transport;
+    std::unique_ptr<Transport> _high_speed_transport;
 };
 
 }  // namespace brpc
