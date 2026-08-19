@@ -20,11 +20,8 @@
 #include "brpc/rdma_transport.h"
 #include "brpc/adapter_transport.h"
 #include "brpc/event_dispatcher.h"
-#include "brpc/input_messenger.h"
+#include "brpc/handshake/rdma_handshake.h"
 #include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma_handshake.h"
-#include "brpc/rdma_handshake_constants.h"
-#include "brpc/rdma_handshake_server.h"
 #include "brpc/rdma/rdma_helper.h"
 
 namespace brpc {
@@ -167,84 +164,6 @@ void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
     }
     errno = 0;
     return NULL;
-}
-
-ParseResult RdmaTransport::ExecuteServerHandshake(butil::IOBuf* source,
-                                                   Socket* socket) {
-    RdmaTransport* transport = RdmaTransport::Get(socket);
-    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
-    CHECK(ep != NULL);
-
-    rdma::ParsedHello remote{};
-    std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter> > protocols =
-        rdma::CreateServerHandshakeAdapters(ep);
-    handshake::IOBufHandshakeInput input(source);
-    handshake::ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = handshake::HandshakePhases{
-        S_ALLOC_QPCQ, S_HELLO_SEND, S_HELLO_WAIT,
-        S_BRINGUP_QP, 0, S_ACK_WAIT};
-    callbacks.fallback_on_not_mine = false;
-    callbacks.input = &input;
-    for (size_t i = 0; i < protocols.size(); ++i) {
-        handshake::HandshakeCodec codec = protocols[i]->MakeCodec(&remote);
-        const std::function<handshake::StepResult(const std::string&)>
-            parse_hello = codec.parse_hello;
-        codec.parse_hello = [transport, parse_hello](
-            const std::string& payload) {
-            const handshake::StepResult result = parse_hello(payload);
-            if (result == handshake::STEP_FALLBACK) {
-                transport->_rdma_state = RDMA_OFF;
-            }
-            return result;
-        };
-        callbacks.codecs.push_back(codec);
-    }
-    callbacks.prepare_resources = [&]() {
-        ep->ApplyRemoteInfo(remote);
-        if (ep->AllocateResources() < 0) {
-            PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
-                          << socket->description();
-            transport->_rdma_state = RDMA_OFF;
-            return handshake::STEP_FALLBACK;
-        }
-        return handshake::STEP_OK;
-    };
-    callbacks.negotiate_resources = [&]() {
-        if (ep->BringUpQp(remote, true) < 0) {
-            transport->_rdma_state = RDMA_OFF;
-            return handshake::STEP_FALLBACK;
-        }
-        return handshake::STEP_OK;
-    };
-    callbacks.validate_established = [&]() {
-        if (!source->empty() || transport->_rdma_state == RDMA_OFF) {
-            return handshake::STEP_ERROR;
-        }
-        return handshake::STEP_OK;
-    };
-    callbacks.set_high_speed_active = [transport]() {
-        transport->SetHighSpeedAvailable(true);
-    };
-    callbacks.set_tcp_active = [transport]() {
-        transport->SetHighSpeedAvailable(false);
-    };
-    callbacks.on_failed = []() {};
-
-    const handshake::StepResult result =
-        transport->handshake_session()->RunServer(callbacks);
-    if (result == handshake::STEP_NEED_MORE) {
-        if (transport->handshake_phase() == S_ACK_WAIT &&
-            socket->parsing_context() == NULL) {
-            socket->reset_parsing_context(
-                rdma::ServerHandshakeContext::Create());
-        }
-        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
-    }
-    socket->reset_parsing_context(NULL);
-    if (result == handshake::STEP_ERROR) {
-        return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
-    }
-    return MakeParseError(PARSE_ERROR_TRY_OTHERS);
 }
 
 void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {

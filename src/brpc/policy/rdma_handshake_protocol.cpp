@@ -19,14 +19,15 @@
 
 #include "butil/logging.h"
 #include "brpc/destroyable.h"
-#include "brpc/rdma_handshake_server.h"
+#include "brpc/handshake/rdma_handshake.h"
 
 namespace brpc {
 namespace policy {
 
 ParseResult ParseRdmaHandshake(butil::IOBuf* source, Socket* socket,
                                bool /*read_eof*/, const void* /*arg*/) {
-    return rdma::ExecuteServerHandshake(source, socket);
+    return handshake::GetRdmaServerHandshakeAdapter()
+        ->ExecuteServerHandshake(source, socket);
 }
 
 void ProcessRdmaHandshake(InputMessageBase* msg) {

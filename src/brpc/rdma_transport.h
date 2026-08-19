@@ -26,11 +26,15 @@
 
 namespace brpc {
 class AdapterTransport;
+namespace handshake {
+class RdmaServerHandshakeAdapter;
+}
 class RdmaTransport : public Transport {
     friend class TransportFactory;
     friend class AdapterTransport;
     friend class rdma::RdmaEndpoint;
     friend class rdma::RdmaConnect;
+    friend class handshake::RdmaServerHandshakeAdapter;
 public:
     enum HandshakeState {
         UNINIT = 0x0,
@@ -75,8 +79,6 @@ public:
     // TCP control-plane callbacks. The endpoint is intentionally absent from
     // these entry points and only participates through resource operations.
     static void* ProcessHandshakeAtClient(void* arg);
-    static ParseResult ExecuteServerHandshake(butil::IOBuf* source,
-                                              Socket* socket);
 private:
     AdapterTransport* adapter_transport() const;
     handshake::HandshakeSession* handshake_session() const;

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_RDMA_HANDSHAKE_CONSTANTS_H
-#define BRPC_RDMA_HANDSHAKE_CONSTANTS_H
+#ifndef BRPC_HANDSHAKE_RDMA_HANDSHAKE_CONSTANTS_H
+#define BRPC_HANDSHAKE_RDMA_HANDSHAKE_CONSTANTS_H
 
 #include <cstddef>
 #include <cstdint>
@@ -78,4 +78,4 @@ inline const handshake::FrameSpec& RdmaAckFrameSpec() {
 }  // namespace rdma
 }  // namespace brpc
 
-#endif  // BRPC_RDMA_HANDSHAKE_CONSTANTS_H
+#endif  // BRPC_HANDSHAKE_RDMA_HANDSHAKE_CONSTANTS_H

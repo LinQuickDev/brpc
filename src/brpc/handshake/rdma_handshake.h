@@ -15,8 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_RDMA_HANDSHAKE_H
-#define BRPC_RDMA_HANDSHAKE_H
+#ifndef BRPC_HANDSHAKE_RDMA_HANDSHAKE_H
+#define BRPC_HANDSHAKE_RDMA_HANDSHAKE_H
+
+#include "brpc/handshake/handshake_adapter.h"
+
+namespace brpc {
+namespace handshake {
+
+// Returns the single adapter used by policy::ParseRdmaHandshake. The concrete
+// RDMA type is private to the implementation; callers only learn the common
+// HandshakeAdapter interface.
+HandshakeAdapter* GetRdmaServerHandshakeAdapter();
+
+}  // namespace handshake
+}  // namespace brpc
 
 #if BRPC_WITH_RDMA
 
@@ -29,7 +42,7 @@
 #include "butil/containers/optional.h"
 #include "butil/macros.h"
 #include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma_handshake_constants.h"
+#include "brpc/handshake/rdma_handshake_constants.h"
 #include "brpc/transport_handshake.h"
 
 namespace brpc {
@@ -138,4 +151,4 @@ CreateServerHandshakeAdapters(RdmaEndpoint* ep);
 }  // namespace brpc
 
 #endif  // BRPC_WITH_RDMA
-#endif  // BRPC_RDMA_HANDSHAKE_H
+#endif  // BRPC_HANDSHAKE_RDMA_HANDSHAKE_H

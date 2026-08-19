@@ -43,9 +43,9 @@ RDMA 支持：
 
 相关代码：
 
-- `src/brpc/rdma_handshake.h`
-- `src/brpc/rdma_handshake.cpp`
-- `src/brpc/rdma_handshake_server.cpp`
+- `src/brpc/handshake/handshake_adapter.*`
+- `src/brpc/handshake/rdma_handshake.*`
+- `src/brpc/handshake/rdma_handshake_constants.h`
 
 ### 2.2 URMA
 
@@ -120,10 +120,10 @@ Hello 中携带：
 src/brpc/
     adapter_transport.h/.cpp     # Socket 顶层 Transport、TCP-first 路由与状态发布
     transport_handshake.h/.cpp   # HandshakeSession、codec 与资源阶段编排
+    handshake/handshake_adapter.* # 标准 server parser 适配与 ParseResult 转换
     handshake/handshake_io.*     # blocking fd I/O 与增量 IOBuf 输入适配
     handshake/handshake_frame.*  # fixed/U16/U32 通用 framing
-    rdma_handshake.h/.cpp        # RDMA v2/v3 payload 字段 adapter
-    rdma_handshake_server.h/.cpp # RDMA 标准 server parser，fallback 复用 Session/FrameCodec
+    handshake/rdma_handshake.*   # RDMA v2/v3 字段与 server handshake adapter
     rdma_handshake.proto         # RDMA v3 wire message
     rdma_transport.h/.cpp        # 独立 RDMA Transport、握手回调与数据面
     ubshm_transport.h/.cpp       # 独立 UBSHM Transport、握手回调与数据面
@@ -318,7 +318,7 @@ public:
 - client：通过 `SocketHandshakeIO` 统一执行 blocking fd 读写；
 - server：把 `butil::IOBuf` 封装成 `IOBufHandshakeInput`；
 - UBSHM 当前 server 也使用 fd 读取，可先使用 `SocketHandshakeIO`，后续再迁移到增量解析；
-- RDMA 的 `rdma_handshake_server.cpp` 可以直接使用 `HandshakeInput`。
+- RDMA 的 `RdmaServerHandshakeAdapter` 直接使用 `HandshakeInput`。
 
 ### 5.3 FrameCodec
 
@@ -390,6 +390,26 @@ struct ClientHandshakeCallbacks {
     HandshakeCodec codec;
     std::function<Result()> prepare_resources;
     std::function<Result()> negotiate_resources;
+};
+```
+
+标准 server parser 通过一个更深的 adapter seam 接入。policy parser 只调用
+`ExecuteServerHandshake`。`StandardHandshakeAdapter` 统一处理 `StepResult` 到
+`ParseResult` 的转换、`ACK_WAIT` parsing context 和终态清理，协议通常只实现
+三个 protected hook；确实无法复用标准 parser 生命周期时，可以直接实现最小
+`HandshakeAdapter` interface：
+
+```cpp
+class HandshakeAdapter {
+public:
+    virtual ParseResult ExecuteServerHandshake(IOBuf*, Socket*) = 0;
+};
+
+class StandardHandshakeAdapter : public HandshakeAdapter {
+protected:
+    virtual StepResult RunServerHandshake(IOBuf*, Socket*) = 0;
+    virtual HandshakeSession* GetSession(Socket*) const = 0;
+    virtual int AckWaitPhase(const Socket*) const = 0;
 };
 ```
 
@@ -524,7 +544,7 @@ class AdapterTransport : public Transport {
 
 class RdmaTransport : public Transport {
     RdmaEndpoint* _endpoint;
-    // 每次升级尝试创建一个 RdmaHandshakeAdapter。
+    // client 每次升级尝试创建字段 adapter；server 由公共 adapter 驱动。
 };
 
 class UrmaTransport : public Transport {
@@ -734,6 +754,9 @@ classDiagram
         +MarkFailed()
     }
     class RdmaTransport
+    class HandshakeAdapter
+    class StandardHandshakeAdapter
+    class RdmaServerHandshakeAdapter
     class RdmaHandshakeAdapter
     class HandshakeCodec
     class FrameCodec
@@ -754,6 +777,10 @@ classDiagram
     HandshakeSession *-- SocketHandshakeIO
     HandshakeSession --> FrameCodec
     HandshakeSession o-- HandshakeCodec
+    HandshakeAdapter <|-- StandardHandshakeAdapter
+    StandardHandshakeAdapter <|-- RdmaServerHandshakeAdapter
+    RdmaServerHandshakeAdapter --> HandshakeSession
+    RdmaServerHandshakeAdapter --> RdmaHandshakeAdapter
     RdmaTransport --> RdmaHandshakeAdapter
     RdmaTransport --> HighSpeedEndpoint
     UBShmTransport --> HighSpeedEndpoint
@@ -761,7 +788,7 @@ classDiagram
 
 `AdapterTransport` 是安装在 `Socket` 上的最上层 TCP-first Transport：`UNINITIALIZED/NEGOTIATING/FALLBACK_TCP` 都委托给 `TcpTransport`，仅当 `HandshakeSession` release 发布 `ESTABLISHED` 后才委托给所选的 RDMA/URMA/UBSHM Transport。成功升级后的 TCP 控制连接只允许 EOF，不再接受应用数据。
 
-`HandshakeSession::RunClient/RunServer` 持有 `HandshakeCodec` 并统一执行 framing、Hello/ACK 收发、字段 codec 调用、资源准备/协商回调以及 established/fallback/failed 发布。RDMA/UBSHM callback 只解析协议字段或执行具体资源动作；RDMA server 的 `STEP_NEED_MORE` 仍由 bRPC 标准 parser 增量驱动，UBSHM server 使用同一驱动的 blocking 模式。
+`HandshakeSession::RunClient/RunServer` 持有 `HandshakeCodec` 并统一执行 framing、Hello/ACK 收发、字段 codec 调用、资源准备/协商回调以及 established/fallback/failed 发布。`StandardHandshakeAdapter::ExecuteServerHandshake` 统一桥接 bRPC 标准 parser；`RdmaServerHandshakeAdapter` 组装 RDMA 或 plain-TCP fallback callback。RDMA/UBSHM callback 只解析协议字段或执行具体资源动作；RDMA server 的 `STEP_NEED_MORE` 仍由标准 parser 增量驱动，UBSHM server 使用同一 Session driver 的 blocking 模式。
 
 ### 14.1 当前完成度
 
@@ -769,10 +796,11 @@ classDiagram
 |---|---|---|
 | TCP-first 路由 | 已实现 | `Socket` 持有顶层 `AdapterTransport`；其组合 `TcpTransport` 和一个独立高速 `Transport` |
 | 公共握手处理 | 已实现 | `RunClient/RunServer` 统一 FrameCodec、字段 codec、资源回调、ACK、fallback 和错误流程 |
-| RDMA client/server | 已迁移 | v2/v3 adapter 只编解码 payload 字段；真实 RDMA 与无 RDMA Endpoint 的 server fallback 都由 Session 处理 framing/ACK；server 保留 #3350 的标准增量解析流程 |
+| RDMA client/server | 已迁移 | adapter、wire 常量和 server executor 位于 `src/brpc/handshake`；真实 RDMA 与无 RDMA Endpoint 的 fallback 共用 `HandshakeAdapter/Session`；server 保留 #3350 的标准增量解析流程 |
 | UBSHM client/server | 已迁移 | 固定 64 字节 framing、2 字节 magic、ACK 和 fd I/O 已进入公共组件；server 当前仍使用 blocking 输入 |
 | URMA | 待迁移 | origin/master 暂无受版本控制的 URMA Transport；合入后保留独立 `UrmaTransport`，由顶层 `AdapterTransport` 组合并复用 `HandshakeSession` |
 | RDMA Protocol adapter | 已实现 | `RdmaHandshakeAdapter` 只构造/解析 v2/v3 payload 字段，不再读写 fd 或消费 `IOBuf` |
+| Server parser adapter | 已实现 | `HandshakeAdapter` 抽象唯一入口；`StandardHandshakeAdapter` 统一 ParseResult、ACK_WAIT context 和清理流程；协议只实现 driver hook |
 | 通用 FrameCodec | 已实现 | 支持 fixed、U16 总长度、U32 body 长度、2/4 字节 magic、blocking I/O 和增量 `IOBuf` 解析 |
 
 ### 14.2 必须继承的修复语义

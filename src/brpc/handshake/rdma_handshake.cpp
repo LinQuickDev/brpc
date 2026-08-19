@@ -15,20 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#if BRPC_WITH_RDMA
-
-#include "brpc/rdma_handshake.h"
+#include "brpc/handshake/rdma_handshake.h"
 
 #include <errno.h>
-#include <cstring>
 #include <limits>
 #include <string>
 
-#include <gflags/gflags.h>
-
+#include "butil/logging.h"
 #include "butil/raw_pack.h"
 #include "butil/sys_byteorder.h"
+#include "brpc/adapter_transport.h"
+#include "brpc/handshake/rdma_handshake_constants.h"
 #include "brpc/rdma_handshake.pb.h"
+#include "brpc/socket.h"
+
+#if BRPC_WITH_RDMA
+
+#include <cstring>
+
+#include <gflags/gflags.h>
+
+#include "brpc/rdma_transport.h"
 
 namespace brpc {
 namespace rdma {
@@ -383,3 +390,210 @@ CreateServerHandshakeAdapters(RdmaEndpoint* ep) {
 }  // namespace brpc
 
 #endif  // BRPC_WITH_RDMA
+
+namespace brpc {
+namespace handshake {
+
+class RdmaServerHandshakeAdapter : public StandardHandshakeAdapter {
+public:
+    RdmaServerHandshakeAdapter() = default;
+
+protected:
+    StepResult RunServerHandshake(
+        butil::IOBuf* source, Socket* socket) override;
+    HandshakeSession* GetSession(Socket* socket) const override;
+    int AckWaitPhase(const Socket* socket) const override;
+
+private:
+    StepResult RunFallbackServerHandshake(
+        butil::IOBuf* source, Socket* socket);
+#if BRPC_WITH_RDMA
+    StepResult RunRdmaServerHandshake(
+        butil::IOBuf* source, Socket* socket);
+#endif
+
+    DISALLOW_COPY_AND_ASSIGN(RdmaServerHandshakeAdapter);
+};
+
+static const int FALLBACK_PREPARE = 1;
+static const int FALLBACK_HELLO_SEND = 2;
+static const int FALLBACK_HELLO_WAIT = 3;
+static const int FALLBACK_NEGOTIATE = 4;
+static const int FALLBACK_ACK_SEND = 5;
+static const int FALLBACK_ACK_WAIT = 6;
+static constexpr uint16_t V2_HELLO_VERSION_INVALID =
+    std::numeric_limits<uint16_t>::max();
+static constexpr size_t V3_GID_LEN = 16;
+
+static HandshakeCodec MakeRdmaFallbackCodec(int version) {
+    HandshakeCodec codec{};
+    codec.protocol_version = version;
+    codec.hello_frame = rdma::RdmaHelloFrameSpec(version);
+    codec.ack_frame = rdma::RdmaAckFrameSpec();
+    codec.parse_hello = [](const std::string&) {
+        return STEP_FALLBACK;
+    };
+    codec.build_hello = [version](bool enabled, std::string* payload) {
+        if (enabled) {
+            errno = EPROTO;
+            return STEP_ERROR;
+        }
+        if (version == 2) {
+            payload->assign(
+                rdma::HELLO_V2_MSG_LEN_MIN - rdma::HELLO_MAGIC_LEN -
+                    sizeof(uint16_t),
+                '\0');
+            butil::RawPacker(&(*payload)[0])
+                .pack16(V2_HELLO_VERSION_INVALID);
+            return STEP_OK;
+        }
+
+        rdma::RdmaHello reply;
+        reply.set_block_size(0);
+        reply.set_sq_size(0);
+        reply.set_rq_size(0);
+        reply.set_lid(0);
+        reply.set_gid(std::string(V3_GID_LEN, '\0'));
+        reply.set_qp_num(0);
+        if (!reply.SerializeToString(payload)) {
+            errno = EPROTO;
+            return STEP_ERROR;
+        }
+        return STEP_OK;
+    };
+    codec.build_ack = [](bool enabled, std::string* payload) {
+        const uint32_t flags_be = butil::HostToNet32(
+            enabled ? rdma::HELLO_ACK_RDMA_OK : 0);
+        payload->assign(reinterpret_cast<const char*>(&flags_be),
+                        sizeof(flags_be));
+        return STEP_OK;
+    };
+    codec.parse_ack = [](const std::string& payload, bool* enabled) {
+        if (payload.size() != rdma::HELLO_ACK_LEN) {
+            errno = EPROTO;
+            return STEP_ERROR;
+        }
+        *enabled = false;
+        return STEP_OK;
+    };
+    return codec;
+}
+
+HandshakeAdapter* GetRdmaServerHandshakeAdapter() {
+    static RdmaServerHandshakeAdapter adapter;
+    return &adapter;
+}
+
+HandshakeSession* RdmaServerHandshakeAdapter::GetSession(
+    Socket* socket) const {
+    return AdapterTransport::Get(socket)->handshake_session();
+}
+
+int RdmaServerHandshakeAdapter::AckWaitPhase(const Socket* socket) const {
+#if BRPC_WITH_RDMA
+    if (socket->socket_mode() == SOCKET_MODE_RDMA) {
+        return RdmaTransport::S_ACK_WAIT;
+    }
+#endif
+    return FALLBACK_ACK_WAIT;
+}
+
+StepResult RdmaServerHandshakeAdapter::RunFallbackServerHandshake(
+    butil::IOBuf* source, Socket* socket) {
+    IOBufHandshakeInput input(source);
+    ServerHandshakeCallbacks callbacks{};
+    callbacks.phases = HandshakePhases{
+        FALLBACK_PREPARE, FALLBACK_HELLO_SEND, FALLBACK_HELLO_WAIT,
+        FALLBACK_NEGOTIATE, FALLBACK_ACK_SEND, FALLBACK_ACK_WAIT};
+    callbacks.fallback_on_not_mine = false;
+    callbacks.codecs.push_back(MakeRdmaFallbackCodec(2));
+    callbacks.codecs.push_back(MakeRdmaFallbackCodec(3));
+    callbacks.input = &input;
+    callbacks.prepare_resources = []() { return STEP_OK; };
+    callbacks.negotiate_resources = []() { return STEP_OK; };
+    callbacks.set_high_speed_active = []() {};
+    callbacks.set_tcp_active = []() {};
+    callbacks.on_failed = []() {};
+    return GetSession(socket)->RunServer(callbacks);
+}
+
+#if BRPC_WITH_RDMA
+StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
+    butil::IOBuf* source, Socket* socket) {
+    RdmaTransport* transport = RdmaTransport::Get(socket);
+    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
+    CHECK(ep != NULL);
+
+    rdma::ParsedHello remote{};
+    std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter> > protocols =
+        rdma::CreateServerHandshakeAdapters(ep);
+    IOBufHandshakeInput input(source);
+    ServerHandshakeCallbacks callbacks{};
+    callbacks.phases = HandshakePhases{
+        RdmaTransport::S_ALLOC_QPCQ, RdmaTransport::S_HELLO_SEND,
+        RdmaTransport::S_HELLO_WAIT, RdmaTransport::S_BRINGUP_QP,
+        0, RdmaTransport::S_ACK_WAIT};
+    callbacks.fallback_on_not_mine = false;
+    callbacks.input = &input;
+    for (size_t i = 0; i < protocols.size(); ++i) {
+        HandshakeCodec codec = protocols[i]->MakeCodec(&remote);
+        const std::function<StepResult(const std::string&)> parse_hello =
+            codec.parse_hello;
+        codec.parse_hello = [transport, parse_hello](
+            const std::string& payload) {
+            const StepResult result = parse_hello(payload);
+            if (result == STEP_FALLBACK) {
+                transport->_rdma_state = RdmaTransport::RDMA_OFF;
+            }
+            return result;
+        };
+        callbacks.codecs.push_back(codec);
+    }
+    callbacks.prepare_resources = [&]() {
+        ep->ApplyRemoteInfo(remote);
+        if (ep->AllocateResources() < 0) {
+            PLOG(WARNING)
+                << "Fail to allocate rdma resources, fallback to tcp:"
+                << socket->description();
+            transport->_rdma_state = RdmaTransport::RDMA_OFF;
+            return STEP_FALLBACK;
+        }
+        return STEP_OK;
+    };
+    callbacks.negotiate_resources = [&]() {
+        if (ep->BringUpQp(remote, true) < 0) {
+            transport->_rdma_state = RdmaTransport::RDMA_OFF;
+            return STEP_FALLBACK;
+        }
+        return STEP_OK;
+    };
+    callbacks.validate_established = [&]() {
+        if (!source->empty() ||
+            transport->_rdma_state == RdmaTransport::RDMA_OFF) {
+            return STEP_ERROR;
+        }
+        return STEP_OK;
+    };
+    callbacks.set_high_speed_active = [transport]() {
+        transport->SetHighSpeedAvailable(true);
+    };
+    callbacks.set_tcp_active = [transport]() {
+        transport->SetHighSpeedAvailable(false);
+    };
+    callbacks.on_failed = []() {};
+    return GetSession(socket)->RunServer(callbacks);
+}
+#endif
+
+StepResult RdmaServerHandshakeAdapter::RunServerHandshake(
+    butil::IOBuf* source, Socket* socket) {
+#if BRPC_WITH_RDMA
+    if (socket->socket_mode() == SOCKET_MODE_RDMA) {
+        return RunRdmaServerHandshake(source, socket);
+    }
+#endif
+    return RunFallbackServerHandshake(source, socket);
+}
+
+}  // namespace handshake
+}  // namespace brpc

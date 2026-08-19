@@ -38,8 +38,8 @@
 #include "brpc/rdma_transport.h"
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_endpoint.h"
-#include "brpc/rdma_handshake.h"
-#include "brpc/rdma_handshake_constants.h"
+#include "brpc/handshake/rdma_handshake.h"
+#include "brpc/handshake/rdma_handshake_constants.h"
 #include "brpc/rdma_handshake.pb.h"
 #include "brpc/rdma/rdma_helper.h"
 #include "echo.pb.h"
@@ -57,7 +57,7 @@ DEFINE_bool(rdma_test_enable, false, "Enable tests requring rdma runtime.");
 namespace rdma {
 
 // HELLO_V2_VERSION / IMPL_V2_VERSION come from
-// brpc/rdma_handshake_constants.h (shared wire constants).
+// brpc/handshake/rdma_handshake_constants.h (shared wire constants).
 
 DECLARE_bool(rdma_trace_verbose);
 DECLARE_int32(rdma_memory_pool_max_regions);
