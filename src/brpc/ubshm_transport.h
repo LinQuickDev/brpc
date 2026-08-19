@@ -25,11 +25,15 @@
 
 namespace brpc {
 class AdapterTransport;
+namespace handshake {
+class UBShmServerHandshakeAdapter;
+}
 class UBShmTransport : public Transport {
     friend class TransportFactory;
     friend class AdapterTransport;
     friend class ubring::UBShmEndpoint;
     friend class ubring::UBConnect;
+    friend class handshake::UBShmServerHandshakeAdapter;
 public:
     enum HandshakeState {
         UNINIT = 0x0,
@@ -67,14 +71,11 @@ public:
     int handshake_phase() const;
     int handshake_version() const;
     static void* ProcessHandshakeAtClient(void* arg);
-    static void* ProcessHandshakeAtServer(void* arg);
 private:
     AdapterTransport* adapter_transport() const;
     handshake::HandshakeSession* handshake_session() const;
     void FallbackToTcp();
-    void TryReadOnTcp();
     void SetHighSpeedAvailable(bool available);
-    void StartServerHandshake();
 
     static bool OptionsAvailableForUB(const ChannelOptions* opt);
     static bool OptionsAvailableOverUB(const ServerOptions* opt);

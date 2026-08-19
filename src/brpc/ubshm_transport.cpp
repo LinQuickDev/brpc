@@ -17,16 +17,61 @@
 
 #if BRPC_WITH_UBRING
 
+#include <cstring>
+
 #include "brpc/ubshm_transport.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/errno.pb.h"
+#include "brpc/handshake/ubshm_handshake.h"
+#include "brpc/ubshm/common/common.h"
 #include "brpc/ubshm/ub_endpoint.h"
 #include "brpc/ubshm/ub_helper.h"
+#include "brpc/ubshm/ubr_trx.h"
 
 namespace brpc {
 DECLARE_bool(usercode_in_coroutine);
 DECLARE_bool(usercode_in_pthread);
 
 extern SocketVarsCollector *g_vars;
+
+namespace ubring {
+
+void UBConnect::StartConnect(const Socket* socket,
+                             void (*done)(int err, void* data),
+                             void* data) {
+    UBShmTransport* transport = UBShmTransport::Get(socket);
+    CHECK(transport->_ub_ep != NULL);
+    SocketUniquePtr ptr;
+    if (Socket::Address(socket->id(), &ptr) != 0) {
+        return;
+    }
+    if (!IsUBAvailable()) {
+        transport->FallbackToTcp();
+        done(0, data);
+        return;
+    }
+    _done = done;
+    _data = data;
+    bthread_t tid;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "UBProcessHandshakeAtClient");
+    if (bthread_start_background(
+            &tid, &attr, UBShmTransport::ProcessHandshakeAtClient,
+            transport) < 0) {
+        LOG(FATAL) << "Fail to start handshake bthread";
+        Run();
+    } else {
+        ptr.release();
+    }
+}
+
+void UBConnect::StopConnect(Socket*) {}
+
+void UBConnect::Run() {
+    _done(errno, _data);
+}
+
+}  // namespace ubring
 
 UBShmTransport* UBShmTransport::Get(const Socket* socket) {
     const AdapterTransport* adapter = AdapterTransport::Get(socket);
@@ -55,8 +100,96 @@ void UBShmTransport::FallbackToTcp() {
     adapter_transport()->FallbackToTcp();
 }
 
-void UBShmTransport::TryReadOnTcp() {
-    adapter_transport()->TryReadOnTcp();
+void* UBShmTransport::ProcessHandshakeAtClient(void* arg) {
+    UBShmTransport* transport = static_cast<UBShmTransport*>(arg);
+    ubring::UBShmEndpoint* ep = transport->_ub_ep;
+    SocketUniquePtr socket(ep->_socket);
+    ubring::UBConnect::RunGuard guard(
+        static_cast<ubring::UBConnect*>(socket->_app_connect.get()));
+
+    LOG_IF(INFO, ubring::FLAGS_ub_trace_verbose)
+        << "Start handshake on " << socket->_local_side;
+
+    const size_t local_shm_len =
+        static_cast<size_t>(ubring::FLAGS_data_queue_size) * MB_TO_BYTE;
+    ubring::SHM local_trx_shm = {
+        NULL, local_shm_len, 0, {0},
+        static_cast<uint32_t>(socket->fd())};
+    const auto shm_name_str = butil::endpoint2str(socket->local_side());
+    const char* const shm_name = shm_name_str.c_str();
+    ubring::HelloMessage remote{};
+    ubring::UBShmHandshakeAdapter wire;
+
+    handshake::ClientHandshakeCallbacks callbacks{};
+    callbacks.phases = handshake::HandshakePhases{
+        C_ALLOC_SHM, C_HELLO_SEND, C_HELLO_WAIT,
+        C_MAP_REMOTE_SHM, C_ACK_SEND, 0};
+    callbacks.codec = wire.MakeCodec();
+    callbacks.codec.build_hello = [&](bool enabled, std::string* payload) {
+        CHECK(enabled);
+        const handshake::StepResult result = wire.BuildHello(
+            true, local_shm_len, local_trx_shm.name, payload);
+        if (result == handshake::STEP_OK) {
+            ubring::HelloMessage local{};
+            local.Deserialize(payload->data());
+            LOG_IF(INFO, ubring::FLAGS_ub_trace_verbose)
+                << "client handshake message : " << local.toString();
+        }
+        return result;
+    };
+    callbacks.codec.parse_hello = [&](const std::string& payload) {
+        const handshake::StepResult result = wire.ParseHello(payload, &remote);
+        if (result == handshake::STEP_FALLBACK) {
+            LOG(WARNING)
+                << "Fail to negotiate with server, fallback to tcp:"
+                << socket->description();
+        }
+        return result;
+    };
+    callbacks.prepare_resources = [&]() {
+        if (ep->AllocateClientResources(&local_trx_shm, shm_name) == 0) {
+            return handshake::STEP_OK;
+        }
+        LOG(WARNING) << "Fallback to tcp:" << socket->description();
+        errno = 0;
+        return handshake::STEP_FALLBACK;
+    };
+    callbacks.negotiate_resources = [&]() {
+        if (ep->_ub_ring->UbrMapRemoteShm(
+                &local_trx_shm, shm_name) == 0) {
+            return handshake::STEP_OK;
+        }
+        LOG(WARNING) << "Fail to map the remote shm, fallback to tcp:"
+                     << socket->description();
+        return handshake::STEP_FALLBACK;
+    };
+    callbacks.set_high_speed_active = [transport]() {
+        transport->SetHighSpeedAvailable(true);
+    };
+    callbacks.set_tcp_active = [transport]() {
+        transport->SetHighSpeedAvailable(false);
+    };
+    callbacks.on_failed = [&]() {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        socket->SetFailed(saved_errno,
+                          "Fail to complete ubring handshake from %s: %s",
+                          socket->description().c_str(), berror(saved_errno));
+    };
+
+    const handshake::StepResult result =
+        transport->handshake_session()->RunClient(callbacks);
+    if (result == handshake::STEP_OK) {
+        ep->_ub_ring->UbrUnlinkLocalShm();
+        LOG_IF(INFO, ubring::FLAGS_ub_trace_verbose)
+            << "Client handshake ends (use ubring) on "
+            << socket->description();
+    } else if (result == handshake::STEP_FALLBACK) {
+        LOG_IF(INFO, ubring::FLAGS_ub_trace_verbose)
+            << "Client handshake ends (use tcp) on "
+            << socket->description();
+    }
+    errno = 0;
+    return NULL;
 }
 
 void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {

@@ -25,11 +25,18 @@
 namespace brpc {
 namespace handshake {
 
-ServerHandshakeContext* ServerHandshakeContext::Create() {
-    return butil::get_object<ServerHandshakeContext>();
+ServerHandshakeContext* ServerHandshakeContext::Create(
+    HandshakeAdapter* adapter) {
+    ServerHandshakeContext* context =
+        butil::get_object<ServerHandshakeContext>();
+    if (context != NULL) {
+        context->_adapter = adapter;
+    }
+    return context;
 }
 
 void ServerHandshakeContext::Destroy() {
+    _adapter = NULL;
     butil::return_object(this);
 }
 

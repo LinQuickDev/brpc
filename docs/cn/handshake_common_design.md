@@ -19,7 +19,7 @@ TCP 连接建立
     -> 成功切换高速通道，或回退到 TCP
 ```
 
-目前公共流程主要以复制代码的形式存在。例如：
+重构前公共流程主要以复制代码的形式存在。例如：
 
 - RDMA 的 TCP 握手读写循环在 `rdma_endpoint.cpp` 中实现；
 - URMA 在 `urma_endpoint.cpp` 中重新实现了一套；
@@ -83,10 +83,9 @@ Hello 中携带：
 
 相关代码：
 
-- `src/brpc/ubshm/ub_endpoint.h`
-- `src/brpc/ubshm/ub_endpoint.cpp:63`
-- `src/brpc/ubshm/ub_endpoint.cpp:331`
-- `src/brpc/ubshm/ub_endpoint.cpp:460`
+- `src/brpc/handshake/ubshm_handshake.*`
+- `src/brpc/ubshm_transport.*`
+- `src/brpc/ubshm/ub_endpoint.*`
 
 ## 3. 设计目标
 
@@ -124,6 +123,8 @@ src/brpc/
     handshake/handshake_io.*     # blocking fd I/O 与增量 IOBuf 输入适配
     handshake/handshake_frame.*  # fixed/U16/U32 通用 framing
     handshake/rdma_handshake.*   # RDMA v2/v3 字段与 server handshake adapter
+    handshake/ubshm_handshake.*  # UBSHM v2 字段与 server handshake adapter
+    policy/transport_handshake_protocol.* # RDMA/UBSHM server magic 分发
     rdma_handshake.proto         # RDMA v3 wire message
     rdma_transport.h/.cpp        # 独立 RDMA Transport、握手回调与数据面
     ubshm_transport.h/.cpp       # 独立 UBSHM Transport、握手回调与数据面
@@ -142,6 +143,7 @@ flowchart TB
     UT --> UTRA["UrmaTransport"]
     UT --> BT["UBShmTransport"]
     RT --> RA["RDMA handshake adapter"]
+    BT --> BA["UBSHM handshake adapter"]
     RT --> RE["RdmaEndpoint\nQP / CQ / MR"]
     UTRA --> UE["UrmaEndpoint\nJetty / JFC / Segment"]
     BT --> BE["UBShmEndpoint\nUBRing / Shared Memory"]
@@ -317,7 +319,7 @@ public:
 
 - client：通过 `SocketHandshakeIO` 统一执行 blocking fd 读写；
 - server：把 `butil::IOBuf` 封装成 `IOBufHandshakeInput`；
-- UBSHM 当前 server 也使用 fd 读取，可先使用 `SocketHandshakeIO`，后续再迁移到增量解析；
+- UBSHM server 与 RDMA 一样使用 `IOBufHandshakeInput`，由 bRPC 标准协议解析流程增量驱动；
 - RDMA 的 `RdmaServerHandshakeAdapter` 直接使用 `HandshakeInput`。
 
 ### 5.3 FrameCodec
@@ -454,8 +456,8 @@ UNINIT
 
 server 解析必须保留 `NEED_MORE_DATA`：
 
-- RDMA 的 policy parser 可能多次收到 `IOBuf` 片段；
-- 后续 URMA/UBSHM 如果接入统一 server parser，也需要同样行为；
+- RDMA/UBSHM 的公共 transport-handshake policy parser 可能多次收到 `IOBuf` 片段；
+- 后续 URMA 接入统一 server parser 时也需要同样行为；
 - 未读完整时不得消费输入缓冲区。
 
 ### 6.3 公共驱动与具体资源实现的边界
@@ -515,7 +517,7 @@ BuildAck   -> URMA ACK
 
 - `HelloMessage`；
 - `HelloMessage::Serialize/Deserialize`；
-- `HelloNegotiationValid`；
+- hello/implementation version 校验；
 - shared memory 名称和长度校验；
 - `AllocateClientResources/AllocateServerResources`；
 - `UB_OK` ACK bit。
@@ -686,7 +688,7 @@ Hello valid
 
 ### Phase 3：清理旧实现
 
-- **已完成（RDMA/UBSHM）**：删除重复的握手 fd 读写，统一使用 `SocketHandshakeIO`；
+- **已完成（RDMA/UBSHM）**：删除 Endpoint 中重复的握手 fd 读写；client 统一使用 `SocketHandshakeIO`，server 统一使用 `IOBufHandshakeInput`；
 - **已完成（RDMA/UBSHM）**：删除可替代的 magic/length 解析，统一使用 `FrameCodec`；
 - **已完成**：仅保留各协议的 payload 字段 codec 和资源回调；
 - **已完成**：CMake/Bazel 通过递归 glob 收录，Makefile 增加 `src/brpc/handshake`，并更新公共测试；
@@ -758,6 +760,8 @@ classDiagram
     class StandardHandshakeAdapter
     class RdmaServerHandshakeAdapter
     class RdmaHandshakeAdapter
+    class UBShmServerHandshakeAdapter
+    class UBShmHandshakeAdapter
     class HandshakeCodec
     class FrameCodec
     class UrmaTransport
@@ -779,16 +783,20 @@ classDiagram
     HandshakeSession o-- HandshakeCodec
     HandshakeAdapter <|-- StandardHandshakeAdapter
     StandardHandshakeAdapter <|-- RdmaServerHandshakeAdapter
+    StandardHandshakeAdapter <|-- UBShmServerHandshakeAdapter
     RdmaServerHandshakeAdapter --> HandshakeSession
     RdmaServerHandshakeAdapter --> RdmaHandshakeAdapter
+    UBShmServerHandshakeAdapter --> HandshakeSession
+    UBShmServerHandshakeAdapter --> UBShmHandshakeAdapter
     RdmaTransport --> RdmaHandshakeAdapter
+    UBShmTransport --> UBShmHandshakeAdapter
     RdmaTransport --> HighSpeedEndpoint
     UBShmTransport --> HighSpeedEndpoint
 ```
 
 `AdapterTransport` 是安装在 `Socket` 上的最上层 TCP-first Transport：`UNINITIALIZED/NEGOTIATING/FALLBACK_TCP` 都委托给 `TcpTransport`，仅当 `HandshakeSession` release 发布 `ESTABLISHED` 后才委托给所选的 RDMA/URMA/UBSHM Transport。成功升级后的 TCP 控制连接只允许 EOF，不再接受应用数据。
 
-`HandshakeSession::RunClient/RunServer` 持有 `HandshakeCodec` 并统一执行 framing、Hello/ACK 收发、字段 codec 调用、资源准备/协商回调以及 established/fallback/failed 发布。`StandardHandshakeAdapter::ExecuteServerHandshake` 统一桥接 bRPC 标准 parser；`RdmaServerHandshakeAdapter` 组装 RDMA 或 plain-TCP fallback callback。RDMA/UBSHM callback 只解析协议字段或执行具体资源动作；RDMA server 的 `STEP_NEED_MORE` 仍由标准 parser 增量驱动，UBSHM server 使用同一 Session driver 的 blocking 模式。
+`HandshakeSession::RunClient/RunServer` 持有 `HandshakeCodec` 并统一执行 framing、Hello/ACK 收发、字段 codec 调用、资源准备/协商回调以及 established/fallback/failed 发布。`StandardHandshakeAdapter::ExecuteServerHandshake` 统一桥接 bRPC 标准 parser；`RdmaServerHandshakeAdapter` 和 `UBShmServerHandshakeAdapter` 分别组装真实高速连接或 plain-TCP fallback callback。公共 `transport_handshake` policy 根据 magic 分发首次 Hello，并在 parsing context 中保留选中的 adapter，确保后续无 magic 的 ACK 仍回到同一状态机。注册时暂时保留既有 `PROTOCOL_RDMA_HANDSHAKE` 数值和 `rdma_handshake` 名称，避免破坏兼容性。RDMA/UBSHM server 都由标准 parser 增量驱动。
 
 ### 14.1 当前完成度
 
@@ -797,10 +805,10 @@ classDiagram
 | TCP-first 路由 | 已实现 | `Socket` 持有顶层 `AdapterTransport`；其组合 `TcpTransport` 和一个独立高速 `Transport` |
 | 公共握手处理 | 已实现 | `RunClient/RunServer` 统一 FrameCodec、字段 codec、资源回调、ACK、fallback 和错误流程 |
 | RDMA client/server | 已迁移 | adapter、wire 常量和 server executor 位于 `src/brpc/handshake`；真实 RDMA 与无 RDMA Endpoint 的 fallback 共用 `HandshakeAdapter/Session`；server 保留 #3350 的标准增量解析流程 |
-| UBSHM client/server | 已迁移 | 固定 64 字节 framing、2 字节 magic、ACK 和 fd I/O 已进入公共组件；server 当前仍使用 blocking 输入 |
+| UBSHM client/server | 已迁移 | 字段 codec、固定 64 字节 framing、2 字节 magic、ACK 与 server executor 位于 `src/brpc/handshake`；client 由 `UBShmTransport` 驱动，server 与 RDMA 一样走标准增量 parser |
 | URMA | 待迁移 | origin/master 暂无受版本控制的 URMA Transport；合入后保留独立 `UrmaTransport`，由顶层 `AdapterTransport` 组合并复用 `HandshakeSession` |
 | RDMA Protocol adapter | 已实现 | `RdmaHandshakeAdapter` 只构造/解析 v2/v3 payload 字段，不再读写 fd 或消费 `IOBuf` |
-| Server parser adapter | 已实现 | `HandshakeAdapter` 抽象唯一入口；`StandardHandshakeAdapter` 统一 ParseResult、ACK_WAIT context 和清理流程；协议只实现 driver hook |
+| Server parser adapter | 已实现 | `HandshakeAdapter` 抽象唯一入口；`StandardHandshakeAdapter` 统一 ParseResult、ACK_WAIT context 和清理流程；公共 policy 分发 RDMA/UBSHM，协议只实现 driver hook |
 | 通用 FrameCodec | 已实现 | 支持 fixed、U16 总长度、U32 body 长度、2/4 字节 magic、blocking I/O 和增量 `IOBuf` 解析 |
 
 ### 14.2 必须继承的修复语义

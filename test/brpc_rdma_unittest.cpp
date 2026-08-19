@@ -227,9 +227,10 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
     memcpy(data, "PRPC", 4);  // send as normal baidu_std protocol
     ASSERT_EQ(4, write(sockfd, data, 4));
     usleep(100000);  // wait for server to handle the msg
-    // A non-RDMA magic makes ParseRdmaHandshake return TRY_OTHERS and hand the
-    // bytes to other protocols; it does not touch the endpoint state, so it
-    // stays UNINIT (the old blocking handshake used to set FALLBACK_TCP here).
+    // A non-RDMA magic makes the transport-handshake parser return TRY_OTHERS
+    // and hand the bytes to other protocols; it does not touch the endpoint
+    // state, so it stays UNINIT (the old blocking handshake used to set
+    // FALLBACK_TCP here).
     ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
 
     StopServer();
@@ -254,8 +255,8 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     memcpy(data, "RD", 2);
     ASSERT_EQ(2, write(sockfd1, data, 2));  // break in magic str
     usleep(100000);  // wait for server to handle the msg
-    // Fewer than 4 magic bytes: ParseRdmaHandshake can't tell yet, returns
-    // NOT_ENOUGH_DATA and leaves the endpoint UNINIT (the old blocking
+    // Fewer than 4 magic bytes: the transport-handshake parser can't tell yet,
+    // returns NOT_ENOUGH_DATA and leaves the endpoint UNINIT (the old blocking
     // handshake used to set S_HELLO_WAIT before reading the magic).
     ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
     close(sockfd1);

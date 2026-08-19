@@ -18,10 +18,16 @@
 #include <gtest/gtest.h>
 
 #include <errno.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <cstring>
 #include <string>
 
+#include "butil/fd_guard.h"
 #include "butil/sys_byteorder.h"
+#include "brpc/adapter_transport.h"
+#include "brpc/policy/transport_handshake_protocol.h"
+#include "brpc/socket.h"
 #include "brpc/transport_handshake.h"
 
 namespace brpc {
@@ -93,6 +99,18 @@ static HandshakeCodec MakeTestCodec(std::string* calls = NULL) {
         return payload == "1" || payload == "0" ? STEP_OK : STEP_ERROR;
     };
     return codec;
+}
+
+static std::string MakeUBShmHello() {
+    std::string frame(64, '\0');
+    memcpy(&frame[0], "UB", 2);
+    const uint16_t msg_len = butil::HostToNet16(64);
+    const uint16_t hello_ver = butil::HostToNet16(2);
+    const uint16_t impl_ver = butil::HostToNet16(1);
+    memcpy(&frame[2], &msg_len, sizeof(msg_len));
+    memcpy(&frame[4], &hello_ver, sizeof(hello_ver));
+    memcpy(&frame[6], &impl_ver, sizeof(impl_ver));
+    return frame;
 }
 
 TEST(HandshakeFrameTest, supports_two_byte_fixed_magic) {
@@ -280,6 +298,33 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
     ASSERT_EQ(ESTABLISHED, session.phase());
 }
 
+TEST(TransportHandshakeTest, server_resource_failure_falls_back_after_ack) {
+    MemoryHandshakeIO io;
+    HandshakeSession session;
+    session.SetIOForTest(&io);
+    butil::IOBuf source;
+    source.append("HSOK0", 5);
+    IOBufHandshakeInput input(&source);
+    bool tcp_active = false;
+
+    ServerHandshakeCallbacks callbacks{};
+    callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
+    callbacks.fallback_on_not_mine = false;
+    callbacks.codecs.push_back(MakeTestCodec());
+    callbacks.input = &input;
+    callbacks.prepare_resources = []() { return STEP_FALLBACK; };
+    callbacks.negotiate_resources = []() { return STEP_ERROR; };
+    callbacks.set_high_speed_active = []() {};
+    callbacks.set_tcp_active = [&]() { tcp_active = true; };
+    callbacks.on_failed = []() {};
+
+    ASSERT_EQ(STEP_FALLBACK, session.RunServer(callbacks));
+    ASSERT_EQ("HSNO", io.output());
+    ASSERT_TRUE(source.empty());
+    ASSERT_TRUE(tcp_active);
+    ASSERT_EQ(FALLBACK_TCP, session.phase());
+}
+
 TEST(TransportHandshakeTest, server_falls_back_without_consuming_other_magic) {
     MemoryHandshakeIO io;
     HandshakeSession session;
@@ -337,6 +382,87 @@ TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
     ASSERT_EQ(13, session.phase());
     ASSERT_EQ(7, session.protocol_version());
     ASSERT_EQ(2UL, source.size());
+}
+
+TEST(TransportHandshakeTest,
+     plain_tcp_server_incrementally_rejects_ubshm_upgrade) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    const std::string hello = MakeUBShmHello();
+    butil::IOBuf source;
+    source.append(hello.data(), 1);
+    ParseResult result = policy::ParseTransportHandshake(
+        &source, socket.get(), false, NULL);
+    ASSERT_FALSE(result.is_ok());
+    ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
+    ASSERT_EQ(1UL, source.size());
+    ASSERT_EQ(UNINITIALIZED,
+              AdapterTransport::Get(socket.get())->handshake_phase());
+
+    source.append(hello.data() + 1, hello.size() - 1);
+    result = policy::ParseTransportHandshake(
+        &source, socket.get(), false, NULL);
+    ASSERT_FALSE(result.is_ok());
+    ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
+    ASSERT_TRUE(source.empty());
+    ASSERT_NE(NULL, socket->parsing_context());
+
+    char reply[64];
+    ASSERT_EQ(sizeof(reply), read(peer_fd, reply, sizeof(reply)));
+    EXPECT_EQ(0, memcmp(reply, "UB", 2));
+    uint16_t reply_len = 0;
+    memcpy(&reply_len, reply + 2, sizeof(reply_len));
+    EXPECT_EQ(64, butil::NetToHost16(reply_len));
+    EXPECT_EQ(0, reply[4]);
+    EXPECT_EQ(0, reply[5]);
+    EXPECT_EQ(0, reply[6]);
+    EXPECT_EQ(0, reply[7]);
+
+    const uint32_t ack = 0;
+    source.append(&ack, sizeof(ack));
+    result = policy::ParseTransportHandshake(
+        &source, socket.get(), false, NULL);
+    ASSERT_FALSE(result.is_ok());
+    ASSERT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
+    ASSERT_TRUE(source.empty());
+    ASSERT_EQ(FALLBACK_TCP,
+              AdapterTransport::Get(socket.get())->handshake_phase());
+    ASSERT_EQ(NULL, socket->parsing_context());
+    socket->SetFailed();
+}
+
+TEST(TransportHandshakeTest, plain_tcp_server_consumes_coalesced_ubshm_ack) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    butil::IOBuf source;
+    source.append(MakeUBShmHello());
+    const uint32_t ack = 0;
+    source.append(&ack, sizeof(ack));
+    const ParseResult result = policy::ParseTransportHandshake(
+        &source, socket.get(), false, NULL);
+    ASSERT_FALSE(result.is_ok());
+    ASSERT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
+    ASSERT_TRUE(source.empty());
+    ASSERT_EQ(FALLBACK_TCP,
+              AdapterTransport::Get(socket.get())->handshake_phase());
+    ASSERT_EQ(NULL, socket->parsing_context());
+    socket->SetFailed();
 }
 
 }  // namespace handshake

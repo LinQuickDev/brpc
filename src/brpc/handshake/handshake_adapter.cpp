@@ -25,15 +25,21 @@ namespace handshake {
 // InputMessenger may call this entry repeatedly while bytes arrive. Keep all
 // connection state in HandshakeSession and Socket rather than in the adapter,
 // so a single stateless adapter can serve every connection. The parsing
-// context is only a marker that keeps InputMessenger on the selected protocol
-// between the server hello and the peer ACK.
+// context retains that selected adapter between the server hello and the peer
+// ACK, whose frame has no protocol magic of its own.
 ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     const StepResult result = RunServerHandshake(source, socket);
     if (result == STEP_NEED_MORE) {
         if (GetSession(socket)->phase() == AckWaitPhase(socket) &&
             socket->parsing_context() == NULL) {
-            socket->reset_parsing_context(ServerHandshakeContext::Create());
+            ServerHandshakeContext* context =
+                ServerHandshakeContext::Create(this);
+            if (context == NULL) {
+                GetSession(socket)->MarkFailed();
+                return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+            }
+            socket->reset_parsing_context(context);
         }
         return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }

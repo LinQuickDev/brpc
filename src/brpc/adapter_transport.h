@@ -69,7 +69,6 @@ private:
 
     Transport* ActiveTransport() const;
     void SetHighSpeedAvailable(bool available);
-    void StartServerHandshake();
     void FallbackToTcp();
     void TryReadOnTcp();
     void ProcessTcpEvent();

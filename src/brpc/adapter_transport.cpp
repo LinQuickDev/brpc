@@ -55,6 +55,13 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
             // RDMA server handshake is parsed by InputMessenger.
             _on_edge_trigger = InputMessenger::OnNewMessages;
 #endif
+#if BRPC_WITH_UBRING
+        } else if (_mode == SOCKET_MODE_UBRING &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            // UBSHM server handshake is parsed by InputMessenger.
+            _on_edge_trigger = InputMessenger::OnNewMessages;
+#endif
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
         }
@@ -173,23 +180,6 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
     }
 }
 
-void AdapterTransport::StartServerHandshake() {
-    if (!_high_speed_transport) {
-        return;
-    }
-    switch (_mode) {
-#if BRPC_WITH_UBRING
-    case SOCKET_MODE_UBRING:
-        static_cast<UBShmTransport*>(_high_speed_transport.get())
-            ->StartServerHandshake();
-        break;
-#endif
-    default:
-        // RDMA uses the standard InputMessenger protocol parser.
-        break;
-    }
-}
-
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
     static_cast<AdapterTransport*>(socket->_transport.get())->ProcessTcpEvent();
 }
@@ -198,14 +188,8 @@ void AdapterTransport::ProcessTcpEvent() {
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         const int phase = _handshake.phase();
-        if (phase == handshake::UNINITIALIZED) {
-            if (!_socket->CreatedByConnect() && _high_speed_transport) {
-                StartServerHandshake();
-                if (_handshake.phase() != handshake::UNINITIALIZED) {
-                    continue;
-                }
-            }
-        } else if (phase < handshake::ESTABLISHED) {
+        if (phase != handshake::UNINITIALIZED &&
+            phase < handshake::ESTABLISHED) {
             _handshake.NotifyReadable();
         } else if (phase == handshake::FALLBACK_TCP) {
             InputMessenger::OnNewMessages(_socket);

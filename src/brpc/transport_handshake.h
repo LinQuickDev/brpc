@@ -34,11 +34,19 @@ class Socket;
 
 namespace handshake {
 
-// Marker context retained by InputMessenger between the hello and ACK parse
-// calls. It is wire-format agnostic and reusable by every upgrade protocol.
+class HandshakeAdapter;
+
+// Context retained by InputMessenger between the hello and ACK parse calls.
+// Remembering the selected stateless adapter is necessary because ACK frames
+// have no magic and cannot be dispatched from their bytes alone.
 struct ServerHandshakeContext : public Destroyable {
-    static ServerHandshakeContext* Create();
+    ServerHandshakeContext() : _adapter(NULL) {}
+    static ServerHandshakeContext* Create(HandshakeAdapter* adapter);
+    HandshakeAdapter* adapter() const { return _adapter; }
     void Destroy() override;
+
+private:
+    HandshakeAdapter* _adapter;
 };
 
 // Protocol adapters may use transport-specific intermediate values, but the

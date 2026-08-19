@@ -20,15 +20,13 @@
 
 #if BRPC_WITH_UBRING
 
-#include <cstring>
-#include <iostream>
-#include <string>
-#include <vector>
 #include <functional>
+#include <vector>
 #include "butil/atomicops.h"
 #include "butil/iobuf.h"
 #include "butil/macros.h"
 #include "butil/containers/mpsc_queue.h"
+#include "brpc/handshake/ubshm_handshake.h"
 #include "brpc/socket.h"
 #include "brpc/ubshm/ub_helper.h"
 #include "brpc/ubshm/ub_ring.h"
@@ -38,23 +36,14 @@
 namespace brpc {
 class Socket;
 class UBShmTransport;
+namespace handshake {
+class UBShmServerHandshakeAdapter;
+}
 namespace ubring {
 
 DECLARE_int32(ub_poller_num);
 DECLARE_bool(ub_edisp_unsched);
 DECLARE_bool(ub_disable_bthread);
-
-struct HelloMessage {
-    void Serialize(void* data) const;
-    void Deserialize(const void* data);
-    std::string toString() const;
-
-    uint16_t msg_len;
-    uint16_t hello_ver;
-    uint16_t impl_ver;
-    uint64_t len;
-    char shm_name[SHM_MAX_NAME_BUFF_LEN];
-};
 
 class UBConnect : public AppConnect {
 public:
@@ -77,6 +66,7 @@ class BAIDU_CACHELINE_ALIGNMENT UBShmEndpoint : public SocketUser {
 friend class UBConnect;
 friend class Socket;
 friend class ::brpc::UBShmTransport;
+friend class ::brpc::handshake::UBShmServerHandshakeAdapter;
 public:
     explicit UBShmEndpoint(Socket* s);
     ~UBShmEndpoint() override;
