@@ -392,7 +392,7 @@ brpc会自动检测valgrind（然后注册bthread的栈）。不支持老版本�
 
 ## libunwind: 1.3-1.8.1
 
-bRPC默认**不**链接 [libunwind](https://github.com/libunwind/libunwind)。用户需要追踪bthread功能则链接libunwind，可以给config_brpc.sh增加`--with-bthread-tracer`选项或者给cmake增加`-DWITH_BTHREAD_TRACER=ON`选项，如果是用 bazel 构建，请添加 `--define with_bthread_tracer=true` 选项。
+bRPC默认**不**链接 [libunwind](https://github.com/libunwind/libunwind)。用户需要追踪bthread功能则链接libunwind，可以给config_brpc.sh增加`--with-bthread-tracer`选项或者给cmake增加`-DWITH_BTHREAD_TRACER=ON`选项，如果是用 bazel 构建，请添加 `--define with_bthread_tracer=true` 选项。`with_bthread_tracer` 仅在 x86_64 上生效。
 
 建议使用最新版本的libunwind。
 
