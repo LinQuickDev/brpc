@@ -123,6 +123,13 @@ macro(brpc_example_find_common_deps out_libs)
 
     find_package(OpenSSL REQUIRED)
 
+    # brpc built with -DWITH_URMA=ON carries undefined urma_* symbols. Link
+    # liburma by best effort for examples built against that configuration.
+    find_library(URMA_LIB NAMES urma)
+    if(NOT URMA_LIB)
+        set(URMA_LIB "")
+    endif()
+
     set(_common_libs
         Threads::Threads
         ${GFLAGS_LIBRARY}
@@ -132,6 +139,7 @@ macro(brpc_example_find_common_deps out_libs)
         ${OPENSSL_CRYPTO_LIBRARY}
         ${OPENSSL_SSL_LIBRARY}
         ${THRIFT_LIB}
+        ${URMA_LIB}
         dl
     )
 
