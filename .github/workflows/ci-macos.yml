@@ -2,11 +2,11 @@ name: Build on Macos
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, urma_transport_review_fixes ]
     paths-ignore:
       - '**.md'
   pull_request:
-    branches: [ master ]
+    branches: [ master, urma_transport ]
     paths-ignore:
       - '**.md'
 
