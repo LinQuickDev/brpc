@@ -20,7 +20,7 @@ from a JFC either by busy polling or through a JFCE event fd.
 ### Build with CMake
 
 ```bash
-# Build brpc with URMA support
+# Build brpc with URMA support (requires liburma; see below for CI/mock builds)
 cmake -B build -DWITH_URMA=ON
 make -C build -j$(nproc)
 
@@ -30,13 +30,42 @@ cmake -B build
 make -C build -j$(nproc)
 ```
 
+Without `liburma` installed (e.g. in CI), explicitly opt into the link-time
+mock instead of relying on an implicit fallback:
+
+```bash
+cmake -B build -DWITH_URMA=ON -DWITH_URMA_MOCK=ON
+make -C build -j$(nproc)
+```
+
 `WITH_URMA=ON` compiles against upstream UMDK headers. CMake prefers an
 installed SDK and, following Mooncake's mock setup, downloads a pinned UMDK
 release when the headers are unavailable. Set `DOWNLOAD_URMA_HEADERS=OFF` to
 disable downloading.
-When `liburma` is found it is linked for the hardware data path. Otherwise,
-brpc uses its link-time mock so URMA code and tests can still be built without
-hardware.
+When `liburma` is found it is linked for the hardware data path. Otherwise
+the build fails by default, since silently falling back to the mock could
+mask a broken environment and ship a binary that looks URMA-capable but
+cannot reach real hardware. Pass `-DWITH_URMA_MOCK=ON`
+(`config_brpc.sh --with-urma-mock`) to explicitly opt into brpc's
+link-time mock so URMA code and tests can still be built without hardware
+(e.g. in CI).
+
+### Build with Bazel
+
+```bash
+# Build brpc with URMA support
+bazel build --define=BRPC_WITH_URMA=true //:brpc
+```
+
+Bazel fetches the UMDK headers from the `umdk` `git_repository` pinned to a
+fixed commit in `WORKSPACE` / `MODULE.bazel`. There is no Bazel equivalent of
+CMake's `DOWNLOAD_URMA_HEADERS`: Bazel can neither use a locally installed SDK
+nor disable the download. Bazel builds also have no detection/linking logic
+for a real `liburma` yet — `src/brpc/urma/mock_urma.cpp` is compiled in
+unconditionally, so a Bazel build of URMA always uses the mock data path. Use
+CMake or Make to link against real hardware. The `urma_performance` example
+currently only has CMake/Make build files; there is no Bazel target for it
+yet.
 
 ## Usage
 

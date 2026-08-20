@@ -284,6 +284,14 @@ git_repository(
     build_file = "//bazel/third_party/umdk:umdk.BUILD",
     remote = "https://atomgit.com/openeuler/umdk.git",
     commit = "564ee727a55523d4351a8fb3c94292b388ebb924",  # v26.06.0_CAM
+    # umdk ships its own src/urma/BUILD.bazel, which turns src/urma into a
+    # separate Bazel package and silently empties the glob() in umdk.BUILD
+    # (glob cannot cross package boundaries). Drop it so the headers under
+    # src/urma/lib/urma/**/include stay part of this repository's root
+    # package.
+    patch_cmds = [
+        "rm -f src/urma/BUILD.bazel",
+    ],
 )
 
 # Header-only JSON library used by iobuf_unittest's IOBuf<->std::iostream

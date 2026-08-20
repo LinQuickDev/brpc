@@ -20,7 +20,7 @@ WR。完成事件既可由 JFC 忙轮询获取，也可通过 JFCE 事件 fd 获
 ### CMake 编译
 
 ```bash
-# 带 URMA 支持编译 brpc
+# 带 URMA 支持编译 brpc（需要 liburma；无硬件/CI 场景见下方 mock 说明）
 cmake -B build -DWITH_URMA=ON
 make -C build -j$(nproc)
 
@@ -30,11 +30,37 @@ cmake -B build
 make -C build -j$(nproc)
 ```
 
+未安装 `liburma` 时（例如 CI 环境），需显式开启链接期 mock，而不是依赖
+隐式回退：
+
+```bash
+cmake -B build -DWITH_URMA=ON -DWITH_URMA_MOCK=ON
+make -C build -j$(nproc)
+```
+
 `WITH_URMA=ON` 使用上游 UMDK 头文件进行编译。CMake 优先使用系统安装的
 SDK；找不到头文件时，会参照 Mooncake 的 mock 构建方式下载固定版本的
 UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `liburma` 时使用
-真实硬件数据通路，否则链接 brpc 的 mock，使 URMA 代码和测试仍可在无硬件
-环境编译。
+真实硬件数据通路；否则默认直接报错终止构建，避免静默回退到 mock 而产出
+一个看似支持 URMA、实际无法访问真实硬件的产物。需要在无硬件环境（例如
+CI）编译和测试 URMA 代码时，显式传入 `-DWITH_URMA_MOCK=ON`
+（Make 对应 `config_brpc.sh --with-urma-mock`）以主动选择链接 brpc 的
+mock。
+
+### Bazel 编译
+
+```bash
+# 带 URMA 支持编译 brpc
+bazel build --define=BRPC_WITH_URMA=true //:brpc
+```
+
+Bazel 下的 URMA 头文件来自 `WORKSPACE` / `MODULE.bazel` 中固定 commit 的
+`umdk` `git_repository`，没有 CMake `DOWNLOAD_URMA_HEADERS` 那样的开关：
+既不能改用系统已安装的 SDK 头文件，也无法禁止下载。此外 Bazel 构建目前
+未提供检测/链接真实 `liburma` 的逻辑，`src/brpc/urma/mock_urma.cpp` 会
+无条件编入，因此 Bazel 构建的 URMA 始终使用 mock 数据通路；如需链接真实
+硬件，请使用 CMake 或 Make 构建。`urma_performance` 示例目前也只有
+CMake/Make 构建脚本，尚无对应的 Bazel target。
 
 ## 使用
 
