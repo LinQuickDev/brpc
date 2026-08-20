@@ -98,9 +98,10 @@ jobs:
     # test/CMakeLists.txt does find_package(Gperftools) and links
     # ${GPERFTOOLS_LIBRARIES} into every unittest target. The make-based
     # unittest jobs never hit this, but the CMake generate step fails with
-    # NOTFOUND without it.
+    # NOTFOUND without it. Install libunwind-dev explicitly because
+    # libgoogle-perftools-dev depends on it on Ubuntu 22.04 runners.
     - name: install gperftools
-      run: sudo apt-get install -y libgoogle-perftools-dev
+      run: sudo apt-get install -y libunwind-dev libgoogle-perftools-dev
 
     # DOWNLOAD_URMA_HEADERS fetches from atomgit.com, which is slow and often
     # unreachable from CI. openEuler mirrors the same repo (identical tags and
