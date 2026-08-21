@@ -170,62 +170,62 @@ StepResult HandshakeSession::SelectAndReceiveHello(
 
 StepResult HandshakeSession::RunClient(
     const ClientHandshakeCallbacks& callbacks) {
-    CHECK(callbacks.prepare_resources);
-    CHECK(callbacks.negotiate_resources);
-    CHECK(callbacks.set_high_speed_active);
-    CHECK(callbacks.set_tcp_active);
+    CHECK(callbacks.transport.prepare_resources);
+    CHECK(callbacks.transport.negotiate_resources);
+    CHECK(callbacks.transport.set_high_speed_active);
+    CHECK(callbacks.transport.set_tcp_active);
 
-    SetPhase(callbacks.phases.prepare_local);
-    StepResult result = callbacks.prepare_resources();
+    SetPhase(PREPARING);
+    StepResult result = callbacks.transport.prepare_resources();
     if (result == STEP_FALLBACK) {
-        return FinishWithFallback(this, callbacks.set_tcp_active);
+        return FinishWithFallback(this, callbacks.transport.set_tcp_active);
     }
     if (result != STEP_OK) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
 
-    SetPhase(callbacks.phases.hello_send);
+    SetPhase(HELLO_SEND);
     if (SendHello(callbacks.codec, true) != STEP_OK) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
 
-    SetPhase(callbacks.phases.hello_wait);
+    SetPhase(HELLO_WAIT);
     result = ReceiveHello(callbacks.codec, NULL, false);
     if (result == STEP_ERROR || result == STEP_NOT_MINE ||
         result == STEP_NEED_MORE) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
     bool enabled = result == STEP_OK;
 
     if (enabled) {
-        SetPhase(callbacks.phases.negotiate);
-        result = callbacks.negotiate_resources();
+        SetPhase(NEGOTIATING);
+        result = callbacks.transport.negotiate_resources();
         if (result != STEP_OK && result != STEP_FALLBACK) {
-            return FinishWithFailure(this, callbacks.on_failed);
+            return FinishWithFailure(this, callbacks.transport.on_failed);
         }
         enabled = result == STEP_OK;
     }
 
-    SetPhase(callbacks.phases.ack_send);
+    SetPhase(ACK_SEND);
     if (SendAck(callbacks.codec, enabled) != STEP_OK) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
 
     if (enabled) {
-        callbacks.set_high_speed_active();
+        callbacks.transport.set_high_speed_active();
         MarkEstablished();
         return STEP_OK;
     }
-    return FinishWithFallback(this, callbacks.set_tcp_active);
+    return FinishWithFallback(this, callbacks.transport.set_tcp_active);
 }
 
 StepResult HandshakeSession::RunServer(
     const ServerHandshakeCallbacks& callbacks) {
     CHECK(!callbacks.codecs.empty());
-    CHECK(callbacks.prepare_resources);
-    CHECK(callbacks.negotiate_resources);
-    CHECK(callbacks.set_high_speed_active);
-    CHECK(callbacks.set_tcp_active);
+    CHECK(callbacks.transport.prepare_resources);
+    CHECK(callbacks.transport.negotiate_resources);
+    CHECK(callbacks.transport.set_high_speed_active);
+    CHECK(callbacks.transport.set_tcp_active);
 
     // Once TCP fallback has been published, subsequent bytes are application
     // protocol data and must bypass every upgrade codec without changing the
@@ -235,16 +235,16 @@ StepResult HandshakeSession::RunServer(
     }
 
     const HandshakeCodec* selected = NULL;
-    if (phase() != callbacks.phases.ack_wait) {
+    if (phase() != ACK_WAIT) {
         const int previous_phase = phase();
         _local_enabled = false;
-        SetPhase(callbacks.phases.hello_wait);
+        SetPhase(HELLO_WAIT);
         StepResult result = SelectAndReceiveHello(
             callbacks.codecs, callbacks.input,
             callbacks.fallback_on_not_mine, &selected);
         if (result == STEP_NOT_MINE) {
             if (callbacks.fallback_on_not_mine) {
-                return FinishWithFallback(this, callbacks.set_tcp_active);
+                return FinishWithFallback(this, callbacks.transport.set_tcp_active);
             }
             SetPhase(UNINITIALIZED);
             return STEP_NOT_MINE;
@@ -256,35 +256,35 @@ StepResult HandshakeSession::RunServer(
             return STEP_NEED_MORE;
         }
         if (result == STEP_ERROR) {
-            return FinishWithFailure(this, callbacks.on_failed);
+            return FinishWithFailure(this, callbacks.transport.on_failed);
         }
         bool enabled = result == STEP_OK;
 
         if (enabled) {
-            SetPhase(callbacks.phases.prepare_local);
-            result = callbacks.prepare_resources();
+            SetPhase(PREPARING);
+            result = callbacks.transport.prepare_resources();
             if (result != STEP_OK && result != STEP_FALLBACK) {
-                return FinishWithFailure(this, callbacks.on_failed);
+                return FinishWithFailure(this, callbacks.transport.on_failed);
             }
             enabled = result == STEP_OK;
         }
 
         if (enabled) {
-            SetPhase(callbacks.phases.negotiate);
-            result = callbacks.negotiate_resources();
+            SetPhase(NEGOTIATING);
+            result = callbacks.transport.negotiate_resources();
             if (result != STEP_OK && result != STEP_FALLBACK) {
-                return FinishWithFailure(this, callbacks.on_failed);
+                return FinishWithFailure(this, callbacks.transport.on_failed);
             }
             enabled = result == STEP_OK;
         }
 
-        SetPhase(callbacks.phases.hello_send);
+        SetPhase(HELLO_SEND);
         CHECK(selected != NULL);
         _local_enabled = enabled;
         if (SendHello(*selected, enabled) != STEP_OK) {
-            return FinishWithFailure(this, callbacks.on_failed);
+            return FinishWithFailure(this, callbacks.transport.on_failed);
         }
-        SetPhase(callbacks.phases.ack_wait);
+        SetPhase(ACK_WAIT);
     } else {
         for (size_t i = 0; i < callbacks.codecs.size(); ++i) {
             if (callbacks.codecs[i].protocol_version == protocol_version()) {
@@ -306,24 +306,24 @@ StepResult HandshakeSession::RunServer(
         return STEP_NEED_MORE;
     }
     if (result == STEP_ERROR || result == STEP_NOT_MINE) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
     if (result == STEP_FALLBACK) {
-        return FinishWithFallback(this, callbacks.set_tcp_active);
+        return FinishWithFallback(this, callbacks.transport.set_tcp_active);
     }
     if (!peer_enabled) {
-        return FinishWithFallback(this, callbacks.set_tcp_active);
+        return FinishWithFallback(this, callbacks.transport.set_tcp_active);
     }
     if (!_local_enabled) {
         errno = EPROTO;
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
     if (callbacks.validate_established &&
         callbacks.validate_established() != STEP_OK) {
-        return FinishWithFailure(this, callbacks.on_failed);
+        return FinishWithFailure(this, callbacks.transport.on_failed);
     }
 
-    callbacks.set_high_speed_active();
+    callbacks.transport.set_high_speed_active();
     MarkEstablished();
     return STEP_OK;
 }

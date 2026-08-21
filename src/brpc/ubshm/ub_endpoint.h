@@ -45,25 +45,7 @@ DECLARE_int32(ub_poller_num);
 DECLARE_bool(ub_edisp_unsched);
 DECLARE_bool(ub_disable_bthread);
 
-class UBConnect : public AppConnect {
-public:
-    void StartConnect(const Socket* socket,
-            void (*done)(int err, void* data), void* data) override;
-    void StopConnect(Socket*) override;
-    struct RunGuard {
-        RunGuard(UBConnect* rc) { this_rc = rc; }
-        ~RunGuard() { if (this_rc) this_rc->Run(); }
-        UBConnect* this_rc;
-    };
-
-private:
-    void Run();
-    void (*_done)(int, void*){NULL};
-    void* _data{NULL};
-};
-
 class BAIDU_CACHELINE_ALIGNMENT UBShmEndpoint : public SocketUser {
-friend class UBConnect;
 friend class Socket;
 friend class ::brpc::UBShmTransport;
 friend class ::brpc::handshake::UBShmServerHandshakeAdapter;

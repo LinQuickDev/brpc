@@ -22,37 +22,16 @@
 #include "brpc/socket.h"
 #include "brpc/channel.h"
 #include "brpc/transport.h"
-#include "brpc/transport_handshake.h"
+#include "brpc/rdma/rdma_endpoint.h"
+#include "brpc/handshake/rdma_handshake.h"
 
 namespace brpc {
 class AdapterTransport;
-namespace handshake {
-class RdmaServerHandshakeAdapter;
-}
 class RdmaTransport : public Transport {
     friend class TransportFactory;
     friend class AdapterTransport;
     friend class rdma::RdmaEndpoint;
-    friend class rdma::RdmaConnect;
-    friend class handshake::RdmaServerHandshakeAdapter;
 public:
-    enum HandshakeState {
-        UNINIT = 0x0,
-        C_ALLOC_QPCQ = 0x1,
-        C_HELLO_SEND = 0x2,
-        C_HELLO_WAIT = 0x3,
-        C_BRINGUP_QP = 0x4,
-        C_ACK_SEND = 0x5,
-        S_HELLO_WAIT = 0x11,
-        S_ALLOC_QPCQ = 0x12,
-        S_BRINGUP_QP = 0x13,
-        S_HELLO_SEND = 0x14,
-        S_ACK_WAIT = 0x15,
-        ESTABLISHED = handshake::ESTABLISHED,
-        FALLBACK_TCP = handshake::FALLBACK_TCP,
-        FAILED = handshake::FAILED
-    };
-
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;
     int Reset(int32_t expected_nref) override;
@@ -73,16 +52,19 @@ public:
         return Get(socket.get());
     }
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
-    int handshake_phase() const;
-    int handshake_version() const;
 
-    // TCP control-plane callbacks. The endpoint is intentionally absent from
-    // these entry points and only participates through resource operations.
-    static void* ProcessHandshakeAtClient(void* arg);
+    // Resource operations consumed by the upper-level handshake coordinator.
+    int PrepareUpgradeResources();
+    int NegotiateUpgradeResources(const rdma::RdmaConnectionInfo& remote,
+                                  bool server);
+    std::unique_ptr<rdma::RdmaHandshakeAdapter>
+    CreateClientHandshakeAdapter();
+    std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter>>
+    CreateServerHandshakeAdapters();
+    void ActivateUpgrade();
+    void DeactivateUpgrade();
+    bool UpgradeActive() const { return _rdma_state == RDMA_ON; }
 private:
-    AdapterTransport* adapter_transport() const;
-    handshake::HandshakeSession* handshake_session() const;
-    void FallbackToTcp();
     void SetHighSpeedAvailable(bool available);
 
     static bool OptionsAvailableForRdma(const ChannelOptions* opt);

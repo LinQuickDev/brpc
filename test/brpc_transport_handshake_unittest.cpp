@@ -214,19 +214,18 @@ TEST(TransportHandshakeTest, client_runs_codec_and_resource_sequence) {
     std::string calls;
 
     ClientHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{1, 2, 3, 4, 5, 6};
     callbacks.codec = MakeTestCodec(&calls);
-    callbacks.prepare_resources = [&]() {
+    callbacks.transport.prepare_resources = [&]() {
         calls += "prepare ";
         return STEP_OK;
     };
-    callbacks.negotiate_resources = [&]() {
+    callbacks.transport.negotiate_resources = [&]() {
         calls += "negotiate ";
         return STEP_OK;
     };
-    callbacks.set_high_speed_active = [&]() { calls += "activate"; };
-    callbacks.set_tcp_active = []() {};
-    callbacks.on_failed = []() {};
+    callbacks.transport.set_high_speed_active = [&]() { calls += "activate"; };
+    callbacks.transport.set_tcp_active = []() {};
+    callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_OK, session.RunClient(callbacks));
     ASSERT_EQ("prepare build parse negotiate ack1 activate", calls);
@@ -242,13 +241,12 @@ TEST(TransportHandshakeTest, client_resource_failure_falls_back_before_io) {
     bool tcp_active = false;
 
     ClientHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{1, 2, 3, 4, 5, 6};
     callbacks.codec = MakeTestCodec();
-    callbacks.prepare_resources = []() { return STEP_FALLBACK; };
-    callbacks.negotiate_resources = []() { return STEP_ERROR; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = [&]() { tcp_active = true; };
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_FALLBACK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_ERROR; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = [&]() { tcp_active = true; };
+    callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_FALLBACK, session.RunClient(callbacks));
     ASSERT_TRUE(tcp_active);
@@ -266,15 +264,14 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
     std::string calls;
 
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
     callbacks.fallback_on_not_mine = false;
     callbacks.codecs.push_back(MakeTestCodec(&calls));
     callbacks.input = &input;
-    callbacks.prepare_resources = [&]() {
+    callbacks.transport.prepare_resources = [&]() {
         calls += "prepare ";
         return STEP_OK;
     };
-    callbacks.negotiate_resources = [&]() {
+    callbacks.transport.negotiate_resources = [&]() {
         calls += "negotiate ";
         return STEP_OK;
     };
@@ -282,9 +279,9 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
         calls += "validate ";
         return STEP_OK;
     };
-    callbacks.set_high_speed_active = [&]() { calls += "activate"; };
-    callbacks.set_tcp_active = []() {};
-    callbacks.on_failed = []() {};
+    callbacks.transport.set_high_speed_active = [&]() { calls += "activate"; };
+    callbacks.transport.set_tcp_active = []() {};
+    callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_NEED_MORE, session.RunServer(callbacks));
     ASSERT_EQ(16, session.phase());
@@ -308,15 +305,14 @@ TEST(TransportHandshakeTest, server_resource_failure_falls_back_after_ack) {
     bool tcp_active = false;
 
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
     callbacks.fallback_on_not_mine = false;
     callbacks.codecs.push_back(MakeTestCodec());
     callbacks.input = &input;
-    callbacks.prepare_resources = []() { return STEP_FALLBACK; };
-    callbacks.negotiate_resources = []() { return STEP_ERROR; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = [&]() { tcp_active = true; };
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_FALLBACK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_ERROR; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = [&]() { tcp_active = true; };
+    callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_FALLBACK, session.RunServer(callbacks));
     ASSERT_EQ("HSNO", io.output());
@@ -335,15 +331,14 @@ TEST(TransportHandshakeTest, server_falls_back_without_consuming_other_magic) {
     bool tcp_active = false;
 
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
     callbacks.fallback_on_not_mine = true;
     callbacks.codecs.push_back(MakeTestCodec());
     callbacks.input = &input;
-    callbacks.prepare_resources = []() { return STEP_ERROR; };
-    callbacks.negotiate_resources = []() { return STEP_ERROR; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = [&]() { tcp_active = true; };
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_ERROR; };
+    callbacks.transport.negotiate_resources = []() { return STEP_ERROR; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = [&]() { tcp_active = true; };
+    callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_FALLBACK, session.RunServer(callbacks));
     ASSERT_TRUE(tcp_active);
@@ -363,15 +358,14 @@ TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
     IOBufHandshakeInput input(&source);
 
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{11, 12, 13, 14, 15, 16};
     callbacks.fallback_on_not_mine = false;
     callbacks.codecs.push_back(MakeTestCodec());
     callbacks.input = &input;
-    callbacks.prepare_resources = []() { return STEP_OK; };
-    callbacks.negotiate_resources = []() { return STEP_OK; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = []() {};
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_OK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_OK; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = []() {};
+    callbacks.transport.on_failed = []() {};
 
     source.append("H", 1);
     ASSERT_EQ(STEP_NEED_MORE, session.RunServer(callbacks));

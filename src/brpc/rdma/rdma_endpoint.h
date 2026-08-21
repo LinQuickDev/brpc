@@ -54,23 +54,6 @@ struct RdmaConnectionInfo {
     butil::optional<ibv_ece> ece;
 };
 
-class RdmaConnect : public AppConnect {
-public:
-    void StartConnect(const Socket* socket, 
-            void (*done)(int err, void* data), void* data) override;
-    void StopConnect(Socket*) override;
-    struct RunGuard {
-        RunGuard(RdmaConnect* rc) { this_rc = rc; }
-        ~RunGuard() { if (this_rc) this_rc->Run(); }
-        RdmaConnect* this_rc;
-    };
-
-private:
-    void Run();
-    void (*_done)(int, void*){NULL};
-    void* _data{NULL};
-};
-
 struct RdmaResource {
     RdmaResource* next{NULL};
     ibv_qp* qp{NULL};
@@ -86,7 +69,6 @@ struct RdmaResource {
 };
 
 class BAIDU_CACHELINE_ALIGNMENT RdmaEndpoint : public SocketUser {
-friend class RdmaConnect;
 friend class Socket;
 friend class ::brpc::RdmaTransport;
 public:

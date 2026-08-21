@@ -36,6 +36,7 @@
 #include "brpc/parallel_channel.h"
 #include "brpc/selective_channel.h"
 #include "brpc/rdma_transport.h"
+#include "brpc/adapter_transport.h"
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/handshake/rdma_handshake.h"
@@ -200,7 +201,7 @@ TEST_F(RdmaTest, client_close_before_hello_send) {
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     Socket* s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -221,7 +222,7 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     Socket* s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     uint8_t data[rdma::HELLO_V2_MSG_LEN_MIN];
     memcpy(data, "PRPC", 4);  // send as normal baidu_std protocol
@@ -231,7 +232,7 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
     // and hand the bytes to other protocols; it does not touch the endpoint
     // state, so it stays UNINIT (the old blocking handshake used to set
     // FALLBACK_TCP here).
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     StopServer();
 }
@@ -251,14 +252,14 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RD", 2);
     ASSERT_EQ(2, write(sockfd1, data, 2));  // break in magic str
     usleep(100000);  // wait for server to handle the msg
     // Fewer than 4 magic bytes: the transport-handshake parser can't tell yet,
     // returns NOT_ENOUGH_DATA and leaves the endpoint UNINIT (the old blocking
-    // handshake used to set S_HELLO_WAIT before reading the magic).
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    // the common handshake state remains uninitialized before reading magic).
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -268,11 +269,11 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd2, data, 4));  // break after magic str
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd2);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -282,7 +283,7 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     ASSERT_EQ(0, connect(sockfd3, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     // Send the 4B magic plus a valid msg_len (=40) but no body, so the server
     // recognizes an RDMA v2 hello and waits for the remaining bytes. (A zero
     // msg_len would now be rejected up-front as a protocol error.)
@@ -291,7 +292,7 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     memcpy(data + 4, &v2_len, sizeof(v2_len));
     ASSERT_EQ(6, write(sockfd3, data, 6));  // magic + msg_len, body missing
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd3);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -314,11 +315,11 @@ TEST_F(RdmaTest, client_hello_msg_invalid_len) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     memset(data + 4, 0, 36);
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));  // Write invalid length.
     usleep(100000);  // wait for server to handle the msg
@@ -329,11 +330,11 @@ TEST_F(RdmaTest, client_hello_msg_invalid_len) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd2, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     uint16_t len = butil::HostToNet16(35);
     memcpy(data + 4, &len, sizeof(len));
     memset(data + 6, 0, 34);
@@ -361,11 +362,11 @@ TEST_F(RdmaTest, client_hello_msg_invalid_version) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data + 4, &len, 2);
     memset(data + 6, 0, 34);
     memcpy(data + 6, &ver, 2);  // hello_ver == 1, impl_ver == 0
@@ -378,12 +379,12 @@ TEST_F(RdmaTest, client_hello_msg_invalid_version) {
     // version check, breaking the intent of this UT.
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     uint32_t flags = 0;
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     sockfd1.reset(-1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -393,11 +394,11 @@ TEST_F(RdmaTest, client_hello_msg_invalid_version) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd2, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     memcpy(data + 4, &len, 2);
     memset(data + 6, 0, 32);
     memcpy(data + 8, &ver, 2);  // hello_ver == 0, impl_ver == 1
@@ -405,11 +406,11 @@ TEST_F(RdmaTest, client_hello_msg_invalid_version) {
     // write from data + 4 instead of data.
     ASSERT_EQ(36, write(sockfd2, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     ASSERT_EQ(sizeof(flags), write(sockfd2, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     sockfd2.reset(-1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -442,17 +443,17 @@ TEST_F(RdmaTest, client_hello_msg_invalid_sq_rq_block_size) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     sockfd1.reset(-1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -467,17 +468,17 @@ TEST_F(RdmaTest, client_hello_msg_invalid_sq_rq_block_size) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd2, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd2, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     ASSERT_EQ(sizeof(flags), write(sockfd2, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     sockfd2.reset(-1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -492,17 +493,17 @@ TEST_F(RdmaTest, client_hello_msg_invalid_sq_rq_block_size) {
     ASSERT_EQ(0, connect(sockfd3, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd3, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd3, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     ASSERT_EQ(sizeof(flags), write(sockfd3, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     sockfd3.reset(-1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -536,10 +537,10 @@ TEST_F(RdmaTest, client_close_after_qp_build) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(40, write(sockfd1, data, 40));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -573,17 +574,17 @@ TEST_F(RdmaTest, client_close_during_ack_send) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     uint32_t flags = butil::HostToNet32(1);
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd1);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -617,17 +618,17 @@ TEST_F(RdmaTest, client_close_after_ack_send) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     uint32_t flags = butil::HostToNet32(0);
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
     close(sockfd1);
     usleep(100000);  // wait for server to handle the msg
@@ -638,17 +639,17 @@ TEST_F(RdmaTest, client_close_after_ack_send) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd2, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd2, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     flags = butil::HostToNet32(1);
     ASSERT_EQ(sizeof(flags), write(sockfd2, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     close(sockfd2);
     usleep(100000);  // wait for server to handle the msg
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -682,17 +683,17 @@ TEST_F(RdmaTest, client_send_data_on_tcp_after_ack_send) {
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd1, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd1, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     uint32_t flags = butil::HostToNet32(0);
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(sizeof(flags), write(sockfd1, &flags, sizeof(flags)));
     usleep(100000);
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -702,17 +703,17 @@ TEST_F(RdmaTest, client_send_data_on_tcp_after_ack_send) {
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);  // wait for server to handle the msg
     s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, write(sockfd2, data, 4)); // Write magic string.
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(36, write(sockfd2, data + 4, 36));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     flags = butil::HostToNet32(1);
     ASSERT_EQ(sizeof(flags), write(sockfd2, &flags, sizeof(flags)));
     usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(sizeof(flags), write(sockfd2, &flags, sizeof(flags)));
     usleep(100000);
     ASSERT_EQ(NULL, GetSocketFromServer(0));
@@ -742,7 +743,7 @@ TEST_F(RdmaTest, server_miss_before_hello_send) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -773,7 +774,7 @@ TEST_F(RdmaTest, server_close_before_hello_send) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -781,7 +782,7 @@ TEST_F(RdmaTest, server_close_before_hello_send) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, read(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     close(acc_fd);
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FAILED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
 
     ASSERT_EQ(EEOF, cntl.ErrorCode());
@@ -809,7 +810,7 @@ TEST_F(RdmaTest, server_miss_during_magic_str) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -844,7 +845,7 @@ TEST_F(RdmaTest, server_close_during_magic_str) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -854,7 +855,7 @@ TEST_F(RdmaTest, server_close_during_magic_str) {
     usleep(100000);
     close(acc_fd);
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FAILED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
 
     ASSERT_EQ(EEOF, cntl.ErrorCode());
@@ -882,7 +883,7 @@ TEST_F(RdmaTest, server_hello_invalid_magic_str) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -890,7 +891,7 @@ TEST_F(RdmaTest, server_hello_invalid_magic_str) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, read(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     ASSERT_EQ(4, write(acc_fd, "ABCD", 4));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FAILED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
 
     ASSERT_EQ(EPROTO, cntl.ErrorCode());
@@ -918,7 +919,7 @@ TEST_F(RdmaTest, server_miss_during_hello_msg) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -953,7 +954,7 @@ TEST_F(RdmaTest, server_close_during_hello_msg) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -963,7 +964,7 @@ TEST_F(RdmaTest, server_close_during_hello_msg) {
     ASSERT_EQ(2, write(acc_fd, "00", 2));
     close(acc_fd);
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FAILED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
 
     ASSERT_EQ(EEOF, cntl.ErrorCode());
@@ -991,7 +992,7 @@ TEST_F(RdmaTest, server_hello_invalid_msg_len) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1003,7 +1004,7 @@ TEST_F(RdmaTest, server_hello_invalid_msg_len) {
     memset(data + 6, 0, 32);
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FAILED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
 
     ASSERT_EQ(EPROTO, cntl.ErrorCode());
@@ -1031,7 +1032,7 @@ TEST_F(RdmaTest, server_hello_invalid_version) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1043,7 +1044,7 @@ TEST_F(RdmaTest, server_hello_invalid_version) {
     memset(data + 6, 0, 32);
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, read(acc_fd, data, 4));
     uint32_t* tmp = (uint32_t*)data;
     ASSERT_EQ(0, butil::NetToHost32(*tmp));
@@ -1074,7 +1075,7 @@ TEST_F(RdmaTest, server_hello_invalid_sq_rq_size) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1095,7 +1096,7 @@ TEST_F(RdmaTest, server_hello_invalid_sq_rq_size) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
 
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, read(acc_fd, data, 4));
     uint32_t* tmp = (uint32_t*)data;
     ASSERT_EQ(0, butil::NetToHost32(*tmp));
@@ -1126,7 +1127,7 @@ TEST_F(RdmaTest, server_miss_after_ack) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1147,7 +1148,7 @@ TEST_F(RdmaTest, server_miss_after_ack) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
 
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, read(acc_fd, data, 4));
     uint32_t* tmp = (uint32_t*)data;
     ASSERT_EQ(1, butil::NetToHost32(*tmp));
@@ -1178,7 +1179,7 @@ TEST_F(RdmaTest, server_close_after_ack) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1199,7 +1200,7 @@ TEST_F(RdmaTest, server_close_after_ack) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
 
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(4, read(acc_fd, data, 4));
     uint32_t* tmp = (uint32_t*)data;
     ASSERT_EQ(1, butil::NetToHost32(*tmp));
@@ -1231,7 +1232,7 @@ TEST_F(RdmaTest, server_send_data_on_tcp_after_ack) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::C_HELLO_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     butil::fd_guard acc_fd(accept(sockfd, NULL, NULL));
     ASSERT_TRUE(acc_fd >= 0);
@@ -1252,7 +1253,7 @@ TEST_F(RdmaTest, server_send_data_on_tcp_after_ack) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
 
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     bthread_id_join(cntl.call_id());
 
@@ -1323,9 +1324,9 @@ TEST_F(RdmaTest, v2_server_hello_bytes_baseline) {
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);
     Socket* s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
-    // Send a well-formed v2 hello so the server enters S_ACK_WAIT.
+    // Send a well-formed v2 hello so the server enters the common ACK_WAIT.
     rdma::v2_wire::HelloMessage msg{};
     msg.msg_len = rdma::HELLO_V2_MSG_LEN_MIN;
     msg.hello_ver = rdma::HELLO_V2_VERSION;
@@ -1341,7 +1342,7 @@ TEST_F(RdmaTest, v2_server_hello_bytes_baseline) {
     msg.Serialize(data + 4);
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN, write(sockfd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     // Read server's reply hello and assert its byte-level layout.
     uint8_t reply[rdma::HELLO_V2_MSG_LEN_MIN];
@@ -1366,7 +1367,7 @@ TEST_F(RdmaTest, v2_server_hello_bytes_baseline) {
     uint32_t flags = butil::HostToNet32(0);
     ASSERT_EQ(sizeof(flags), write(sockfd, &flags, sizeof(flags)));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     usleep(100000);
@@ -1388,7 +1389,7 @@ TEST_F(RdmaTest, v2_server_preserves_coalesced_ack_after_extension) {
     usleep(100000);
     Socket* s = GetSocketFromServer(0);
     ASSERT_TRUE(s != NULL);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     // Build a v2 hello with msg_len = 48 (40 base + 8B zero tail).
     rdma::v2_wire::HelloMessage msg{};
@@ -1412,7 +1413,7 @@ TEST_F(RdmaTest, v2_server_preserves_coalesced_ack_after_extension) {
     ASSERT_EQ(sizeof(buf), write(sockfd, buf, sizeof(buf)));
     usleep(100000);
 
-    ASSERT_EQ(RdmaTransport::ESTABLISHED, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     usleep(100000);
@@ -1434,7 +1435,7 @@ TEST_F(RdmaTest, v2_server_rejects_oversized_msg_len) {
     usleep(100000);
     Socket* s = GetSocketFromServer(0);
     ASSERT_TRUE(s != NULL);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     // Build a v2 hello with msg_len = 4097 (HELLO_V2_MSG_LEN_MAX + 1).
     // We only send the 40B base; the server must reject before reading
@@ -1585,14 +1586,14 @@ TEST_F(RdmaTest, v3_server_hello_bytes_baseline) {
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
     usleep(100000);
     Socket* s = GetSocketFromServer(0);
-    ASSERT_EQ(RdmaTransport::UNINIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     // Send a valid v3 hello.
     std::string packet = MakeV3Packet(MakeValidV3Hello());
     ASSERT_EQ((ssize_t)packet.size(),
               write(sockfd, packet.data(), packet.size()));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
 
     // Read server's reply hello: 4B magic + 4B pb_size + body.
     uint8_t reply_magic[4];
@@ -1622,7 +1623,7 @@ TEST_F(RdmaTest, v3_server_hello_bytes_baseline) {
     ASSERT_EQ((ssize_t)sizeof(flags),
               write(sockfd, &flags, sizeof(flags)));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     usleep(100000);
@@ -1736,8 +1737,8 @@ TEST_F(RdmaTest, v3_server_invalid_sq_size_falls_back) {
     usleep(100000);
 
     // Server validated the hello as invalid -> _rdma_state = RDMA_OFF,
-    // but still proceeds to S_ACK_WAIT (sends its own reply hello).
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT, RdmaTransport::Get(s)->handshake_phase());
+// but still proceeds to the common ACK_WAIT (sends its own reply hello).
+    ASSERT_EQ(handshake::ACK_WAIT, AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF, RdmaTransport::Get(s)->_rdma_state);
 
     // Drain server's reply hello (content not asserted here; covered
@@ -1756,7 +1757,7 @@ TEST_F(RdmaTest, v3_server_invalid_sq_size_falls_back) {
     ASSERT_EQ((ssize_t)sizeof(flags),
               write(sockfd, &flags, sizeof(flags)));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     usleep(100000);
@@ -1806,7 +1807,7 @@ static void ReadServerV3Reply(int fd, rdma::RdmaHello* reply) {
 }
 
 // A client hello carrying ECE must not break the server handshake: with ECE
-// enabled the server still parses the hello and advances to S_ACK_WAIT.
+// enabled the server still parses the hello and advances to the common ACK_WAIT.
 TEST_F(RdmaTest, v3_server_accepts_client_hello_with_ece) {
     EceFlagGuard ece_flag_guard(true);
     StartServer();
@@ -1828,8 +1829,8 @@ TEST_F(RdmaTest, v3_server_accepts_client_hello_with_ece) {
               write(sockfd, packet.data(), packet.size()));
     usleep(100000);
 
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT,
+              AdapterTransport::Get(s)->handshake_phase());
 
     rdma::RdmaHello reply;
     ReadServerV3Reply(sockfd, &reply);
@@ -1838,8 +1839,8 @@ TEST_F(RdmaTest, v3_server_accepts_client_hello_with_ece) {
     uint32_t flags = butil::HostToNet32(0);
     ASSERT_EQ((ssize_t)sizeof(flags), write(sockfd, &flags, sizeof(flags)));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP,
+              AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     usleep(100000);
@@ -1956,8 +1957,8 @@ TEST_F(RdmaTest, client_alloc_resource_fail_fallback_tcp) {
 
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP,
+              AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF,
               RdmaTransport::Get(s)->_rdma_state);
     // The socket must not be failed, otherwise it can no longer carry TCP.
@@ -1984,8 +1985,8 @@ TEST_F(RdmaTest, server_alloc_resource_fail_fallback_tcp) {
     usleep(100000);  // wait for server to handle the msg
     Socket* s = GetSocketFromServer(0);
     ASSERT_TRUE(s != NULL);
-    ASSERT_EQ(RdmaTransport::UNINIT,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::UNINITIALIZED,
+              AdapterTransport::Get(s)->handshake_phase());
 
     // Send a well-formed v2 hello: the negotiation succeeds
     // but the resource allocation does not.
@@ -2005,8 +2006,8 @@ TEST_F(RdmaTest, server_alloc_resource_fail_fallback_tcp) {
     ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN,
               write(sockfd, data, rdma::HELLO_V2_MSG_LEN_MIN));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::S_ACK_WAIT,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::ACK_WAIT,
+              AdapterTransport::Get(s)->handshake_phase());
     ASSERT_EQ(RdmaTransport::RDMA_OFF,
               RdmaTransport::Get(s)->_rdma_state);
     ASSERT_FALSE(s->Failed());
@@ -2015,8 +2016,8 @@ TEST_F(RdmaTest, server_alloc_resource_fail_fallback_tcp) {
     uint32_t flags = butil::HostToNet32(0);
     ASSERT_EQ(sizeof(flags), write(sockfd, &flags, sizeof(flags)));
     usleep(100000);
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP,
-              RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP,
+              AdapterTransport::Get(s)->handshake_phase());
     ASSERT_FALSE(s->Failed());
 
     sockfd.reset(-1);
@@ -2048,7 +2049,7 @@ TEST_F(RdmaTest, try_global_disable_rdma) {
     usleep(100000);
     SocketUniquePtr s;
     ASSERT_EQ(0, Socket::Address(cntl._single_server_id, &s));
-    ASSERT_EQ(RdmaTransport::FALLBACK_TCP, RdmaTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(handshake::FALLBACK_TCP, AdapterTransport::Get(s)->handshake_phase());
     bthread_id_join(cntl.call_id());
     ASSERT_EQ(0, cntl.ErrorCode());
 

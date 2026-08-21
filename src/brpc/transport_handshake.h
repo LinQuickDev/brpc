@@ -54,7 +54,12 @@ private:
 // acquire-side decision for RDMA, URMA and UBSHM.
 enum Phase {
     UNINITIALIZED = 0,
-    NEGOTIATING = 1,
+    PREPARING = 1,
+    HELLO_SEND = 2,
+    HELLO_WAIT = 3,
+    NEGOTIATING = 4,
+    ACK_SEND = 5,
+    ACK_WAIT = 6,
     ESTABLISHED = 0x100,
     FALLBACK_TCP = 0x200,
     FAILED = 0x300,
@@ -66,15 +71,6 @@ enum StepResult {
     STEP_NEED_MORE,
     STEP_NOT_MINE,
     STEP_ERROR,
-};
-
-struct HandshakePhases {
-    int prepare_local;
-    int hello_send;
-    int hello_wait;
-    int negotiate;
-    int ack_send;
-    int ack_wait;
 };
 
 // A protocol describes only its fields and resource-independent wire values.
@@ -90,11 +86,10 @@ struct HandshakeCodec {
     std::function<StepResult(const std::string&, bool*)> parse_ack;
 };
 
-// Resource-specific operations invoked by the common client driver. Wire I/O
-// and field codec invocation are owned by HandshakeSession.
-struct ClientHandshakeCallbacks {
-    HandshakePhases phases;
-    HandshakeCodec codec;
+// Resource-specific operations supplied by a Transport and invoked by the
+// common coordinator. Wire I/O and field codec invocation remain owned by
+// HandshakeSession.
+struct TransportUpgradeOps {
     std::function<StepResult()> prepare_resources;
     std::function<StepResult()> negotiate_resources;
     std::function<void()> set_high_speed_active;
@@ -102,21 +97,21 @@ struct ClientHandshakeCallbacks {
     std::function<void()> on_failed;
 };
 
+struct ClientHandshakeCallbacks {
+    HandshakeCodec codec;
+    TransportUpgradeOps transport;
+};
+
 // The server driver is independent of the input mode. A parser callback can
 // return STEP_NEED_MORE, while a blocking callback waits before returning.
 struct ServerHandshakeCallbacks {
-    HandshakePhases phases;
     bool fallback_on_not_mine;
     // Buffered parsers may offer multiple codecs (RDMA v2/v3). Blocking
     // server handshakes currently provide exactly one codec.
     std::vector<HandshakeCodec> codecs;
     HandshakeInput* input;
-    std::function<StepResult()> prepare_resources;
-    std::function<StepResult()> negotiate_resources;
+    TransportUpgradeOps transport;
     std::function<StepResult()> validate_established;
-    std::function<void()> set_high_speed_active;
-    std::function<void()> set_tcp_active;
-    std::function<void()> on_failed;
 };
 
 // Owns one connection-upgrade attempt, invokes the protocol field codec and

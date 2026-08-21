@@ -21,36 +21,15 @@
 #include "brpc/socket.h"
 #include "brpc/channel.h"
 #include "brpc/transport.h"
-#include "brpc/transport_handshake.h"
+#include "brpc/ubshm/shm/shm_def.h"
 
 namespace brpc {
 class AdapterTransport;
-namespace handshake {
-class UBShmServerHandshakeAdapter;
-}
 class UBShmTransport : public Transport {
     friend class TransportFactory;
     friend class AdapterTransport;
     friend class ubring::UBShmEndpoint;
-    friend class ubring::UBConnect;
-    friend class handshake::UBShmServerHandshakeAdapter;
 public:
-    enum HandshakeState {
-        UNINIT = 0x0,
-        C_ALLOC_SHM = 0x1,
-        C_HELLO_SEND = 0x2,
-        C_HELLO_WAIT = 0x3,
-        C_MAP_REMOTE_SHM = 0x4,
-        C_ACK_SEND = 0x5,
-        S_HELLO_WAIT = 0x11,
-        S_ALLOC_SHM = 0x12,
-        S_HELLO_SEND = 0x13,
-        S_ACK_WAIT = 0x14,
-        ESTABLISHED = handshake::ESTABLISHED,
-        FALLBACK_TCP = handshake::FALLBACK_TCP,
-        FAILED = handshake::FAILED
-    };
-
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;
     int Reset(int32_t expected_nref) override;
@@ -68,13 +47,17 @@ public:
     }
     static UBShmTransport* Get(const Socket* socket);
     static int ContextInitOrDie(bool serverOrNot, const void* _options);
-    int handshake_phase() const;
-    int handshake_version() const;
-    static void* ProcessHandshakeAtClient(void* arg);
+    int PrepareUpgradeResources(ubring::SHM* local_trx_shm,
+                                const char* shm_name);
+    int NegotiateUpgradeResources(ubring::SHM* local_trx_shm,
+                                  const char* shm_name);
+    int PrepareServerUpgradeResources(ubring::SHM* remote_trx_shm,
+                                      ubring::SHM* local_trx_shm);
+    void ActivateUpgrade();
+    void DeactivateUpgrade();
+    void FinishUpgrade();
+    bool UpgradeActive() const { return _ub_state == UB_ON; }
 private:
-    AdapterTransport* adapter_transport() const;
-    handshake::HandshakeSession* handshake_session() const;
-    void FallbackToTcp();
     void SetHighSpeedAvailable(bool available);
 
     static bool OptionsAvailableForUB(const ChannelOptions* opt);

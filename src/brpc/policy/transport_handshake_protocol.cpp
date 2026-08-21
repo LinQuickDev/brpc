@@ -18,30 +18,14 @@
 #include "brpc/policy/transport_handshake_protocol.h"
 
 #include "butil/logging.h"
-#include "brpc/destroyable.h"
-#include "brpc/handshake/rdma_handshake.h"
-#include "brpc/handshake/ubshm_handshake.h"
-#include "brpc/transport_handshake.h"
+#include "brpc/adapter_transport.h"
 
 namespace brpc {
 namespace policy {
 
 ParseResult ParseTransportHandshake(butil::IOBuf* source, Socket* socket,
                                      bool /*read_eof*/, const void* /*arg*/) {
-    if (socket->parsing_context() != NULL) {
-        handshake::ServerHandshakeContext* context =
-            static_cast<handshake::ServerHandshakeContext*>(
-                socket->parsing_context());
-        CHECK(context->adapter() != NULL);
-        return context->adapter()->ExecuteServerHandshake(source, socket);
-    }
-
-    const char* first = static_cast<const char*>(source->fetch1());
-    handshake::HandshakeAdapter* adapter =
-        first != NULL && *first == 'U'
-        ? handshake::GetUBShmServerHandshakeAdapter()
-        : handshake::GetRdmaServerHandshakeAdapter();
-    return adapter->ExecuteServerHandshake(source, socket);
+    return AdapterTransport::Get(socket)->ProcessUpgradeReadable(source);
 }
 
 void ProcessTransportHandshake(InputMessageBase* msg) {

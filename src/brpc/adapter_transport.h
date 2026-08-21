@@ -23,6 +23,7 @@
 #include "brpc/socket_mode.h"
 #include "brpc/transport.h"
 #include "brpc/transport_handshake.h"
+#include "brpc/parse_result.h"
 
 namespace brpc {
 
@@ -57,14 +58,27 @@ public:
     Transport* high_speed_transport() const {
         return _high_speed_transport.get();
     }
+    bool upgrade_capable() const { return _high_speed_transport != NULL; }
 
     static AdapterTransport* Get(Socket* socket);
     static const AdapterTransport* Get(const Socket* socket);
 
+    // The only client-side upgrade entry point. Concrete transports provide
+    // resources; AdapterTransport owns the handshake orchestration.
+    static int StartClientUpgrade(const Socket* socket,
+                                  void (*done)(int, void*), void* data);
+
+    ParseResult ProcessUpgradeReadable(butil::IOBuf* source);
+    void CompleteConnection(handshake::Phase terminal_phase);
+    bool connection_completed() const {
+        return _connection_completed.load(butil::memory_order_acquire) != 0;
+    }
+
     static void OnNewDataFromTcp(Socket* socket);
 
 private:
-    explicit AdapterTransport(SocketMode mode) : _mode(mode) {}
+    explicit AdapterTransport(SocketMode mode)
+        : _mode(mode), _connection_completed(0) {}
     ~AdapterTransport() override;
 
     Transport* ActiveTransport() const;
@@ -73,11 +87,13 @@ private:
     void TryReadOnTcp();
     void ProcessTcpEvent();
     void CheckUnexpectedTcpData();
+    static void* ProcessClientHandshake(void* arg);
 
     SocketMode _mode;
     handshake::HandshakeSession _handshake;
     std::unique_ptr<TcpTransport> _tcp_transport;
     std::unique_ptr<Transport> _high_speed_transport;
+    butil::atomic<int> _connection_completed;
 };
 
 }  // namespace brpc

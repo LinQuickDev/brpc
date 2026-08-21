@@ -49,8 +49,8 @@ private:
     DISALLOW_COPY_AND_ASSIGN(HandshakeAdapter);
 };
 
-// Reusable InputMessenger implementation. Protocols normally derive from this
-// class and provide only the Session driver and phase hooks.
+// Reusable InputMessenger implementation. Protocol adapters provide only the
+// protocol-specific server step; the common session owns all phases.
 class StandardHandshakeAdapter : public HandshakeAdapter {
 public:
     ParseResult ExecuteServerHandshake(
@@ -59,10 +59,9 @@ public:
 protected:
     StandardHandshakeAdapter() = default;
 
-    virtual StepResult RunServerHandshake(
+    virtual StepResult RunServerStep(
         butil::IOBuf* source, Socket* socket) = 0;
     virtual HandshakeSession* GetSession(Socket* socket) const = 0;
-    virtual int AckWaitPhase(const Socket* socket) const = 0;
 
 private:
     DISALLOW_COPY_AND_ASSIGN(StandardHandshakeAdapter);

@@ -209,10 +209,9 @@ public:
     UBShmServerHandshakeAdapter() = default;
 
 protected:
-    StepResult RunServerHandshake(
+    StepResult RunServerStep(
         butil::IOBuf* source, Socket* socket) override;
     HandshakeSession* GetSession(Socket* socket) const override;
-    int AckWaitPhase(const Socket* socket) const override;
 
 private:
     StepResult RunFallbackServerHandshake(
@@ -279,31 +278,18 @@ HandshakeSession* UBShmServerHandshakeAdapter::GetSession(
     return AdapterTransport::Get(socket)->handshake_session();
 }
 
-int UBShmServerHandshakeAdapter::AckWaitPhase(
-    const Socket* socket) const {
-#if BRPC_WITH_UBRING
-    if (socket->socket_mode() == SOCKET_MODE_UBRING) {
-        return UBShmTransport::S_ACK_WAIT;
-    }
-#endif
-    return FALLBACK_ACK_WAIT;
-}
-
 StepResult UBShmServerHandshakeAdapter::RunFallbackServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     IOBufHandshakeInput input(source);
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{
-        FALLBACK_PREPARE, FALLBACK_HELLO_SEND, FALLBACK_HELLO_WAIT,
-        FALLBACK_NEGOTIATE, FALLBACK_ACK_SEND, FALLBACK_ACK_WAIT};
     callbacks.fallback_on_not_mine = false;
     callbacks.codecs.push_back(MakeUBShmFallbackCodec());
     callbacks.input = &input;
-    callbacks.prepare_resources = []() { return STEP_OK; };
-    callbacks.negotiate_resources = []() { return STEP_OK; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = []() {};
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_OK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_OK; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = []() {};
+    callbacks.transport.on_failed = []() {};
     return GetSession(socket)->RunServer(callbacks);
 }
 
@@ -311,17 +297,12 @@ StepResult UBShmServerHandshakeAdapter::RunFallbackServerHandshake(
 StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     UBShmTransport* transport = UBShmTransport::Get(socket);
-    ubring::UBShmEndpoint* ep = transport->_ub_ep;
-    CHECK(ep != NULL);
+    CHECK(transport->GetUBShmEp() != NULL);
 
     ubring::HelloMessage remote{};
     ubring::UBShmHandshakeAdapter wire;
     IOBufHandshakeInput input(source);
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{
-        UBShmTransport::S_ALLOC_SHM, UBShmTransport::S_HELLO_SEND,
-        UBShmTransport::S_HELLO_WAIT, UBShmTransport::S_ALLOC_SHM,
-        0, UBShmTransport::S_ACK_WAIT};
     callbacks.fallback_on_not_mine = false;
     callbacks.input = &input;
     HandshakeCodec codec = wire.MakeCodec();
@@ -333,7 +314,7 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
                 << remote.toString();
         }
         if (result == STEP_FALLBACK) {
-            transport->_ub_state = UBShmTransport::UB_OFF;
+            transport->DeactivateUpgrade();
         }
         return result;
     };
@@ -346,9 +327,9 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
             enabled, len, enabled ? remote.shm_name : NULL, payload);
     };
     callbacks.codecs.push_back(codec);
-    callbacks.prepare_resources = [&]() {
+    callbacks.transport.prepare_resources = [&]() {
         if (!ubring::IsUBAvailable()) {
-            transport->_ub_state = UBShmTransport::UB_OFF;
+            transport->DeactivateUpgrade();
             return STEP_FALLBACK;
         }
         ubring::SHM remote_trx_shm = {
@@ -373,37 +354,37 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
             local_trx_shm.name, SHM_MAX_NAME_BUFF_LEN, "%s_%s",
             client_name, SERVER_SHM_NAME_SUFFIX);
         if (UNLIKELY(result < 0)) {
-            transport->_ub_state = UBShmTransport::UB_OFF;
+            transport->DeactivateUpgrade();
             return STEP_FALLBACK;
         }
-        if (ep->AllocateServerResources(
+        if (transport->PrepareServerUpgradeResources(
                 &remote_trx_shm, &local_trx_shm) < 0) {
             LOG(WARNING)
                 << "Fail to allocate ub resources, fallback to tcp:"
                 << socket->description();
-            transport->_ub_state = UBShmTransport::UB_OFF;
+            transport->DeactivateUpgrade();
             return STEP_FALLBACK;
         }
         return STEP_OK;
     };
-    callbacks.negotiate_resources = []() { return STEP_OK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_OK; };
     callbacks.validate_established = [&]() {
         if (!source->empty() ||
-            transport->_ub_state == UBShmTransport::UB_OFF) {
+            !transport->UpgradeActive()) {
             return STEP_ERROR;
         }
         return STEP_OK;
     };
-    callbacks.set_high_speed_active = [transport]() {
-        transport->SetHighSpeedAvailable(true);
+    callbacks.transport.set_high_speed_active = [transport]() {
+        transport->ActivateUpgrade();
     };
-    callbacks.set_tcp_active = [transport]() {
-        transport->SetHighSpeedAvailable(false);
+    callbacks.transport.set_tcp_active = [transport]() {
+        transport->DeactivateUpgrade();
     };
-    callbacks.on_failed = []() {};
+    callbacks.transport.on_failed = []() {};
     const StepResult result = GetSession(socket)->RunServer(callbacks);
     if (result == STEP_OK) {
-        ep->_ub_ring->UbrUnlinkLocalShm();
+        transport->FinishUpgrade();
         LOG_IF(INFO, ubring::FLAGS_ub_trace_verbose)
             << "Server handshake ends (use ubring) on "
             << socket->description();
@@ -416,10 +397,10 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
 }
 #endif
 
-StepResult UBShmServerHandshakeAdapter::RunServerHandshake(
+StepResult UBShmServerHandshakeAdapter::RunServerStep(
     butil::IOBuf* source, Socket* socket) {
 #if BRPC_WITH_UBRING
-    if (socket->socket_mode() == SOCKET_MODE_UBRING) {
+    if (AdapterTransport::Get(socket)->upgrade_capable()) {
         return RunUBShmServerHandshake(source, socket);
     }
 #endif

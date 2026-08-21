@@ -55,11 +55,9 @@ class ChannelBalancer;
 }
 namespace rdma {
 class RdmaEndpoint;
-class RdmaConnect;
 }
 namespace ubring {
     class UBShmEndpoint;
-    class UBConnect;
 }
 namespace handshake {
 class SocketHandshakeIO;
@@ -326,9 +324,7 @@ friend class policy::ConsistentHashingLoadBalancer;
 friend class policy::RtmpContext;
 friend class schan::ChannelBalancer;
 friend class rdma::RdmaEndpoint;
-friend class rdma::RdmaConnect;
 friend class ubring::UBShmEndpoint;
-friend class ubring::UBConnect;
 friend class UBShmTransport;
 friend class HealthCheckTask;
 friend class OnAppHealthCheckDone;

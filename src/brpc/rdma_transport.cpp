@@ -20,7 +20,6 @@
 #include "brpc/rdma_transport.h"
 #include "brpc/adapter_transport.h"
 #include "brpc/event_dispatcher.h"
-#include "brpc/handshake/rdma_handshake.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma/rdma_helper.h"
 
@@ -30,140 +29,11 @@ DECLARE_bool(usercode_in_pthread);
 
 extern SocketVarsCollector *g_vars;
 
-namespace rdma {
-
-DECLARE_bool(rdma_trace_verbose);
-
-void RdmaConnect::StartConnect(const Socket* socket,
-                               void (*done)(int err, void* data),
-                               void* data) {
-    RdmaTransport* transport = RdmaTransport::Get(socket);
-    CHECK(transport->_rdma_ep != NULL);
-    SocketUniquePtr ptr;
-    if (Socket::Address(socket->id(), &ptr) != 0) {
-        return;
-    }
-    if (!IsRdmaAvailable()) {
-        transport->FallbackToTcp();
-        done(0, data);
-        return;
-    }
-    _done = done;
-    _data = data;
-    bthread_t tid;
-    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
-    bthread_attr_set_name(&attr, "RdmaProcessHandshakeAtClient");
-    if (bthread_start_background(&tid, &attr,
-                                 RdmaTransport::ProcessHandshakeAtClient,
-                                 transport) < 0) {
-        LOG(FATAL) << "Fail to start handshake bthread";
-        Run();
-    } else {
-        ptr.release();
-    }
-}
-
-void RdmaConnect::StopConnect(Socket*) {}
-
-void RdmaConnect::Run() {
-    _done(errno, _data);
-}
-
-}  // namespace rdma
-
 RdmaTransport* RdmaTransport::Get(const Socket* socket) {
     const AdapterTransport* adapter = AdapterTransport::Get(socket);
     Transport* transport = adapter->high_speed_transport();
     CHECK(transport != NULL);
     return static_cast<RdmaTransport*>(transport);
-}
-
-AdapterTransport* RdmaTransport::adapter_transport() const {
-    return AdapterTransport::Get(_socket);
-}
-
-handshake::HandshakeSession* RdmaTransport::handshake_session() const {
-    return adapter_transport()->handshake_session();
-}
-
-int RdmaTransport::handshake_phase() const {
-    return adapter_transport()->handshake_phase();
-}
-
-int RdmaTransport::handshake_version() const {
-    return adapter_transport()->handshake_version();
-}
-
-void RdmaTransport::FallbackToTcp() {
-    adapter_transport()->FallbackToTcp();
-}
-
-void* RdmaTransport::ProcessHandshakeAtClient(void* arg) {
-    RdmaTransport* transport = static_cast<RdmaTransport*>(arg);
-    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
-    SocketUniquePtr socket(transport->_socket);
-    rdma::RdmaConnect::RunGuard guard(
-        static_cast<rdma::RdmaConnect*>(socket->_app_connect.get()));
-
-    LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
-        << "Start handshake on " << socket->description();
-
-    std::unique_ptr<rdma::RdmaHandshakeAdapter> protocol =
-        rdma::CreateClientHandshakeAdapter(ep);
-    CHECK(protocol != NULL);
-    rdma::ParsedHello remote{};
-
-    handshake::ClientHandshakeCallbacks callbacks{};
-    callbacks.phases = handshake::HandshakePhases{
-        C_ALLOC_QPCQ, C_HELLO_SEND, C_HELLO_WAIT,
-        C_BRINGUP_QP, C_ACK_SEND, 0};
-    callbacks.codec = protocol->MakeCodec(&remote);
-    callbacks.prepare_resources = [&]() {
-        if (ep->AllocateResources() == 0) {
-            return handshake::STEP_OK;
-        }
-        PLOG(WARNING) << "Fail to allocate rdma resources, fallback to tcp:"
-                      << socket->description();
-        // Resource preparation is transactional (see #3424): partial RDMA
-        // resources are cleaned by AllocateResources and TCP remains usable.
-        errno = 0;
-        return handshake::STEP_FALLBACK;
-    };
-    callbacks.negotiate_resources = [&]() {
-        ep->ApplyRemoteInfo(remote);
-        if (ep->BringUpQp(remote, false) == 0) {
-            return handshake::STEP_OK;
-        }
-        LOG(WARNING) << "Fail to bringup QP, fallback to tcp:"
-                     << socket->description();
-        return handshake::STEP_FALLBACK;
-    };
-    callbacks.set_high_speed_active = [transport]() {
-        transport->SetHighSpeedAvailable(true);
-    };
-    callbacks.set_tcp_active = [transport]() {
-        transport->SetHighSpeedAvailable(false);
-    };
-    callbacks.on_failed = [&]() {
-        const int saved_errno = errno != 0 ? errno : EPROTO;
-        socket->SetFailed(saved_errno,
-                          "Fail to complete rdma handshake from %s: %s",
-                          socket->description().c_str(), berror(saved_errno));
-    };
-
-    const handshake::StepResult result =
-        transport->handshake_session()->RunClient(callbacks);
-    if (result == handshake::STEP_OK) {
-        LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
-            << "Client handshake ends (use rdma v"
-            << transport->handshake_version() << ") on "
-            << socket->description();
-    } else if (result == handshake::STEP_FALLBACK) {
-        LOG_IF(INFO, rdma::FLAGS_rdma_trace_verbose)
-            << "Client handshake ends (use tcp) on " << socket->description();
-    }
-    errno = 0;
-    return NULL;
 }
 
 void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
@@ -198,14 +68,39 @@ int RdmaTransport::Reset(int32_t expected_nref) {
 }
 
 std::shared_ptr<AppConnect> RdmaTransport::Connect() {
-    if (_default_connect == nullptr) {
-        return  std::make_shared<rdma::RdmaConnect>();
-    }
     return _default_connect;
 }
 
 void RdmaTransport::SetHighSpeedAvailable(bool available) {
     _rdma_state = available ? RDMA_ON : RDMA_OFF;
+}
+
+int RdmaTransport::PrepareUpgradeResources() {
+    return _rdma_ep->AllocateResources();
+}
+
+int RdmaTransport::NegotiateUpgradeResources(
+    const rdma::RdmaConnectionInfo& remote, bool server) {
+    _rdma_ep->ApplyRemoteInfo(remote);
+    return _rdma_ep->BringUpQp(remote, server);
+}
+
+std::unique_ptr<rdma::RdmaHandshakeAdapter>
+RdmaTransport::CreateClientHandshakeAdapter() {
+    return rdma::CreateClientHandshakeAdapter(_rdma_ep);
+}
+
+std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter>>
+RdmaTransport::CreateServerHandshakeAdapters() {
+    return rdma::CreateServerHandshakeAdapters(_rdma_ep);
+}
+
+void RdmaTransport::ActivateUpgrade() {
+    SetHighSpeedAvailable(true);
+}
+
+void RdmaTransport::DeactivateUpgrade() {
+    SetHighSpeedAvailable(false);
 }
 
 int RdmaTransport::CutFromIOBuf(butil::IOBuf* buf) {
@@ -298,25 +193,6 @@ void RdmaTransport::Debug(std::ostream &os) {
     if (_rdma_state == RDMA_ON && _rdma_ep) {
         _rdma_ep->DebugInfo(os);
     }
-    const char* state = "UNKNOWN";
-    switch (handshake_session()->phase(butil::memory_order_relaxed)) {
-    case UNINIT: state = "UNINIT"; break;
-    case C_ALLOC_QPCQ: state = "C_ALLOC_QPCQ"; break;
-    case C_HELLO_SEND: state = "C_HELLO_SEND"; break;
-    case C_HELLO_WAIT: state = "C_HELLO_WAIT"; break;
-    case C_BRINGUP_QP: state = "C_BRINGUP_QP"; break;
-    case C_ACK_SEND: state = "C_ACK_SEND"; break;
-    case S_HELLO_WAIT: state = "S_HELLO_WAIT"; break;
-    case S_ALLOC_QPCQ: state = "S_ALLOC_QPCQ"; break;
-    case S_BRINGUP_QP: state = "S_BRINGUP_QP"; break;
-    case S_HELLO_SEND: state = "S_HELLO_SEND"; break;
-    case S_ACK_WAIT: state = "S_ACK_WAIT"; break;
-    case ESTABLISHED: state = "ESTABLISHED"; break;
-    case FALLBACK_TCP: state = "FALLBACK_TCP"; break;
-    case FAILED: state = "FAILED"; break;
-    }
-    os << "\nhandshake_state=" << state
-       << "\nhandshake_version=" << handshake_version();
 }
 
 int RdmaTransport::ContextInitOrDie(bool serverOrNot, const void* _options) {

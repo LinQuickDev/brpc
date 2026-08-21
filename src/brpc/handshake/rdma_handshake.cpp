@@ -399,10 +399,9 @@ public:
     RdmaServerHandshakeAdapter() = default;
 
 protected:
-    StepResult RunServerHandshake(
+    StepResult RunServerStep(
         butil::IOBuf* source, Socket* socket) override;
     HandshakeSession* GetSession(Socket* socket) const override;
-    int AckWaitPhase(const Socket* socket) const override;
 
 private:
     StepResult RunFallbackServerHandshake(
@@ -489,31 +488,19 @@ HandshakeSession* RdmaServerHandshakeAdapter::GetSession(
     return AdapterTransport::Get(socket)->handshake_session();
 }
 
-int RdmaServerHandshakeAdapter::AckWaitPhase(const Socket* socket) const {
-#if BRPC_WITH_RDMA
-    if (socket->socket_mode() == SOCKET_MODE_RDMA) {
-        return RdmaTransport::S_ACK_WAIT;
-    }
-#endif
-    return FALLBACK_ACK_WAIT;
-}
-
 StepResult RdmaServerHandshakeAdapter::RunFallbackServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     IOBufHandshakeInput input(source);
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{
-        FALLBACK_PREPARE, FALLBACK_HELLO_SEND, FALLBACK_HELLO_WAIT,
-        FALLBACK_NEGOTIATE, FALLBACK_ACK_SEND, FALLBACK_ACK_WAIT};
     callbacks.fallback_on_not_mine = false;
     callbacks.codecs.push_back(MakeRdmaFallbackCodec(2));
     callbacks.codecs.push_back(MakeRdmaFallbackCodec(3));
     callbacks.input = &input;
-    callbacks.prepare_resources = []() { return STEP_OK; };
-    callbacks.negotiate_resources = []() { return STEP_OK; };
-    callbacks.set_high_speed_active = []() {};
-    callbacks.set_tcp_active = []() {};
-    callbacks.on_failed = []() {};
+    callbacks.transport.prepare_resources = []() { return STEP_OK; };
+    callbacks.transport.negotiate_resources = []() { return STEP_OK; };
+    callbacks.transport.set_high_speed_active = []() {};
+    callbacks.transport.set_tcp_active = []() {};
+    callbacks.transport.on_failed = []() {};
     return GetSession(socket)->RunServer(callbacks);
 }
 
@@ -521,18 +508,13 @@ StepResult RdmaServerHandshakeAdapter::RunFallbackServerHandshake(
 StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     RdmaTransport* transport = RdmaTransport::Get(socket);
-    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
-    CHECK(ep != NULL);
+    CHECK(transport->GetRdmaEp() != NULL);
 
     rdma::ParsedHello remote{};
     std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter> > protocols =
-        rdma::CreateServerHandshakeAdapters(ep);
+        transport->CreateServerHandshakeAdapters();
     IOBufHandshakeInput input(source);
     ServerHandshakeCallbacks callbacks{};
-    callbacks.phases = HandshakePhases{
-        RdmaTransport::S_ALLOC_QPCQ, RdmaTransport::S_HELLO_SEND,
-        RdmaTransport::S_HELLO_WAIT, RdmaTransport::S_BRINGUP_QP,
-        0, RdmaTransport::S_ACK_WAIT};
     callbacks.fallback_on_not_mine = false;
     callbacks.input = &input;
     for (size_t i = 0; i < protocols.size(); ++i) {
@@ -543,52 +525,47 @@ StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
             const std::string& payload) {
             const StepResult result = parse_hello(payload);
             if (result == STEP_FALLBACK) {
-                transport->_rdma_state = RdmaTransport::RDMA_OFF;
+                transport->DeactivateUpgrade();
             }
             return result;
         };
         callbacks.codecs.push_back(codec);
     }
-    callbacks.prepare_resources = [&]() {
-        ep->ApplyRemoteInfo(remote);
-        if (ep->AllocateResources() < 0) {
+    callbacks.transport.prepare_resources = [&]() {
+        if (transport->NegotiateUpgradeResources(remote, true) < 0) {
             PLOG(WARNING)
                 << "Fail to allocate rdma resources, fallback to tcp:"
                 << socket->description();
-            transport->_rdma_state = RdmaTransport::RDMA_OFF;
+            transport->DeactivateUpgrade();
             return STEP_FALLBACK;
         }
         return STEP_OK;
     };
-    callbacks.negotiate_resources = [&]() {
-        if (ep->BringUpQp(remote, true) < 0) {
-            transport->_rdma_state = RdmaTransport::RDMA_OFF;
-            return STEP_FALLBACK;
-        }
+    callbacks.transport.negotiate_resources = [&]() {
         return STEP_OK;
     };
     callbacks.validate_established = [&]() {
         if (!source->empty() ||
-            transport->_rdma_state == RdmaTransport::RDMA_OFF) {
+            !transport->UpgradeActive()) {
             return STEP_ERROR;
         }
         return STEP_OK;
     };
-    callbacks.set_high_speed_active = [transport]() {
-        transport->SetHighSpeedAvailable(true);
+    callbacks.transport.set_high_speed_active = [transport]() {
+        transport->ActivateUpgrade();
     };
-    callbacks.set_tcp_active = [transport]() {
-        transport->SetHighSpeedAvailable(false);
+    callbacks.transport.set_tcp_active = [transport]() {
+        transport->DeactivateUpgrade();
     };
-    callbacks.on_failed = []() {};
+    callbacks.transport.on_failed = []() {};
     return GetSession(socket)->RunServer(callbacks);
 }
 #endif
 
-StepResult RdmaServerHandshakeAdapter::RunServerHandshake(
+StepResult RdmaServerHandshakeAdapter::RunServerStep(
     butil::IOBuf* source, Socket* socket) {
 #if BRPC_WITH_RDMA
-    if (socket->socket_mode() == SOCKET_MODE_RDMA) {
+    if (AdapterTransport::Get(socket)->upgrade_capable()) {
         return RunRdmaServerHandshake(source, socket);
     }
 #endif

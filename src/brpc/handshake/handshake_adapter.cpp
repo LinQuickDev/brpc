@@ -29,9 +29,9 @@ namespace handshake {
 // ACK, whose frame has no protocol magic of its own.
 ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
     butil::IOBuf* source, Socket* socket) {
-    const StepResult result = RunServerHandshake(source, socket);
+    const StepResult result = RunServerStep(source, socket);
     if (result == STEP_NEED_MORE) {
-        if (GetSession(socket)->phase() == AckWaitPhase(socket) &&
+        if (GetSession(socket)->phase() == ACK_WAIT &&
             socket->parsing_context() == NULL) {
             ServerHandshakeContext* context =
                 ServerHandshakeContext::Create(this);
