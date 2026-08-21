@@ -65,15 +65,31 @@ bazel build --define BRPC_WITH_URMA=true --define BRPC_WITH_URMA_MOCK=true //:br
 `--with-urma-mock`，否则直接报错」的语义等价，只是 Bazel 没有
 `find_library` 式的自动探测，需要由调用方显式指定其中一个。
 
-Bazel 的 URMA 头文件目前**只有下载模式**：`MODULE.bazel` /
-`WORKSPACE` 里的 `@umdk` 仓库固定拉取
-`https://atomgit.com/openeuler/umdk.git`（pin 到
-`564ee727a55523d4351a8fb3c94292b388ebb924`，即 `v26.06.0_CAM`），没有
-CMake `DOWNLOAD_URMA_HEADERS=OFF` / `URMA_ROOT` 那样「优先用系统头，找
-不到再下载，且可以关闭下载」的开关。离线或内网 CI 如果访问不到
-atomgit.com，需要自行配置 Bazel 的仓库镜像/下载重写机制（例如
-`--distdir` 预置归档，或 Bazel 的 downloader 重写配置），将 `umdk`
-这个 `git_repository` 指向内部镜像。
+Bazel 使用的 `@umdk` 仓库与 CMake 的头文件查找顺序保持一致：
+
+1. 如果设置了 `URMA_ROOT`，Bazel 会优先使用这个本地 UMDK 安装/源码树中的
+   头文件。支持系统安装布局（例如
+   `$URMA_ROOT/ub/umdk/urma/urma_api.h`）和 UMDK 源码布局（例如
+   `$URMA_ROOT/src/urma/lib/urma/core/include/urma_api.h`）。
+2. 如果未设置 `URMA_ROOT`，Bazel 才会从
+   `https://atomgit.com/openeuler/umdk.git` 下载固定版本
+   `564ee727a55523d4351a8fb3c94292b388ebb924`（即 `v26.06.0_CAM`）。
+3. 离线或 hermetic CI 中若要禁止该下载兜底，传入
+   `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=false`；此时 `URMA_ROOT` 不可用会
+   在仓库解析阶段直接报错。
+
+如果要用一个准备好的本地仓库或内部镜像直接替换 `@umdk`，使用 Bazel 的
+仓库覆盖。被覆盖的仓库必须提供兼容的 `@umdk//:urma_headers` target；原始
+UMDK 安装目录或源码 checkout 更适合走 `URMA_ROOT`。
+
+```bash
+bazel build --define BRPC_WITH_URMA=true \
+  --override_repository=umdk=/path/to/local/umdk \
+  //:brpc
+```
+
+`--distdir` 只服务于 `http_archive` / `http_file` 这类走 Bazel downloader
+的规则；它不会满足 `@umdk` 的 git 下载兜底。
 
 ## 使用
 

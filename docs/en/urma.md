@@ -70,16 +70,32 @@ found or the mock is explicitly requested — Bazel just has no
 `find_library`-style auto-detection, so the caller must pick one of the two
 `--define`s explicitly.
 
-The Bazel path currently only supports **downloading** the UMDK headers:
-the `@umdk` repository declared in `MODULE.bazel` / `WORKSPACE` always
-fetches `https://atomgit.com/openeuler/umdk.git` pinned to commit
-`564ee727a55523d4351a8fb3c94292b388ebb924` (`v26.06.0_CAM`). There is no
-Bazel equivalent of CMake's `DOWNLOAD_URMA_HEADERS=OFF` / `URMA_ROOT` (prefer
-installed headers, fall back to downloading, or disable downloading
-entirely). Offline or firewalled CI that cannot reach atomgit.com needs to
-configure Bazel's repository mirroring / downloader-rewrite mechanism (e.g.
-a `--distdir` with the archive staged locally) to redirect the `umdk`
-`git_repository` to an internal mirror.
+The `@umdk` repository used by Bazel mirrors CMake's header lookup order:
+
+1. If `URMA_ROOT` is set, Bazel uses headers from that local UMDK install/tree.
+   Supported layouts include an installed SDK such as
+   `$URMA_ROOT/ub/umdk/urma/urma_api.h` and a UMDK source checkout such as
+   `$URMA_ROOT/src/urma/lib/urma/core/include/urma_api.h`.
+2. Otherwise Bazel downloads the pinned UMDK revision
+   `564ee727a55523d4351a8fb3c94292b388ebb924` (`v26.06.0_CAM`) from
+   `https://atomgit.com/openeuler/umdk.git`.
+3. To forbid that fallback in offline or hermetic CI, pass
+   `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=false`; repository resolution will
+   fail if `URMA_ROOT` is not usable.
+
+For a prepared local repository or internal mirror that should replace `@umdk`
+directly, use Bazel's repository override instead. The override target must
+expose a compatible `@umdk//:urma_headers` target; use `URMA_ROOT` for a raw
+UMDK install or source checkout.
+
+```bash
+bazel build --define BRPC_WITH_URMA=true \
+  --override_repository=umdk=/path/to/local/umdk \
+  //:brpc
+```
+
+`--distdir` only feeds Bazel's downloader-based rules such as `http_archive`
+and `http_file`; it does not satisfy the git fallback used by `@umdk`.
 
 ## Usage
 
