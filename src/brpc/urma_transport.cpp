@@ -58,6 +58,12 @@ void UrmaTransport::Init(Socket* socket, const SocketOptions& options) {
     _default_connect = options.app_connect;
     _on_edge_trigger = options.on_edge_triggered_events;
     if (options.need_on_edge_trigger && _on_edge_trigger == nullptr) {
+        // Unlike RDMA (which only wires OnNewDataFromTcp for client sockets
+        // and relies on InputMessenger::OnNewMessages / ParseRdmaHandshake
+        // for the server side), URMA uses OnNewDataFromTcp for both roles:
+        // its UNINIT branch itself dispatches on m->CreatedByConnect(),
+        // starting the server handshake bthread directly instead of going
+        // through a protocol-level handshake message.
         _on_edge_trigger = urma::UrmaEndpoint::OnNewDataFromTcp;
     }
     _tcp_transport = std::make_shared<TcpTransport>();
@@ -87,8 +93,14 @@ std::shared_ptr<AppConnect> UrmaTransport::Connect() {
 }
 
 int UrmaTransport::CutFromIOBuf(butil::IOBuf* buf) {
+    // Only send over the URMA channel once the handshake has NEGOTIATED it
+    // (URMA_ON). While the state is still URMA_UNKNOWN (handshake in
+    // progress, or a server connection that turned out to be plain TCP and
+    // never handshook) or URMA_OFF (fell back), _resource is not yet set up
+    // and everything must go over the TCP fd. Mirrors the URMA_ON check in
+    // WaitEpollOut() and RDMA's equivalent check.
     if (_urma_ep &&
-        _urma_state.load(butil::memory_order_acquire) != URMA_OFF) {
+        _urma_state.load(butil::memory_order_acquire) == URMA_ON) {
         butil::IOBuf* data_arr[1] = {buf};
         return _urma_ep->CutFromIOBufList(data_arr, 1);
     } else {
@@ -98,7 +110,7 @@ int UrmaTransport::CutFromIOBuf(butil::IOBuf* buf) {
 
 ssize_t UrmaTransport::CutFromIOBufList(butil::IOBuf** buf, size_t ndata) {
     if (_urma_ep &&
-        _urma_state.load(butil::memory_order_acquire) != URMA_OFF) {
+        _urma_state.load(butil::memory_order_acquire) == URMA_ON) {
         return _urma_ep->CutFromIOBufList(buf, ndata);
     } else {
         return _tcp_transport->CutFromIOBufList(buf, ndata);

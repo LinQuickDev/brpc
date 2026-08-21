@@ -87,11 +87,11 @@ macro(brpc_example_find_common_deps out_libs)
     endif()
 
 
-    # brpc built with -DWITH_URMA=ON carries undefined urma_* symbols. Link
-    # liburma when the header is present, which indicates a URMA-capable build.
-    set(_brpc_example_urma_lib "")
-    if(EXISTS "/usr/lib64/liburma.so" OR EXISTS "/usr/lib/liburma.so")
-        set(_brpc_example_urma_lib "urma")
+    # Search for libthrift* by best effort. If it is not found and brpc is
+    # compiled with thrift protocol enabled, a link error would be reported.
+    find_library(THRIFT_LIB NAMES thrift)
+    if(NOT THRIFT_LIB)
+        set(THRIFT_LIB "")
     endif()
 
     find_path(BRPC_INCLUDE_PATH NAMES brpc/server.h)
@@ -124,6 +124,9 @@ macro(brpc_example_find_common_deps out_libs)
 
     find_package(OpenSSL REQUIRED)
 
+    # brpc built with -DWITH_URMA=ON carries undefined urma_* symbols, so every
+    # example has to link liburma. Search by best effort: when brpc was built
+    # without URMA the symbols are absent and the library is not needed.
     find_library(URMA_LIB NAMES urma)
     if(NOT URMA_LIB)
         set(URMA_LIB "")
@@ -138,7 +141,7 @@ macro(brpc_example_find_common_deps out_libs)
         ${OPENSSL_CRYPTO_LIBRARY}
         ${OPENSSL_SSL_LIBRARY}
         ${THRIFT_LIB}
-        ${_brpc_example_urma_lib}
+        ${URMA_LIB}
         dl
     )
 

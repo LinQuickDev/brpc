@@ -32,7 +32,7 @@
 // - Device-name contract: device->name == "mock_urma_device" so tests can
 //   match it with --urma_device=mock_urma_device.
 
-#if BRPC_WITH_URMA
+#if BRPC_WITH_URMA && BRPC_WITH_URMA_MOCK
 
 #include "urma_api.h"
 
@@ -710,4 +710,4 @@ void urma_ack_jfc(urma_jfc_t*[], uint32_t[], uint32_t) {
 
 }  // extern "C"
 
-#endif  // BRPC_WITH_URMA
+#endif  // BRPC_WITH_URMA && BRPC_WITH_URMA_MOCK

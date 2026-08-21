@@ -50,6 +50,37 @@ cannot reach real hardware. Pass `-DWITH_URMA_MOCK=ON`
 link-time mock so URMA code and tests can still be built without hardware
 (e.g. in CI).
 
+### Build with Bazel
+
+```bash
+# Build brpc with URMA support (links the real liburma; must be installed)
+bazel build --define BRPC_WITH_URMA=true //:brpc
+
+# No hardware / CI: explicitly select the link-time mock (does not link liburma)
+bazel build --define BRPC_WITH_URMA=true --define BRPC_WITH_URMA_MOCK=true //:brpc
+```
+
+`bazel/config:brpc_with_urma_mock` is a specialization of
+`bazel/config:brpc_with_urma` (its `define_values` is a superset), so when
+both `--define`s are passed Bazel resolves selects to the more specific
+setting: it compiles with `BRPC_WITH_URMA_MOCK=1` and skips the `-lurma`
+link. Passing only `BRPC_WITH_URMA=true` links the real `liburma`. This
+mirrors the CMake/Make behavior of failing the build unless `liburma` is
+found or the mock is explicitly requested — Bazel just has no
+`find_library`-style auto-detection, so the caller must pick one of the two
+`--define`s explicitly.
+
+The Bazel path currently only supports **downloading** the UMDK headers:
+the `@umdk` repository declared in `MODULE.bazel` / `WORKSPACE` always
+fetches `https://atomgit.com/openeuler/umdk.git` pinned to commit
+`564ee727a55523d4351a8fb3c94292b388ebb924` (`v26.06.0_CAM`). There is no
+Bazel equivalent of CMake's `DOWNLOAD_URMA_HEADERS=OFF` / `URMA_ROOT` (prefer
+installed headers, fall back to downloading, or disable downloading
+entirely). Offline or firewalled CI that cannot reach atomgit.com needs to
+configure Bazel's repository mirroring / downloader-rewrite mechanism (e.g.
+a `--distdir` with the archive staged locally) to redirect the `umdk`
+`git_repository` to an internal mirror.
+
 ## Usage
 
 Select the transport by setting `socket_mode` on the channel / server:

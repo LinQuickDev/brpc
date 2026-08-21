@@ -116,6 +116,21 @@ config_setting(
     visibility = ["//visibility:public"],
 )
 
+# A specialization of :brpc_with_urma (its define_values is a superset), so
+# Bazel resolves select()s using both to this setting whenever it matches.
+# Passing --define BRPC_WITH_URMA=true alone builds against a real liburma;
+# adding --define BRPC_WITH_URMA_MOCK=true switches to brpc's URMA link-time
+# mock instead. The mock cannot talk to real URMA hardware, so it must be
+# opted into rather than silently substituted.
+config_setting(
+    name = "brpc_with_urma_mock",
+    define_values = {
+        "BRPC_WITH_URMA": "true",
+        "BRPC_WITH_URMA_MOCK": "true",
+    },
+    visibility = ["//visibility:public"],
+)
+
 config_setting(
     name = "brpc_with_boringssl",
     define_values = {"BRPC_WITH_BORINGSSL": "true"},

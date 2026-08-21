@@ -85,6 +85,29 @@ jobs:
               -DWITH_ASAN=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
         make -j ${{env.proc_num}} && make clean
 
+  cmake-unittest-urma-mock:
+    # No URMA hardware is available in CI, so this builds against brpc's
+    # URMA link-time mock (WITH_URMA_MOCK=ON) instead of a real liburma, and
+    # actually runs UrmaTransport's unit tests against it.
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v2
+    - uses: ./.github/actions/install-all-dependencies
+    - name: configure
+      run: |
+        mkdir build && cd build
+        cmake -DBUILD_UNIT_TESTS=ON -DDOWNLOAD_GTEST=ON \
+              -DWITH_URMA=ON -DWITH_URMA_MOCK=ON \
+              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+    - name: build
+      run: |
+        cd build
+        make -j ${{env.proc_num}} brpc_urma_unittest
+    - name: run tests
+      run: |
+        cd build
+        ctest -R brpc_urma_unittest --output-on-failure
+
   gcc-compile-with-make-protobuf:
     runs-on: ubuntu-22.04
     steps:

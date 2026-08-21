@@ -47,6 +47,34 @@ CI）编译和测试 URMA 代码时，显式传入 `-DWITH_URMA_MOCK=ON`
 （Make 对应 `config_brpc.sh --with-urma-mock`）以主动选择链接 brpc 的
 mock。
 
+### Bazel 编译
+
+```bash
+# 带 URMA 支持编译 brpc（链接真实 liburma，需系统已安装）
+bazel build --define BRPC_WITH_URMA=true //:brpc
+
+# 无硬件/CI 场景：显式选择链接期 mock（不链接 liburma）
+bazel build --define BRPC_WITH_URMA=true --define BRPC_WITH_URMA_MOCK=true //:brpc
+```
+
+`bazel/config:brpc_with_urma_mock` 是 `bazel/config:brpc_with_urma` 的
+一个特化（`define_values` 是后者的超集），因此同时传入两个 `--define`
+时 Bazel 会按更具体的设置解析：编译期定义 `BRPC_WITH_URMA_MOCK=1`
+并跳过 `-lurma` 链接；只传 `BRPC_WITH_URMA=true` 时才会链接真实
+`liburma`。这与 CMake/Make 侧「找不到 liburma 就必须显式加
+`--with-urma-mock`，否则直接报错」的语义等价，只是 Bazel 没有
+`find_library` 式的自动探测，需要由调用方显式指定其中一个。
+
+Bazel 的 URMA 头文件目前**只有下载模式**：`MODULE.bazel` /
+`WORKSPACE` 里的 `@umdk` 仓库固定拉取
+`https://atomgit.com/openeuler/umdk.git`（pin 到
+`564ee727a55523d4351a8fb3c94292b388ebb924`，即 `v26.06.0_CAM`），没有
+CMake `DOWNLOAD_URMA_HEADERS=OFF` / `URMA_ROOT` 那样「优先用系统头，找
+不到再下载，且可以关闭下载」的开关。离线或内网 CI 如果访问不到
+atomgit.com，需要自行配置 Bazel 的仓库镜像/下载重写机制（例如
+`--distdir` 预置归档，或 Bazel 的 downloader 重写配置），将 `umdk`
+这个 `git_repository` 指向内部镜像。
+
 ## 使用
 
 通过在 channel / server 上设置 `socket_mode` 选择传输层：

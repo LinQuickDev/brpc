@@ -556,8 +556,10 @@ if [ $WITH_URMA != 0 ]; then
         append_to_output_libs "$URMA_LIB"
         append_to_output "DYNAMIC_LINKINGS+=-lurma"
         append_to_output "URMA_USE_MOCK=0"
+        CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_URMA_MOCK=0"
     elif [ $WITH_URMA_MOCK != 0 ]; then
         append_to_output "URMA_USE_MOCK=1"
+        CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_URMA_MOCK=1"
         print_info "liburma not found; --with-urma-mock given, using URMA link-time mock"
     else
         >&2 $ECHO "Fail to find liburma. Install liburma, or explicitly opt into brpc's link-time mock with --with-urma-mock (the mock cannot talk to real URMA hardware; only use it for CI/tests without URMA hardware)."

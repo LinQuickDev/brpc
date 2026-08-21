@@ -148,10 +148,13 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
       _state(UNINIT),
       _handshake_version(0),
       _resource(nullptr) {
-    _sq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
-    _rq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_rq_size))));
+    // FLAGS_urma_sq_size / FLAGS_urma_rq_size are range-checked to [16, 4096]
+    // once in GlobalUrmaInitializeImpl() (urma_helper.cpp), which every path
+    // that can construct a UrmaEndpoint (UrmaTransport::Init(), gated by
+    // ContextInitOrDie()) runs before any endpoint exists. No need to
+    // re-clamp here.
+    _sq_size = static_cast<uint16_t>(FLAGS_urma_sq_size);
+    _rq_size = static_cast<uint16_t>(FLAGS_urma_rq_size);
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
 }
@@ -670,6 +673,11 @@ public:
     }
 };
 
+// urma_jfs_cfg_t::max_sge is uint8_t (see urma_helper.cpp), so
+// GetUrmaMaxSge() never exceeds this. Bound the on-stack SGE array by it
+// instead of alloca()-ing a runtime-controlled size.
+static constexpr int kUrmaMaxSgePerWr = 255;
+
 ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     if (!_resource || !_resource->jetty || !_resource->remote_jetty) {
         errno = ENOTCONN;
@@ -678,14 +686,11 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     int max_sge = GetUrmaMaxSge();
     if (max_sge < 1) {
         max_sge = 1;
+    } else if (max_sge > kUrmaMaxSgePerWr) {
+        max_sge = kUrmaMaxSgePerWr;
     }
 
-    urma_sge_t* sglist = static_cast<urma_sge_t*>(
-        alloca(sizeof(urma_sge_t) * max_sge));
-    if (!sglist) {
-        errno = ENOMEM;
-        return -1;
-    }
+    urma_sge_t sglist[kUrmaMaxSgePerWr];
 
     size_t current = 0;
     ssize_t total_len = 0;
@@ -1216,52 +1221,51 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
         InputMessenger::OnNewMessages(m);
         return;
     }
-    int progress = 0;
-    while (true) {
-        const State state =
-            ep->_state.load(butil::memory_order_acquire);
-        if (state == UNINIT) {
-            if (!m->CreatedByConnect()) {
-                // Server side: kick off the handshake bthread.
-                if (!IsUrmaAvailable()) {
-                    ep->_state = FALLBACK_TCP;
-                    tp->_urma_state = UrmaTransport::URMA_OFF;
-                    InputMessenger::OnNewMessages(m);
-                    return;
-                }
-                SocketUniquePtr s;
-                m->ReAddress(&s);
-                ep->_state = S_HELLO_WAIT;
-                bthread_t tid;
-                bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
-                bthread_attr_set_name(&attr, "UrmaServerHandshake");
-                if (bthread_start_background(&tid, &attr,
-                        ProcessHandshakeAtServer, ep) != 0) {
-                    ep->_state = UNINIT;
-                    LOG(FATAL) << "Fail to start UrmaServerHandshake bthread";
-                } else {
-                    s.release();
-                }
+    const State state = ep->_state.load(butil::memory_order_acquire);
+    if (state == UNINIT) {
+        if (!m->CreatedByConnect()) {
+            // Server side: kick off the handshake bthread.
+            if (!IsUrmaAvailable()) {
+                ep->_state = FALLBACK_TCP;
+                tp->_urma_state = UrmaTransport::URMA_OFF;
+                InputMessenger::OnNewMessages(m);
                 return;
             }
-            // Client side: handled by ProcessHandshakeAtClient.
-            return;
-        } else if (state < ESTABLISHED) {
-            // During handshake: wake the handshake bthread parked in ReadFromFd.
-            ep->_read_butex->fetch_add(1, butil::memory_order_release);
-            bthread::butex_wake(ep->_read_butex);
-            return;
-        } else if (state == FALLBACK_TCP) {
-            InputMessenger::OnNewMessages(m);
-            return;
-        } else if (state == ESTABLISHED) {
-            TryReadOnTcpDuringUrmaEst(m);
+            SocketUniquePtr s;
+            m->ReAddress(&s);
+            ep->_state = S_HELLO_WAIT;
+            bthread_t tid;
+            bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+            bthread_attr_set_name(&attr, "UrmaServerHandshake");
+            if (bthread_start_background(&tid, &attr,
+                    ProcessHandshakeAtServer, ep) != 0) {
+                ep->_state = UNINIT;
+                LOG(FATAL) << "Fail to start UrmaServerHandshake bthread";
+            } else {
+                s.release();
+            }
             return;
         }
-        if (!m->MoreReadEvents(&progress)) {
-            break;
-        }
+        // Client side: handled by ProcessHandshakeAtClient.
+        return;
     }
+    if (state < ESTABLISHED) {
+        // During handshake: wake the handshake bthread parked in ReadFromFd.
+        ep->_read_butex->fetch_add(1, butil::memory_order_release);
+        bthread::butex_wake(ep->_read_butex);
+        return;
+    }
+    if (state == FALLBACK_TCP) {
+        InputMessenger::OnNewMessages(m);
+        return;
+    }
+    if (state == ESTABLISHED) {
+        TryReadOnTcpDuringUrmaEst(m);
+        return;
+    }
+    // state == FAILED: FailHandshake() already called _socket->SetFailed(),
+    // which tears the socket down through the normal Socket path. There is
+    // nothing left for the edge-trigger dispatcher to do.
 }
 
 inline void UrmaEndpoint::TryReadOnTcp() {

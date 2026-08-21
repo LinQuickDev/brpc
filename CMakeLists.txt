@@ -386,6 +386,7 @@ if(WITH_URMA)
             "-DWITH_URMA_MOCK=ON (the mock cannot talk to real URMA "
             "hardware; only enable it for CI/tests without URMA hardware).")
     endif()
+    list(APPEND BRPC_COMMON_DEFINITIONS BRPC_WITH_URMA_MOCK=${URMA_USE_MOCK})
 endif()
 
 find_library(PROTOC_LIB NAMES protoc)
