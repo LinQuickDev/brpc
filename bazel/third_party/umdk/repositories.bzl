@@ -37,7 +37,11 @@ def _is_false(value):
 
 def _first_existing_file(ctx, root, relpaths):
     for relpath in relpaths:
-        path = ctx.path(root).get_child(relpath)
+        # get_child() joins one segment at a time; passing a relative path
+        # containing separators is not portable across Bazel versions.
+        path = ctx.path(root)
+        for segment in relpath.split("/"):
+            path = path.get_child(segment)
         if path.exists:
             return relpath
     return None
@@ -51,6 +55,13 @@ def _use_local_umdk(ctx, urma_root):
         "ub/umdk/urma/urma_api.h",
         "umdk/urma/urma_api.h",
         "urma/urma_api.h",
+        # CMake's find_path() implicitly also searches an include/ prefix
+        # under HINTS, so URMA_ROOT=/usr resolves there. Probe the same
+        # layouts here to keep URMA_ROOT meaning the same in both builds.
+        "include/ub/umdk/urma/urma_api.h",
+        "include/umdk/urma/urma_api.h",
+        "include/urma/urma_api.h",
+        "include/urma_api.h",
         "src/urma/lib/urma/core/include/urma_api.h",
     ])
     if not core_include:
@@ -63,6 +74,10 @@ def _use_local_umdk(ctx, urma_root):
         "ub/umdk/urma/urma_ubagg.h",
         "umdk/urma/urma_ubagg.h",
         "urma/urma_ubagg.h",
+        "include/ub/umdk/urma/urma_ubagg.h",
+        "include/umdk/urma/urma_ubagg.h",
+        "include/urma/urma_ubagg.h",
+        "include/urma_ubagg.h",
         "src/urma/lib/urma/bond/include/urma_ubagg.h",
     ])
     if not bond_include:
