@@ -269,6 +269,17 @@ urma_context_t *urma_create_context(urma_device_t *device, uint32_t eid_index) {
     if (!device) {
         return nullptr;
     }
+// The bonding provider extension. brpc only calls this with
+// BONDP_USER_CTL_SET_BONDING_MODE, and only for a device whose name marks it
+// as a bonding device -- which the mock never reports. Accept the call so the
+// symbol resolves in mock builds where the UMDK tree does ship urma_ubagg.h.
+urma_status_t urma_user_ctl(urma_context_t *ctx, urma_user_ctl_in_t *in,
+                            urma_user_ctl_out_t *out) {
+    if (ctx == nullptr || in == nullptr || out == nullptr) {
+        return URMA_EINVAL;
+    }
+    return URMA_SUCCESS;
+}
     urma_context_t *ctx = new urma_context_t;
     ctx->async_fd = 0;
     ctx->dev = device;
