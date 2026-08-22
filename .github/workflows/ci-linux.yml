@@ -93,6 +93,14 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - uses: ./.github/actions/install-all-dependencies
+    - name: install gperftools
+      # test/CMakeLists.txt links ${GPERFTOOLS_LIBRARIES} into every
+      # brpc_*_unittest target unconditionally, and FindGperftools.cmake
+      # leaves it as "...-NOTFOUND" when the library is absent, which then
+      # reaches the linker verbatim. The existing unittest jobs build via
+      # test/Makefile and get gperftools from init-ut-make-config; this is
+      # the first CMake-based unittest job, so install it explicitly.
+      run: sudo apt-get install -y libgoogle-perftools-dev
     - name: configure
       run: |
         mkdir build && cd build
