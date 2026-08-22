@@ -13,5 +13,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Thie empty BUILD.bazel file is required to make Bazel treat
+# This empty BUILD.bazel file is required to make Bazel treat
 # this directory as a package.
