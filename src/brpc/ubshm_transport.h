@@ -42,7 +42,7 @@ public:
     void QueueMessage(InputMessageClosure& inputMsg, int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream &os) override;
     ubring::UBShmEndpoint* GetUBShmEp() {
-        CHECK(_ub_ep != NULL);
+        CHECK(_ub_ep != nullptr);
         return _ub_ep;
     }
     static UBShmTransport* Get(const Socket* socket);
@@ -70,7 +70,7 @@ private:
         UB_UNKNOWN
     };
     // The UBShmEndpoint
-    ubring::UBShmEndpoint* _ub_ep = NULL;
+    ubring::UBShmEndpoint* _ub_ep = nullptr;
     // Should use UB or not
     UBState _ub_state;
 };

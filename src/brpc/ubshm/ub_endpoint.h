@@ -20,18 +20,17 @@
 
 #if BRPC_WITH_UBRING
 
-#include <functional>
-#include <vector>
-#include "butil/atomicops.h"
-#include "butil/iobuf.h"
-#include "butil/macros.h"
-#include "butil/containers/mpsc_queue.h"
 #include "brpc/handshake/ubshm_handshake.h"
 #include "brpc/socket.h"
+#include "brpc/ubshm/shm/shm_def.h"
 #include "brpc/ubshm/ub_helper.h"
 #include "brpc/ubshm/ub_ring.h"
-#include "brpc/ubshm/shm/shm_def.h"
-
+#include "butil/atomicops.h"
+#include "butil/containers/mpsc_queue.h"
+#include "butil/iobuf.h"
+#include "butil/macros.h"
+#include <functional>
+#include <vector>
 
 namespace brpc {
 class Socket;
@@ -46,132 +45,127 @@ DECLARE_bool(ub_edisp_unsched);
 DECLARE_bool(ub_disable_bthread);
 
 class BAIDU_CACHELINE_ALIGNMENT UBShmEndpoint : public SocketUser {
-friend class Socket;
-friend class ::brpc::UBShmTransport;
-friend class ::brpc::handshake::UBShmServerHandshakeAdapter;
+  friend class Socket;
+  friend class ::brpc::UBShmTransport;
+  friend class ::brpc::handshake::UBShmServerHandshakeAdapter;
+
 public:
-    explicit UBShmEndpoint(Socket* s);
-    ~UBShmEndpoint() override;
+  explicit UBShmEndpoint(Socket *s);
+  ~UBShmEndpoint() override;
 
-    // Global initialization
-    // Return 0 if success, -1 if failed and errno set
-    static int GlobalInitialize();
+  // Global initialization
+  // Return 0 if success, -1 if failed and errno set
+  static int GlobalInitialize();
 
-    static void GlobalRelease();
+  static void GlobalRelease();
 
-    // Reset the endpoint (for next use)
-    void Reset();
+  // Reset the endpoint (for next use)
+  void Reset();
 
-    // Cut data from the given IOBuf list and use UBRING to send
-    // Return bytes cut if success, -1 if failed and errno set
-    ssize_t CutFromIOBufList(butil::IOBuf** data, size_t ndata);
+  // Cut data from the given IOBuf list and use UBRING to send
+  // Return bytes cut if success, -1 if failed and errno set
+  ssize_t CutFromIOBufList(butil::IOBuf **data, size_t ndata);
 
-    // Whether the endpoint can send more data
-    bool IsWritable() const;
+  // Whether the endpoint can send more data
+  bool IsWritable() const;
 
-    void PollerRegisterEpollOut(bool pollin) {
-        uint32_t events = EPOLLOUT | EPOLLET;
-        if (pollin) {
-            PollerRegisterEvent(CqSidOp::MOD, events | EPOLLIN);
-            return;
-        }
-        PollerRegisterEvent(CqSidOp::ADD, events);
+  void PollerRegisterEpollOut(bool pollin) {
+    uint32_t events = EPOLLOUT | EPOLLET;
+    if (pollin) {
+      PollerRegisterEvent(CqSidOp::MOD, events | EPOLLIN);
+      return;
     }
+    PollerRegisterEvent(CqSidOp::ADD, events);
+  }
 
-    void PollerUnRegisterEpollOut(bool pollin) {
-        uint32_t events = EPOLLIN | EPOLLET;
-        if (pollin) {
-            PollerRegisterEvent(CqSidOp::MOD, events);
-            return;
-        }
-        PollerRegisterEvent(CqSidOp::REMOVE);
+  void PollerUnRegisterEpollOut(bool pollin) {
+    uint32_t events = EPOLLIN | EPOLLET;
+    if (pollin) {
+      PollerRegisterEvent(CqSidOp::MOD, events);
+      return;
     }
+    PollerRegisterEvent(CqSidOp::REMOVE);
+  }
 
-    // Initialize polling mode
-    static int PollingModeInitialize(bthread_tag_t tag,
-                                     std::function<void(void)> callback,
-                                     std::function<void(void)> init_fn,
-                                     std::function<void(void)> release_fn);
+  // Initialize polling mode
+  static int PollingModeInitialize(bthread_tag_t tag,
+                                   std::function<void(void)> callback,
+                                   std::function<void(void)> init_fn,
+                                   std::function<void(void)> release_fn);
 
-    static void PollingModeRelease(bthread_tag_t tag);
+  static void PollingModeRelease(bthread_tag_t tag);
 
 private:
-    // Allocate resources
-    // Return 0 if success, -1 if failed and errno set
-    int AllocateClientResources(SHM* local_trx_shm, const char* shm_name);
+  // Allocate resources
+  // Return 0 if success, -1 if failed and errno set
+  int AllocateClientResources(SHM *local_trx_shm, const char *shm_name);
 
-    int AllocateServerResources(SHM* remote_trx_shm, SHM* local_trx_shm);
+  int AllocateServerResources(SHM *remote_trx_shm, SHM *local_trx_shm);
 
-    // Release resources
-    void DeallocateResources();
+  // Release resources
+  void DeallocateResources();
 
-    // Poll CQ and get the work completion
-    static void PollIn(UBShmEndpoint* ep, uint32_t ep_event);
+  // Poll CQ and get the work completion
+  static void PollIn(UBShmEndpoint *ep, uint32_t ep_event);
 
-    static void PollOut(UBShmEndpoint* ep, uint32_t ep_event);
+  static void PollOut(UBShmEndpoint *ep, uint32_t ep_event);
 
-    // Not owner
-    Socket* _socket;
-    SocketId _socket_id;
+  // Not owner
+  Socket *_socket;
+  SocketId _socket_id;
 
-    // ub resource
-    ubring::UBRing* _ub_ring{nullptr};
+  // ub resource
+  ubring::UBRing *_ub_ring{nullptr};
 
-    SocketId _cq_sid;
+  SocketId _cq_sid;
 
-    DISALLOW_COPY_AND_ASSIGN(UBShmEndpoint);
+  DISALLOW_COPY_AND_ASSIGN(UBShmEndpoint);
 
-    struct CqSidOp {
-        enum OpType {
-            ADD,
-            REMOVE,
-            MOD
-        };
-        SocketId sid;
-        uint32_t event;
-        OpType type;
-    };
+  struct CqSidOp {
+    enum OpType { ADD, REMOVE, MOD };
+    SocketId sid;
+    uint32_t event;
+    OpType type;
+  };
 
-    struct CqSidOpHash {
-        std::size_t operator()(const CqSidOp& op) const {
-            return op.sid;
-        }
-    };
+  struct CqSidOpHash {
+    std::size_t operator()(const CqSidOp &op) const { return op.sid; }
+  };
 
-    struct CqSidOpEqual {
-        bool operator()(const CqSidOp& lhs, const CqSidOp& rhs) const {
-            return lhs.sid == rhs.sid;
-        }
-    };
+  struct CqSidOpEqual {
+    bool operator()(const CqSidOp &lhs, const CqSidOp &rhs) const {
+      return lhs.sid == rhs.sid;
+    }
+  };
 
-    // Poller instance
-    struct BAIDU_CACHELINE_ALIGNMENT Poller {
-        bthread_t tid{INVALID_BTHREAD};
-        butil::MPSCQueue<CqSidOp, butil::ObjectPoolAllocator<CqSidOp>> op_queue;
-        // Callback used for io_uring/spdk etc
-        std::function<void()> callback;
-        // Init and Destroy function
-        std::function<void()> init_fn;
-        std::function<void()> release_fn;
-    };
-    // Poller group
-    struct BAIDU_CACHELINE_ALIGNMENT PollerGroup {
-        PollerGroup() : pollers(FLAGS_ub_poller_num), running(false) {}
-        std::vector<Poller> pollers;
-        std::atomic<bool> running;
-    };
-    static std::vector<PollerGroup> _poller_groups;
+  // Poller instance
+  struct BAIDU_CACHELINE_ALIGNMENT Poller {
+    bthread_t tid{INVALID_BTHREAD};
+    butil::MPSCQueue<CqSidOp, butil::ObjectPoolAllocator<CqSidOp>> op_queue;
+    // Callback used for io_uring/spdk etc
+    std::function<void()> callback;
+    // Init and Destroy function
+    std::function<void()> init_fn;
+    std::function<void()> release_fn;
+  };
+  // Poller group
+  struct BAIDU_CACHELINE_ALIGNMENT PollerGroup {
+    PollerGroup() : pollers(FLAGS_ub_poller_num), running(false) {}
+    std::vector<Poller> pollers;
+    std::atomic<bool> running;
+  };
+  static std::vector<PollerGroup> _poller_groups;
 
-    void PollerRegisterEvent(CqSidOp::OpType op, uint32_t events = EPOLLET);
+  void PollerRegisterEvent(CqSidOp::OpType op, uint32_t events = EPOLLET);
 };
 
-}  // namespace ubring
-}  // namespace brpc
+} // namespace ubring
+} // namespace brpc
 
-#else  // if BRPC_WITH_UBRING
+#else // if BRPC_WITH_UBRING
 
-class UBShmEndpoint { };
+class UBShmEndpoint {};
 
 #endif
 
-#endif //BRPC_UB_ENDPOINT_H
+#endif // BRPC_UB_ENDPOINT_H

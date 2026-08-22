@@ -44,7 +44,7 @@ public:
     void QueueMessage(InputMessageClosure& inputMsg, int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream &os) override;
     rdma::RdmaEndpoint* GetRdmaEp() {
-        CHECK(_rdma_ep != NULL);
+        CHECK(_rdma_ep != nullptr);
         return _rdma_ep;
     }
     static RdmaTransport* Get(const Socket* socket);
@@ -77,7 +77,7 @@ private:
         RDMA_UNKNOWN
     };
     // The RdmaEndpoint
-    rdma::RdmaEndpoint* _rdma_ep = NULL;
+    rdma::RdmaEndpoint* _rdma_ep = nullptr;
     // Should use RDMA or not
     RdmaState _rdma_state;
 };
