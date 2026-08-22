@@ -65,7 +65,7 @@ def _use_local_umdk(ctx, urma_root):
         "urma/urma_ubagg.h",
         "src/urma/lib/urma/bond/include/urma_ubagg.h",
     ])
-       if not bond_include:
+    if not bond_include:
         fail(("URMA_ROOT is set to '%s' and urma_api.h was found under it, " +
               "but no urma_ubagg.h was. brpc needs both the core and the bond " +
               "UMDK headers; a partial tree would only fail later with a " +
