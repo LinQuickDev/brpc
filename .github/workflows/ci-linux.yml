@@ -2,7 +2,7 @@ name: Build and Test on Linux
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, urma_transport_dev ]
     paths-ignore:
       - '**.md'
   pull_request:
