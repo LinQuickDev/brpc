@@ -212,8 +212,10 @@ TEST(UrmaHandshakeTest, ack_bit_is_urma_ok) {
 // ParsedHello field layout: covers the flattened segment (seg_* fields).
 // ---------------------------------------------------------------------------
 TEST(UrmaHandshakeTest, parsed_hello_segment_fields) {
+    // ParsedHello zero-initializes every field with default member
+    // initializers, so memset() is redundant here -- and GCC rejects it under
+    // --werror (-Wclass-memaccess) because the type is not trivial.
     urma::ParsedHello p;
-    std::memset(&p, 0, sizeof(p));
     p.buffer_size = 8192;
     p.recv_buffer_cnt = 127;
     p.jetty_id = 42;

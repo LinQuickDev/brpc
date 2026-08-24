@@ -1617,7 +1617,7 @@ int UrmaEndpoint::PollingModeInitialize(
     if (!FLAGS_urma_use_polling) {
         return 0;
     }
-    if (tag >= _poller_groups.size() ||
+    if (tag < 0 || static_cast<size_t>(tag) >= _poller_groups.size() ||
         _poller_groups[tag].pollers.empty()) {
         errno = EINVAL;
         return -1;
@@ -1706,7 +1706,8 @@ int UrmaEndpoint::PollingModeInitialize(
 }
 
 void UrmaEndpoint::PollingModeRelease(bthread_tag_t tag) {
-    if (!FLAGS_urma_use_polling || tag >= _poller_groups.size()) {
+    if (!FLAGS_urma_use_polling || tag < 0 ||
+        static_cast<size_t>(tag) >= _poller_groups.size()) {
         return;
     }
     auto& group = _poller_groups[tag];
@@ -1724,7 +1725,8 @@ void UrmaEndpoint::PollerAddCqSid() {
         return;
     }
     _poller_tag = bthread_self_tag();
-    if (_poller_tag >= _poller_groups.size()) {
+    if (_poller_tag < 0 ||
+        static_cast<size_t>(_poller_tag) >= _poller_groups.size()) {
         return;
     }
     auto& pollers = _poller_groups[_poller_tag].pollers;
@@ -1739,7 +1741,8 @@ void UrmaEndpoint::PollerAddCqSid() {
 
 void UrmaEndpoint::PollerRemoveCqSid() {
     if (_cq_sid == INVALID_SOCKET_ID || _poller_groups.empty() ||
-        _poller_tag >= _poller_groups.size()) {
+        _poller_tag < 0 ||
+        static_cast<size_t>(_poller_tag) >= _poller_groups.size()) {
         return;
     }
     auto& pollers = _poller_groups[_poller_tag].pollers;
