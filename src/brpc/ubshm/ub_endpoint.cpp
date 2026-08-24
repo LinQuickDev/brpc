@@ -849,6 +849,7 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
         while (running->load(std::memory_order_relaxed)) {
             while (poller->op_queue.Dequeue(op)) {
                 if (op.type == CqSidOp::ADD) {
+                    cq_sids.erase(op);
                     cq_sids.emplace(op);
                 } else if (op.type == CqSidOp::REMOVE) {
                     cq_sids.erase(op);
