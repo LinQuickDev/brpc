@@ -26,6 +26,14 @@
 #include "bthread/unstable.h"
 #include "brpc/ubshm/common/common.h"
 
+#if defined(OS_MACOSX)
+struct itimerspec
+{
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+#endif
+
 namespace brpc {
 namespace ubring {
 
