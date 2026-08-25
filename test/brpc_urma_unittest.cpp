@@ -279,51 +279,8 @@ TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
 // ---------------------------------------------------------------------------
 // SupportedByUrma: only baidu_std.
 // ---------------------------------------------------------------------------
-TEST(UrmaHandshakeTest, supported_by_urma_protocol_allowlist) {TEST(UrmaHandshakeTest, v2_client_falls_back_to_tcp_server) {
-    urma::g_skip_urma_init = false;
 
-    UrmaFallbackEchoService service;
-    brpc::Server server;
-    ASSERT_EQ(0, server.AddService(
-        &service, brpc::SERVER_DOESNT_OWN_SERVICE));
-
-    brpc::ServerOptions server_options;
-    server_options.socket_mode = brpc::SOCKET_MODE_TCP;
-    server_options.internal_port = -1;
-    ASSERT_EQ(0, server.Start(0, &server_options));
-
-    const int saved_version =
-        urma::FLAGS_urma_client_handshake_version;
-    urma::FLAGS_urma_client_handshake_version = 2;
-
-    brpc::ChannelOptions channel_options;
-    channel_options.socket_mode = brpc::SOCKET_MODE_URMA;
-    channel_options.connect_timeout_ms = 1000;
-    channel_options.timeout_ms = 3000;
-    channel_options.max_retry = 0;
-
-    brpc::Channel channel;
-    const int init_result =
-        channel.Init(server.listen_address(), &channel_options);
-    EXPECT_EQ(0, init_result);
-
-    if (init_result == 0) {
-        test::EchoRequest request;
-        test::EchoResponse response;
-        brpc::Controller cntl;
-        request.set_message("urma-fallback");
-
-        test::EchoService::Stub stub(&channel);
-        stub.Echo(&cntl, &request, &response, nullptr);
-
-        EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
-        EXPECT_EQ(request.message(), response.message());
-    }
-
-    urma::FLAGS_urma_client_handshake_version = saved_version;
-    server.Stop(0);
-    server.Join();
-}
+TEST(UrmaHandshakeTest, supported_by_urma_protocol_allowlist) {
     EXPECT_TRUE(urma::SupportedByUrma("baidu_std"));
     EXPECT_FALSE(urma::SupportedByUrma("http"));
     EXPECT_FALSE(urma::SupportedByUrma("hulu_pbrpc"));
@@ -649,7 +606,51 @@ TEST_F(UrmaMockTest,
     urma_delete_context(ctx);
     urma_free_device_list(devices);
 }
+TEST(UrmaHandshakeTest, v2_client_falls_back_to_tcp_server) {
+    urma::g_skip_urma_init = false;
 
+    UrmaFallbackEchoService service;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(
+        &service, brpc::SERVER_DOESNT_OWN_SERVICE));
+
+    brpc::ServerOptions server_options;
+    server_options.socket_mode = brpc::SOCKET_MODE_TCP;
+    server_options.internal_port = -1;
+    ASSERT_EQ(0, server.Start(0, &server_options));
+
+    const int saved_version =
+        urma::FLAGS_urma_client_handshake_version;
+    urma::FLAGS_urma_client_handshake_version = 2;
+
+    brpc::ChannelOptions channel_options;
+    channel_options.socket_mode = brpc::SOCKET_MODE_URMA;
+    channel_options.connect_timeout_ms = 1000;
+    channel_options.timeout_ms = 3000;
+    channel_options.max_retry = 0;
+
+    brpc::Channel channel;
+    const int init_result =
+        channel.Init(server.listen_address(), &channel_options);
+    EXPECT_EQ(0, init_result);
+
+    if (init_result == 0) {
+        test::EchoRequest request;
+        test::EchoResponse response;
+        brpc::Controller cntl;
+        request.set_message("urma-fallback");
+
+        test::EchoService::Stub stub(&channel);
+        stub.Echo(&cntl, &request, &response, nullptr);
+
+        EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        EXPECT_EQ(request.message(), response.message());
+    }
+
+    urma::FLAGS_urma_client_handshake_version = saved_version;
+    server.Stop(0);
+    server.Join();
+}
 #else  // BRPC_WITH_URMA
 
 // When URMA is not compiled in, the test file is a no-op so the build stays
