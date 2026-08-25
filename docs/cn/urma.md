@@ -40,12 +40,16 @@ make -C build -j$(nproc)
 
 `WITH_URMA=ON` 使用上游 UMDK 头文件进行编译。CMake 优先使用系统安装的
 SDK；找不到头文件时，会参照 Mooncake 的 mock 构建方式下载固定版本的
-UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `liburma` 时使用
-真实硬件数据通路；否则默认直接报错终止构建，避免静默回退到 mock 而产出
-一个看似支持 URMA、实际无法访问真实硬件的产物。需要在无硬件环境（例如
-CI）编译和测试 URMA 代码时，显式传入 `-DWITH_URMA_MOCK=ON`
-（Make 对应 `config_brpc.sh --with-urma-mock`）以主动选择链接 brpc 的
-mock。
+UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。库的选择遵循两条规则。未开启
+`WITH_URMA_MOCK` 时，链接 `liburma` 走真实硬件数据通路；找不到
+`liburma` 则直接报错终止构建，而不是静默回退到 mock——那样会掩盖环境
+问题，产出一个看似支持 URMA、实际无法访问真实硬件的产物。传入
+`-DWITH_URMA_MOCK=ON`（Make 对应 `config_brpc.sh --with-urma-mock`，
+Bazel 对应 `--define BRPC_WITH_URMA_MOCK=true`）时，**无论是否装有
+`liburma` 都使用 mock**，且 CMake 在覆盖真实 `liburma` 时会打印警告。
+这个显式开关刻意优先于自动探测：若按「是否装了 liburma」来决定，同一条
+mock 构建命令在不同机器上含义就不同了——CI 上得到 mock，而装了 SDK 的
+开发机上却悄悄变成硬件构建。
 
 ### Bazel 编译
 

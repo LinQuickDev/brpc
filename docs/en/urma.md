@@ -42,13 +42,17 @@ make -C build -j$(nproc)
 installed SDK and, following Mooncake's mock setup, downloads a pinned UMDK
 release when the headers are unavailable. Set `DOWNLOAD_URMA_HEADERS=OFF` to
 disable downloading.
-When `liburma` is found it is linked for the hardware data path. Otherwise
-the build fails by default, since silently falling back to the mock could
-mask a broken environment and ship a binary that looks URMA-capable but
-cannot reach real hardware. Pass `-DWITH_URMA_MOCK=ON`
-(`config_brpc.sh --with-urma-mock`) to explicitly opt into brpc's
-link-time mock so URMA code and tests can still be built without hardware
-(e.g. in CI).
+Library selection follows two rules. Without `WITH_URMA_MOCK`, `liburma` is
+linked for the hardware data path, and a missing `liburma` fails the build
+rather than silently falling back to the mock -- that fallback would mask a
+broken environment and ship a binary that looks URMA-capable but cannot
+reach real hardware. With `-DWITH_URMA_MOCK=ON`
+(`config_brpc.sh --with-urma-mock`, Bazel `--define BRPC_WITH_URMA_MOCK=true`),
+the mock is used *whether or not* `liburma` is installed, and CMake prints a
+warning when it overrides a real `liburma`. The explicit switch deliberately
+wins over auto-detection: deciding by "is liburma installed?" would make a
+mock build mean different things on different machines -- the mock in CI, a
+hardware build on a developer box that happens to have the SDK.
 
 ### Build with Bazel
 

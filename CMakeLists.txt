@@ -371,14 +371,29 @@ if(WITH_URMA)
     find_library(URMA_LIB NAMES urma
                  HINTS ENV URMA_ROOT
                  PATH_SUFFIXES lib lib64)
-    if(URMA_LIB)
+    # WITH_URMA_MOCK is an explicit opt-in, so it wins over auto-detection.
+    # Deciding by "is liburma installed?" would make a mock build mean
+    # different things on different machines -- a CI image without liburma
+    # gets the mock, a developer box with liburma silently gets a hardware
+    # build even though it asked for the mock. Bazel already resolves it this
+    # way (brpc_with_urma_mock is a specialization of brpc_with_urma, so it
+    # wins whenever both defines are set); this keeps CMake consistent.
+    if(WITH_URMA_MOCK)
+        if(URMA_LIB)
+            message(WARNING
+                "WITH_URMA_MOCK=ON, so brpc's URMA link-time mock is used "
+                "instead of the liburma found at ${URMA_LIB}. The mock "
+                "cannot talk to real URMA hardware -- drop WITH_URMA_MOCK "
+                "for a hardware build.")
+        else()
+            message(STATUS
+                "liburma not found; WITH_URMA_MOCK=ON, building with the "
+                "URMA link-time mock")
+        endif()
+        set(URMA_USE_MOCK 1)
+    elseif(URMA_LIB)
         message(STATUS "Found URMA library: ${URMA_LIB}")
         set(URMA_USE_MOCK 0)
-    elseif(WITH_URMA_MOCK)
-        message(STATUS
-            "liburma not found; WITH_URMA_MOCK=ON, building with the URMA "
-            "link-time mock")
-        set(URMA_USE_MOCK 1)
     else()
         message(FATAL_ERROR
             "Fail to find liburma. Install liburma, set URMA_ROOT, or "
