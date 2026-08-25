@@ -96,6 +96,11 @@ bool SupportedByUrma(const std::string& protocol);
 // Return the configured recv buffer size (one URMA recv WR's payload size).
 size_t GetUrmaRecvBlockSize();
 
+// Largest payload a single URMA SEND WR may carry: the smaller of the
+// device's max_msg_size and the CTP transport's 4096-byte message limit.
+// Sends above this bound are silently dropped, not rejected.
+size_t GetUrmaMaxMsgSize();
+
 // Return max_sge supported by the device.
 int GetUrmaMaxSge();
 

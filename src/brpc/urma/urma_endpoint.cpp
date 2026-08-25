@@ -690,7 +690,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         max_sge = kUrmaMaxSgePerWr;
     }
 
-    urma_sge_t sglist[kUrmaMaxSgePerWr];
+    // Zero-initialize: cut_into_sglist() fills addr/len/tseg but not
+    // user_tseg, and a stack-garbage handle there is undefined behaviour
+    // waiting to happen.
+    urma_sge_t sglist[kUrmaMaxSgePerWr] = {};
 
     size_t current = 0;
     ssize_t total_len = 0;
@@ -710,6 +713,19 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         size_t max_len = _remote_recv_block_size > 0
                              ? _remote_recv_block_size
                              : GetUrmaRecvBlockSize();
+        // The peer's recv block is only half the story: a single SEND must
+        // also fit the transport's max message size (4096B on CTP, which is
+        // what brpc advertises). urma_post_jetty_send_wr accepts an over-size
+        // WR and reports a successful completion, but the payload never
+        // arrives intact, so the peer's parser stalls and the RPC fails only
+        // on timeout with no error logged anywhere. Split here instead; the
+        // receiver already appends each completion to _read_buf in order, so
+        // the protocol parser reassembles the message exactly as it does for
+        // messages larger than one recv block.
+        const size_t msg_cap = GetUrmaMaxMsgSize();
+        if (msg_cap > 0 && max_len > msg_cap) {
+            max_len = msg_cap;
+        }
         while (sge_index < static_cast<size_t>(max_sge) &&
                this_len < max_len && current < ndata) {
             auto* data = reinterpret_cast<UrmaIOBuf*>(from[current]);
@@ -927,10 +943,52 @@ int UrmaEndpoint::SendAck(int num) {
     return 0;
 }
 
+// urma_cr_status_t has no vendor-provided to-string helper, and the bare
+// number is not much use in a bug report. Keep the spelling identical to
+// urma_opcode.h so it can be grepped against the SDK.
+static const char* UrmaCrStatusStr(urma_cr_status_t status) {
+    switch (status) {
+    case URMA_CR_SUCCESS:                return "SUCCESS";
+    case URMA_CR_UNSUPPORTED_OPCODE_ERR: return "UNSUPPORTED_OPCODE_ERR";
+    case URMA_CR_LOC_LEN_ERR:            return "LOC_LEN_ERR";
+    case URMA_CR_LOC_OPERATION_ERR:      return "LOC_OPERATION_ERR";
+    case URMA_CR_LOC_ACCESS_ERR:         return "LOC_ACCESS_ERR";
+    case URMA_CR_REM_RESP_LEN_ERR:       return "REM_RESP_LEN_ERR";
+    case URMA_CR_REM_UNSUPPORTED_REQ_ERR: return "REM_UNSUPPORTED_REQ_ERR";
+    case URMA_CR_REM_OPERATION_ERR:      return "REM_OPERATION_ERR";
+    case URMA_CR_REM_ACCESS_ABORT_ERR:   return "REM_ACCESS_ABORT_ERR";
+    case URMA_CR_ACK_TIMEOUT_ERR:        return "ACK_TIMEOUT_ERR";
+    case URMA_CR_RNR_RETRY_CNT_EXC_ERR:  return "RNR_RETRY_CNT_EXC_ERR";
+    case URMA_CR_WR_FLUSH_ERR:           return "WR_FLUSH_ERR";
+    case URMA_CR_WR_SUSPEND_DONE:        return "WR_SUSPEND_DONE";
+    case URMA_CR_WR_FLUSH_ERR_DONE:      return "WR_FLUSH_ERR_DONE";
+    case URMA_CR_WR_UNHANDLED:           return "WR_UNHANDLED";
+    case URMA_CR_LOC_DATA_POISON:        return "LOC_DATA_POISON";
+    case URMA_CR_REM_DATA_POISON:        return "REM_DATA_POISON";
+    default:                             return "UNKNOWN";
+    }
+}
+
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        LOG(WARNING) << "URMA completion failed, status=" << cr.status;
+        // A bare status number cannot tell a send failure from a recv one,
+        // which is the first thing anyone needs to know here.
+        LOG(WARNING) << "URMA completion failed: status=" << cr.status
+                     << " (" << UrmaCrStatusStr(cr.status) << ')'
+                     << ", dir=" << (cr.flag.bs.s_r == 0 ? "send" : "recv")
+                     << ", opcode=" << static_cast<int>(cr.opcode)
+                     << ", user_ctx=" << cr.user_ctx
+                     << ", completion_len=" << cr.completion_len
+                     << ", local_id=" << cr.local_id
+                     << ", remote_jetty_id=" << cr.remote_id.id
+                     << ", tpn=" << cr.tpn
+                     << ", sq_window=" << _sq_window_size.load(
+                            butil::memory_order_relaxed)
+                     << ", remote_rq_window=" << _remote_rq_window_size.load(
+                            butil::memory_order_relaxed)
+                     << ", state=" << GetStateStr()
+                     << " on " << _socket->description();
         errno = EIO;
         return -1;
     }

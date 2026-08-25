@@ -79,6 +79,11 @@ DEFINE_int32(urma_zerocopy_min_size, 512,
 
 DEFINE_string(urma_device, "",
               "The name of the URMA device to use. Empty means the first one.");
+DEFINE_int32(urma_max_msg_size, 0,
+             "Largest payload a single URMA SEND WR may carry, in bytes. "
+             "0 means the built-in default (the CTP message limit), and any "
+             "value is still clamped by the device's max_msg_size. Raise it "
+             "only if the transport in use really carries larger messages.");
 DEFINE_int32(urma_max_sge, 0,
              "Max SGEs per WR. 0 means the device maximum.");
 DEFINE_int32(urma_bonding_mode, 0,
@@ -118,6 +123,15 @@ static bool g_has_local_eid = false;
 static urma_device_attr_t g_device_attr{};
 static int g_max_sge = 1;
 static size_t g_recv_block_size = 8 * 1024;
+// brpc always advertises URMA_CTP (see MakeLocalParsedHello) and selects the
+// CTP jetty priority, and UMDK caps a single CTP message at 4096 bytes
+// (UMQ_CTP_MAX_BUF_SIZE in src/urpc/umq/umq_ub/core/private/umq_ub.c). A
+// larger SEND is not rejected by urma_post_jetty_send_wr -- it is silently
+// dropped or truncated, so the peer's parser waits forever for the rest of a
+// message that never arrives and the RPC only fails on timeout, with clean
+// logs on both sides. The send path must therefore split at this bound.
+static const size_t URMA_CTP_MAX_MSG_SIZE = 4096;
+static size_t g_max_msg_size = URMA_CTP_MAX_MSG_SIZE;
 static bool g_is_bonding_device = false;
 // Prefer the device capability table and retain priority 6 as a compatibility
 // fallback for CTP providers that do not report a priority.
@@ -582,6 +596,19 @@ static bool GlobalUrmaInitializeImpl() {
         static_cast<size_t>(FLAGS_urma_buffer_size) -
         sizeof(butil::IOBuf::Block);
 
+    // Never post a SEND larger than the transport can actually carry. 0 means
+    // "use the built-in default", which is the CTP message limit clamped by
+    // whatever the device reports.
+    if (FLAGS_urma_max_msg_size > 0) {
+        g_max_msg_size = static_cast<size_t>(FLAGS_urma_max_msg_size);
+    } else {
+        g_max_msg_size = URMA_CTP_MAX_MSG_SIZE;
+    }
+    const uint64_t dev_max_msg = g_device_attr.dev_cap.max_msg_size;
+    if (dev_max_msg > 0 && dev_max_msg < g_max_msg_size) {
+        g_max_msg_size = static_cast<size_t>(dev_max_msg);
+    }
+
     // User-segment table.
     g_user_segs_lock = new (std::nothrow) butil::Mutex;
     g_user_segs = new (std::nothrow) butil::FlatMap<void*, UserSeg>();
@@ -630,7 +657,9 @@ static bool GlobalUrmaInitializeImpl() {
               << " bonding=" << g_is_bonding_device
               << " max_sge=" << g_max_sge
               << " buffer_size=" << g_pool_buffer_size
-              << " buffer_count=" << g_pool->buffer_count();
+              << " buffer_count=" << g_pool->buffer_count()
+              << " max_msg_size=" << g_max_msg_size
+              << " dev_max_msg_size=" << g_device_attr.dev_cap.max_msg_size;
     return true;
 }
 
@@ -688,6 +717,7 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
 }
 uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
 int GetUrmaMaxSge() { return g_max_sge; }
+size_t GetUrmaMaxMsgSize() { return g_max_msg_size; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }
 
 // ============================================================================
