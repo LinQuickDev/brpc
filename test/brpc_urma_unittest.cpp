@@ -606,7 +606,7 @@ TEST_F(UrmaMockTest,
     urma_delete_context(ctx);
     urma_free_device_list(devices);
 }
-TEST(UrmaHandshakeTest, v2_client_falls_back_to_tcp_server) {
+TEST(UrmaFallbackIntegrationTest, v2_client_falls_back_to_tcp_server) {
     urma::g_skip_urma_init = false;
 
     UrmaFallbackEchoService service;
