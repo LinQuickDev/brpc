@@ -16,7 +16,11 @@
 // under the License.
 
 #include "brpc/policy/rdma_handshake_protocol.h"
+#include <cstring>
 
+#if BRPC_WITH_URMA
+#include "brpc/urma/urma_handshake_server.h"
+#endif
 #include "butil/logging.h"
 #include "brpc/destroyable.h"
 #include "brpc/rdma/rdma_handshake_server.h"
@@ -26,6 +30,18 @@ namespace policy {
 
 ParseResult ParseRdmaHandshake(butil::IOBuf* source, Socket* socket,
                                bool /*read_eof*/, const void* /*arg*/) {
+#if BRPC_WITH_URMA
+    if (source->size() >= 4) {
+        char magic[4];
+        source->copy_to(magic, sizeof(magic));
+
+        if (std::memcmp(magic, "URMA", sizeof(magic)) == 0 ||
+            std::memcmp(magic, "URM3", sizeof(magic)) == 0) {
+            return urma::ExecuteFallbackServerHandshake(source, socket);
+        }
+    }
+#endif
+
     return rdma::ExecuteServerHandshake(source, socket);
 }
 
