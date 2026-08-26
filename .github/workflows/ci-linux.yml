@@ -2,7 +2,7 @@ name: Build and Test on Linux
 
 on:
   push:
-    branches: [ master, urma_transport_dev ]
+    branches: [ master ]
     paths-ignore:
       - '**.md'
   pull_request:
@@ -127,9 +127,8 @@ jobs:
     - uses: actions/checkout@v2
     - uses: ./.github/actions/install-all-dependencies
     - name: fetch UMDK headers
-      # config_brpc.sh has no DOWNLOAD_URMA_HEADERS equivalent (CMake) and no
-      # @umdk repository rule (Bazel), so fetch the same pinned UMDK revision
-      # by hand and hand the include dirs to --headers.
+      # The Makefile path accepts include directories but does not download UMDK
+      # headers, so fetch the same pinned revision and pass it via --headers.
       run: git clone --depth 1 --branch v26.06.0_CAM https://atomgit.com/openeuler/umdk.git "$HOME/umdk"
     - name: compile with make (URMA link-time mock)
       run: |
