@@ -241,6 +241,17 @@ public:
 private:
     static T _instance;
 
+#if GOOGLE_PROTOBUF_VERSION >= 5029000
+    static void* PlacementNew_(const void*, void* mem,
+                               ::google::protobuf::Arena* arena) {
+        T* message = ::new (mem) T();
+        if (arena != nullptr) {
+            arena->OwnDestructor(message);
+        }
+        return message;
+    }
+#endif
+
 #if GOOGLE_PROTOBUF_VERSION >= 5027000
     struct NonreflectableMessageClassData : ClassDataFull {
         constexpr NonreflectableMessageClassData()
@@ -251,7 +262,10 @@ private:
                                 nullptr,    // tc_table
                                 nullptr,    // is_initialized
                                 nullptr,    // merge_to_from
-                                ::google::protobuf::internal::MessageCreator(), // message_creator
+                                ::google::protobuf::internal::MessageCreator(
+                                        &NonreflectableMessage::PlacementNew_,
+                                        sizeof(T),
+                                        static_cast<uint8_t>(alignof(T))), // message_creator
                                 0,     // cached_size_offset
                                 false, // is_lite
                         },
@@ -265,7 +279,10 @@ private:
                                 nullptr,    // on_demand_register_arena_dtor
                                 nullptr,    // is_initialized
                                 nullptr,    // merge_to_from
-                                ::google::protobuf::internal::MessageCreator(), // message_creator
+                                ::google::protobuf::internal::MessageCreator(
+                                        &NonreflectableMessage::PlacementNew_,
+                                        sizeof(T),
+                                        static_cast<uint8_t>(alignof(T))), // message_creator
                                 0,     // cached_size_offset
                                 false, // is_lite
                         },
