@@ -35,6 +35,7 @@
 namespace brpc {
 
 DECLARE_bool(usercode_in_pthread);
+DECLARE_uint64(max_body_size);
 DECLARE_int64(socket_max_streams_unconsumed_bytes);
 DEFINE_uint64(stream_write_max_segment_size, 512 * 1024 * 1024,
               "Stream message exceeding this size will be automatically split into smaller segments");
@@ -54,6 +55,7 @@ Stream::Stream(Forbidden f)
     , _local_consumed(0)
     , _atomic_local_consumed(0)
     , _parse_rpc_response(false)
+    , _server_accepted_stream(false)
     , _pending_buf(nullptr)
     , _start_idle_timer_us(0)
     , _idle_timer(0) {
@@ -94,6 +96,7 @@ int Stream::OnCreated(const StreamOptions& options,
     _local_consumed = 0;
     _atomic_local_consumed.store(0, butil::memory_order_relaxed);
     _parse_rpc_response = parse_rpc_response;
+    _server_accepted_stream = (remote_settings != nullptr);
     _pending_buf = nullptr;
     _start_idle_timer_us = 0;
     _idle_timer = 0;
@@ -584,11 +587,20 @@ void Stream::SetConnected(const StreamSettings* remote_settings) {
 
 int Stream::OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* sock) {
     if (!_connected.load(butil::memory_order_acquire)) {
-        // Before connection is published, let the locked slow path initialize
-        // the host socket or confirm that another thread already did so.
-        if (SetHostSocket(sock) != 0) {
+        if (_server_accepted_stream) {
+            BAIDU_SCOPED_LOCK(_connect_mutex);
+            if (_host_socket == nullptr || _host_socket->id() != sock->id()) {
+                LOG(WARNING) << "stream=" << id()
+                             << " dropped a frame from a foreign socket";
+                return -1;
+            }
+        } else if (SetHostSocket(sock) != 0) {
             return -1;
         }
+    } else if (_host_socket == nullptr || _host_socket->id() != sock->id()) {
+        LOG(WARNING) << "stream=" << id()
+                     << " dropped a frame from a foreign socket";
+        return -1;
     }
 
     switch (fm.frame_type()) {
@@ -599,6 +611,19 @@ int Stream::OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* soc
         CHECK(buf->empty());
         break;
     case FRAME_TYPE_DATA:
+        if (buf->length() > FLAGS_max_body_size ||
+            (_pending_buf != nullptr &&
+             _pending_buf->length() > FLAGS_max_body_size - buf->length())) {
+            LOG(WARNING) << "Close stream=" << id()
+                         << " whose pending message size="
+                         << (_pending_buf != nullptr ? _pending_buf->length() : 0)
+                         << " plus frame size=" << buf->length()
+                         << " exceeds max_body_size=" << FLAGS_max_body_size;
+            delete _pending_buf;
+            _pending_buf = nullptr;
+            Close(EMSGSIZE, "Reassembled stream message is too large");
+            return -1;
+        }
         if (_pending_buf != nullptr) {
             _pending_buf->append(*buf);
             buf->clear();
@@ -758,7 +783,7 @@ int Stream::SetHostSocket(Socket* host_socket) {
         return -1;
     }
     if (_host_socket != nullptr) {
-        return 0;
+        return _host_socket->id() == host_socket->id() ? 0 : -1;
     }
 
     SocketUniquePtr ptr;
