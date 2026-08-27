@@ -43,6 +43,7 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
+#include "brpc/reloadable_flags.h"
 #include "brpc/urma/urma_bonding.h"
 #include "brpc/urma/urma_endpoint.h"
 
@@ -70,6 +71,22 @@ DEFINE_int32(urma_sq_size, 128,
              "Depth of the local send jetty (JFS). [16, 4096]");
 DEFINE_int32(urma_rq_size, 128,
              "Depth of the local recv jetty (JFR). [16, 4096]");
+
+// Jetty depths are handed straight to the URMA SDK and stored in uint16_t
+// fields of UrmaEndpoint. Reject out-of-range values at flag-parsing time
+// instead of silently clamping them, so a misconfiguration fails loudly
+// before any endpoint is constructed.
+static bool ValidateJettyDepth(const char* name, int32_t value) {
+    if (value < 16 || value > 4096) {
+        LOG(ERROR) << "Invalid value of --" << name << ": " << value
+                   << ", which must be in [16, 4096]";
+        return false;
+    }
+    return true;
+}
+BRPC_VALIDATE_GFLAG(urma_sq_size, ValidateJettyDepth);
+BRPC_VALIDATE_GFLAG(urma_rq_size, ValidateJettyDepth);
+
 DEFINE_int32(urma_cqe_poll_once, 32,
              "Max completion entries polled per urma_poll_jfc call");
 DEFINE_bool(urma_recv_zerocopy, true,
@@ -479,17 +496,32 @@ static void GlobalRelease() {
 // ============================================================================
 
 static bool GlobalUrmaInitializeImpl() {
+    // --urma_sq_size / --urma_rq_size are already rejected at flag-parsing
+    // time by ValidateJettyDepth(), so they cannot be out of range here.
+    // The rest are checked one flag at a time so the error names the
+    // offending flag and its value. These run before the g_skip_urma_init
+    // shortcut so the mock path is validated too.
+    if (FLAGS_urma_buffer_size < 1024) {
+        LOG(ERROR) << "Invalid value of --urma_buffer_size: "
+                   << FLAGS_urma_buffer_size << ", which must be >= 1024";
+        errno = EINVAL;
+        return false;
+    }
+    if (FLAGS_urma_buffer_count <= 0) {
+        LOG(ERROR) << "Invalid value of --urma_buffer_count: "
+                   << FLAGS_urma_buffer_count << ", which must be > 0";
+        errno = EINVAL;
+        return false;
+    }
+    if (FLAGS_urma_poller_num <= 0) {
+        LOG(ERROR) << "Invalid value of --urma_poller_num: "
+                   << FLAGS_urma_poller_num << ", which must be > 0";
+        errno = EINVAL;
+        return false;
+    }
     if (BAIDU_UNLIKELY(g_skip_urma_init)) {
         g_urma_available.store(true, butil::memory_order_release);
         return true;
-    }
-    if (FLAGS_urma_sq_size < 16 || FLAGS_urma_sq_size > 4096 ||
-        FLAGS_urma_rq_size < 16 || FLAGS_urma_rq_size > 4096 ||
-        FLAGS_urma_buffer_size < 1024 || FLAGS_urma_buffer_count <= 0 ||
-        FLAGS_urma_poller_num <= 0) {
-        LOG(ERROR) << "Invalid URMA queue, buffer, or poller configuration";
-        errno = EINVAL;
-        return false;
     }
 
     urma_init_attr_t init_attr{};

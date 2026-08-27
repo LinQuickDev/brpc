@@ -148,11 +148,11 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
       _state(UNINIT),
       _handshake_version(0),
       _resource(nullptr) {
-    // FLAGS_urma_sq_size / FLAGS_urma_rq_size are range-checked to [16, 4096]
-    // once in GlobalUrmaInitializeImpl() (urma_helper.cpp), which every path
-    // that can construct a UrmaEndpoint (UrmaTransport::Init(), gated by
-    // ContextInitOrDie()) runs before any endpoint exists. No need to
-    // re-clamp here.
+    // FLAGS_urma_sq_size / FLAGS_urma_rq_size are validated to [16, 4096] by
+    // the gflags validators registered in urma_helper.cpp, which reject an
+    // out-of-range value at flag-parsing time. They can never be out of range
+    // here, so no clamping is needed -- and silently clamping would hide a
+    // misconfiguration instead of reporting it.
     _sq_size = static_cast<uint16_t>(FLAGS_urma_sq_size);
     _rq_size = static_cast<uint16_t>(FLAGS_urma_rq_size);
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
