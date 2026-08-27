@@ -21,6 +21,7 @@
 #include <ctime>
 #include <atomic>
 #include <unordered_map>
+#include <memory>
 #include <mutex>
 #include "bthread/types.h"
 #include "bthread/unstable.h"
@@ -47,12 +48,12 @@ struct TimerContext{
     uint32_t periodical;
     timespec interval;
     bthread_timer_t timer_id;
-    pthread_spinlock_t spin_lock;
+    std::shared_ptr<TimerContext> self_ref;
 };
 
-extern std::unordered_map<uint32_t, TimerContext> g_timer_ctx_map;
+extern std::unordered_map<uint64_t, std::shared_ptr<TimerContext>> g_timer_ctx_map;
 extern std::mutex g_timer_ctx_mutex;
-extern std::atomic<uint32_t> g_total_timer_num;
+extern std::atomic<uint64_t> g_total_timer_num;
 
 
 int TimerInit(void);
