@@ -233,32 +233,14 @@ public:
             "Close connection after delay");
     }
 };
-class RedisEchoChannel : public brpc::ChannelBase {
+class PingCommandHandler : public brpc::RedisCommandHandler {
 public:
-    void CallMethod(const google::protobuf::MethodDescriptor*,
-                    google::protobuf::RpcController* controller,
-                    const google::protobuf::Message*,
-                    google::protobuf::Message* response,
-                    google::protobuf::Closure* done) override {
-        static_cast<brpc::Controller*>(controller)->_response = response;
-        brpc::RedisResponse* redis_response =
-            static_cast<brpc::RedisResponse*>(response);
-        butil::IOBuf buf;
-        buf.append("+OK\r\n");
-        ASSERT_EQ(brpc::PARSE_OK,
-                  redis_response->ConsumePartialIOBuf(buf, 1));
-        pthread_t tid;
-        ASSERT_EQ(0, pthread_create(&tid, nullptr, RunDone, done));
-        ASSERT_EQ(0, pthread_detach(tid));
-    }
-
-    int CheckHealth() override { return 0; }
-    int Weight() override { return 1; }
-
-private:
-    static void* RunDone(void* arg) {
-        static_cast<google::protobuf::Closure*>(arg)->Run();
-        return nullptr;
+    brpc::RedisCommandHandlerResult Run(
+            const std::vector<butil::StringPiece>&,
+            brpc::RedisReply* output,
+            bool) override {
+        output->SetStatus("PONG");
+        return brpc::REDIS_CMD_HANDLED;
     }
 };
 
@@ -2561,21 +2543,35 @@ TEST_F(ChannelTest, empty_selective_channel) {
     EXPECT_EQ(ENODATA, cntl.ErrorCode()) << cntl.ErrorText();
 }
 TEST_F(ChannelTest, selective_channel_supports_nonreflectable_response) {
-    brpc::SelectiveChannel channel;
-    ASSERT_EQ(0, channel.Init("rr", nullptr));
-    ASSERT_EQ(0, channel.AddChannel(new RedisEchoChannel, nullptr));
+    PingCommandHandler ping_handler;
+    std::unique_ptr<brpc::RedisService> redis_service(new brpc::RedisService);
+    ASSERT_TRUE(redis_service->AddCommandHandler("ping", &ping_handler));
+
+    brpc::Server server;
+    brpc::ServerOptions server_options;
+    server_options.redis_service = redis_service.release();
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+
+    brpc::ChannelOptions channel_options;
+    channel_options.protocol = brpc::PROTOCOL_REDIS;
+    std::unique_ptr<brpc::Channel> sub_channel(new brpc::Channel);
+    ASSERT_EQ(0, sub_channel->Init(server.listen_address(), &channel_options));
 
     brpc::Controller cntl;
     brpc::RedisRequest request;
     brpc::RedisResponse response;
     ASSERT_TRUE(request.AddCommand("ping"));
 
+    brpc::SelectiveChannel channel;
+    ASSERT_EQ(0, channel.Init("rr", nullptr));
+    ASSERT_EQ(0, channel.AddChannel(sub_channel.release(), nullptr));
+
     cntl.set_timeout_ms(1000);
     channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(1, response.reply_size());
     ASSERT_EQ(brpc::REDIS_REPLY_STATUS, response.reply(0).type());
-    ASSERT_EQ("OK", response.reply(0).data());
+    ASSERT_EQ("PONG", response.reply(0).data());
 }
 
 class BadCall : public brpc::CallMapper {

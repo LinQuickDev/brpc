@@ -103,11 +103,14 @@ public:
     }
 
     bool CopyFromSameType(const ::google::protobuf::Message& other) override {
-        const T* same_type_other = dynamic_cast<const T*>(&other);
-        if (same_type_other == nullptr) {
+        if (&other == this) {
+            return true;
+        }
+        if (other.GetDescriptor() != descriptor()) {
             return false;
         }
-        CopyFrom(*same_type_other);
+        Clear();
+        MergeFrom(static_cast<const T&>(other));
         return true;
     }
 
@@ -116,10 +119,12 @@ public:
             return;
         }
 
-        // Cross-type merging is meaningless, call implementation of subclass.
-        // These message types are intentionally not generated protobuf messages,
-        // so protobuf's generated-message cast may miss them.
-        const T* same_type_other = dynamic_cast<const T*>(&other);
+        // Cross-type merging is meaningless, call implementation of subclass
+#if GOOGLE_PROTOBUF_VERSION >= 3007000
+        const T* same_type_other = ::google::protobuf::DynamicCastToGenerated<T>(&other);
+#elif GOOGLE_PROTOBUF_VERSION >= 3000000
+        const T* same_type_other = ::google::protobuf::internal::DynamicCastToGenerated<const T>(&other);
+#endif // GOOGLE_PROTOBUF_VERSION
         if (same_type_other != nullptr) {
             MergeFrom(*same_type_other);
         } else {
