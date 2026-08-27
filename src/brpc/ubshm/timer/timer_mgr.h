@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include "bthread/types.h"
 #include "bthread/unstable.h"
 #include "brpc/ubshm/common/common.h"
@@ -43,12 +44,21 @@ constexpr long long NS_PER_SEC = 1000000000LL;
 typedef void * (*TimerCallback)(void *);
 
 struct TimerContext{
+    TimerContext()
+        : cb(nullptr), args(nullptr), periodical(false),
+          interval(), timer_id(0), stopped(false), no_reschedule(false),
+          running(0) {}
+
     TimerCallback cb;
     void *args;
-    uint32_t periodical;
+    bool periodical;
     timespec interval;
     bthread_timer_t timer_id;
-    std::shared_ptr<TimerContext> self_ref;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stopped;
+    bool no_reschedule;
+    int running;
 };
 
 extern std::unordered_map<uint64_t, std::shared_ptr<TimerContext>> g_timer_ctx_map;
