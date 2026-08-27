@@ -401,9 +401,11 @@ void SubDone::Run() {
         if (_cntl._response != main_cntl->_response) {
             NonreflectableMessageBase* nr_msg =
                 dynamic_cast<NonreflectableMessageBase*>(main_cntl->_response);
-            if (nr_msg == nullptr ||
-                !nr_msg->CopyFromSameType(*_cntl._response)) {
-                main_cntl->_response->CopyFrom(*_cntl._response);
+            if (nr_msg != nullptr) {
+                CHECK(nr_msg->CopyFromSameType(*_cntl._response));
+            } else {
+                main_cntl->_response->GetReflection()->Swap(
+                    main_cntl->_response, _cntl._response);
             }
         }
     }
