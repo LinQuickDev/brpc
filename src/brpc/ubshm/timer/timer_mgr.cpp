@@ -34,13 +34,13 @@ std::atomic<uint32_t> g_total_timer_num;
 static std::atomic<uint32_t> g_timer_id_counter(0);
 
 static void normalize_timespec(itimerspec *spec) {
-    if (spec->it_interval.tv_nsec >= 1000000000L) {
-        spec->it_interval.tv_sec += spec->it_interval.tv_nsec / 1000000000L;
-        spec->it_interval.tv_nsec %= 1000000000L;
+    if (spec->it_interval.tv_nsec >= NS_PER_SEC) {
+        spec->it_interval.tv_sec += spec->it_interval.tv_nsec / NS_PER_SEC;
+        spec->it_interval.tv_nsec %= NS_PER_SEC;
     }
-    if (spec->it_value.tv_nsec >= 1000000000L) {
-        spec->it_value.tv_sec += spec->it_value.tv_nsec / 1000000000L;
-        spec->it_value.tv_nsec %= 1000000000L;
+    if (spec->it_value.tv_nsec >= NS_PER_SEC) {
+        spec->it_value.tv_sec += spec->it_value.tv_nsec / NS_PER_SEC;
+        spec->it_value.tv_nsec %= NS_PER_SEC;
     }
 }
 

@@ -37,6 +37,8 @@ struct itimerspec
 namespace brpc {
 namespace ubring {
 
+constexpr long long NS_PER_SEC = 1000000000LL;
+
 typedef void * (*TimerCallback)(void *);
 
 struct TimerContext{
