@@ -247,8 +247,9 @@ public:
         buf.append("+OK\r\n");
         ASSERT_EQ(brpc::PARSE_OK,
                   redis_response->ConsumePartialIOBuf(buf, 1));
-        bthread_t tid;
-        ASSERT_EQ(0, bthread_start_urgent(&tid, nullptr, RunDone, done));
+        pthread_t tid;
+        ASSERT_EQ(0, pthread_create(&tid, nullptr, RunDone, done));
+        ASSERT_EQ(0, pthread_detach(tid));
     }
 
     int CheckHealth() override { return 0; }
