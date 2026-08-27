@@ -46,7 +46,9 @@ constexpr size_t kSavedXmmRegisterSlots =
     kSavedXmmRegisterCount * kSavedXmmRegisterBytes / sizeof(uintptr_t);
 constexpr size_t kRbpContextSlot = 6 + kSavedXmmRegisterSlots;
 constexpr size_t kRipContextSlot = 7 + kSavedXmmRegisterSlots;
+#if UNW_VERSION_MAJOR >= 1 && UNW_VERSION_MINOR >= 7
 constexpr size_t kRspContextSlot = 8 + kSavedXmmRegisterSlots;
+#endif
 
 }  // namespace
 
