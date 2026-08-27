@@ -25,6 +25,11 @@
 
 namespace brpc {
 
+class NonreflectableMessageBase : public ::google::protobuf::Message {
+public:
+    virtual bool CopyFromSameType(const ::google::protobuf::Message& other) = 0;
+};
+
 //
 // In bRPC, some non-Protobuf based protocol messages are also designed to implement
 // Protobuf Message interfaces, to provide a unified protocol message.
@@ -38,7 +43,7 @@ namespace brpc {
 // and use only #if version_check #endif, to make maintenance easier.
 //
 template <typename T>
-class NonreflectableMessage : public ::google::protobuf::Message {
+class NonreflectableMessage : public NonreflectableMessageBase {
 public:
     inline NonreflectableMessage() = default;
     inline NonreflectableMessage(const NonreflectableMessage&) : NonreflectableMessage() {}
@@ -97,17 +102,24 @@ public:
         MergeFrom(other);
     }
 
+    bool CopyFromSameType(const ::google::protobuf::Message& other) override {
+        const T* same_type_other = dynamic_cast<const T*>(&other);
+        if (same_type_other == nullptr) {
+            return false;
+        }
+        CopyFrom(*same_type_other);
+        return true;
+    }
+
     void MergeFrom(const ::google::protobuf::Message& other) PB_526_OVERRIDE {
         if (&other == this) {
             return;
         }
 
-        // Cross-type merging is meaningless, call implementation of subclass
-#if GOOGLE_PROTOBUF_VERSION >= 3007000
-        const T* same_type_other = ::google::protobuf::DynamicCastToGenerated<T>(&other);
-#elif GOOGLE_PROTOBUF_VERSION >= 3000000
-        const T* same_type_other = ::google::protobuf::internal::DynamicCastToGenerated<const T>(&other);
-#endif // GOOGLE_PROTOBUF_VERSION
+        // Cross-type merging is meaningless, call implementation of subclass.
+        // These message types are intentionally not generated protobuf messages,
+        // so protobuf's generated-message cast may miss them.
+        const T* same_type_other = dynamic_cast<const T*>(&other);
         if (same_type_other != nullptr) {
             MergeFrom(*same_type_other);
         } else {

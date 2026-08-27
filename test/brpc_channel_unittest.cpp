@@ -37,6 +37,7 @@
 #include "brpc/channel.h"
 #include "brpc/details/load_balancer_with_naming.h"
 #include "brpc/parallel_channel.h"
+#include "brpc/redis.h"
 #include "brpc/selective_channel.h"
 #include "brpc/socket_map.h"
 #include "brpc/controller.h"
@@ -230,6 +231,33 @@ public:
         }
         static_cast<brpc::Controller*>(cntl_base)->CloseConnection(
             "Close connection after delay");
+    }
+};
+class RedisEchoChannel : public brpc::ChannelBase {
+public:
+    void CallMethod(const google::protobuf::MethodDescriptor*,
+                    google::protobuf::RpcController* controller,
+                    const google::protobuf::Message*,
+                    google::protobuf::Message* response,
+                    google::protobuf::Closure* done) override {
+        static_cast<brpc::Controller*>(controller)->_response = response;
+        brpc::RedisResponse* redis_response =
+            static_cast<brpc::RedisResponse*>(response);
+        butil::IOBuf buf;
+        buf.append("+OK\r\n");
+        ASSERT_EQ(brpc::PARSE_OK,
+                  redis_response->ConsumePartialIOBuf(buf, 1));
+        bthread_t tid;
+        ASSERT_EQ(0, bthread_start_urgent(&tid, nullptr, RunDone, done));
+    }
+
+    int CheckHealth() override { return 0; }
+    int Weight() override { return 1; }
+
+private:
+    static void* RunDone(void* arg) {
+        static_cast<google::protobuf::Closure*>(arg)->Run();
+        return nullptr;
     }
 };
 
@@ -2530,6 +2558,23 @@ TEST_F(ChannelTest, empty_selective_channel) {
     req.set_message(__FUNCTION__);
     CallMethod(&channel, &cntl, &req, &res, false);
     EXPECT_EQ(ENODATA, cntl.ErrorCode()) << cntl.ErrorText();
+}
+TEST_F(ChannelTest, selective_channel_supports_nonreflectable_response) {
+    brpc::SelectiveChannel channel;
+    ASSERT_EQ(0, channel.Init("rr", nullptr));
+    ASSERT_EQ(0, channel.AddChannel(new RedisEchoChannel, nullptr));
+
+    brpc::Controller cntl;
+    brpc::RedisRequest request;
+    brpc::RedisResponse response;
+    ASSERT_TRUE(request.AddCommand("ping"));
+
+    cntl.set_timeout_ms(1000);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(1, response.reply_size());
+    ASSERT_EQ(brpc::REDIS_REPLY_STATUS, response.reply(0).type());
+    ASSERT_EQ("OK", response.reply(0).data());
 }
 
 class BadCall : public brpc::CallMapper {
