@@ -97,8 +97,9 @@ int SocketHandshakeIO::ReadExact(void* data, size_t len) {
         });
 }
 
-template <typename WriteOnce>
-static int WriteAllLoop(Socket* socket, size_t len, WriteOnce write_once) {
+template <typename WriteOnce, typename WaitWritable>
+static int WriteAllLoop(size_t len, WriteOnce write_once,
+                        WaitWritable wait_writable) {
     size_t written = 0;
     while (written < len) {
         const timespec duetime = butil::milliseconds_from_now(WAIT_TIMEOUT_MS);
@@ -114,7 +115,7 @@ static int WriteAllLoop(Socket* socket, size_t len, WriteOnce write_once) {
         if (errno != EAGAIN) {
             return -1;
         }
-        if (socket->WaitEpollOut(socket->fd(), true, &duetime) < 0 &&
+        if (wait_writable(&duetime) < 0 &&
             errno != ETIMEDOUT) {
             return -1;
         }
@@ -126,10 +127,14 @@ int SocketHandshakeIO::WriteAll(const void* data, size_t len) {
     CHECK(data != NULL);
     CHECK(_socket != NULL);
     const int fd = _socket->fd();
-    return WriteAllLoop(_socket, len,
+    return WriteAllLoop(len,
         [data, fd](size_t offset, size_t remaining) {
             return write(fd, static_cast<const uint8_t*>(data) + offset,
                          remaining);
+        },
+        [this](const timespec* duetime) {
+            return _socket->WaitEpollOut(
+                _socket->fd(), true, duetime);
         });
 }
 

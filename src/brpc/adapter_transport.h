@@ -77,8 +77,7 @@ public:
     static void OnNewDataFromTcp(Socket* socket);
 
 private:
-    explicit AdapterTransport(SocketMode mode)
-        : _mode(mode), _connection_completed(0) {}
+    explicit AdapterTransport(SocketMode mode);
     ~AdapterTransport() override;
 
     Transport* ActiveTransport() const;

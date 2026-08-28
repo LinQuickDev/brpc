@@ -446,16 +446,6 @@ static void GlobalInitializeOrDieImpl() {
                                            CONNECTION_TYPE_ALL,
                                            "rdma_handshake"};
 
-  Protocol rdma_handshake_protocol = {ParseRdmaHandshake,
-                                      nullptr,
-                                      nullptr,
-                                      ProcessRdmaHandshake,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      nullptr,
-                                      CONNECTION_TYPE_ALL,
-                                      "rdma_handshake"};
   // Retain the existing enum value and registered name to avoid changing
   // public protocol identifiers while widening the implementation from RDMA
   // to all transport upgrades.

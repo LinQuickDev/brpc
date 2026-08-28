@@ -51,7 +51,7 @@ public:
             socket, _app_connect, done, data};
         if (AdapterTransport::StartClientUpgrade(
                 socket, OnUpgradeComplete, task) != 0) {
-            AdapterTransport::Get(socket)->CompleteConnection(
+            AdapterTransport::Get(const_cast<Socket*>(socket))->CompleteConnection(
                 handshake::FAILED);
             const int error = errno != 0 ? errno : EAGAIN;
             delete task;
@@ -98,6 +98,8 @@ struct ClientHandshakeTask {
 
 }  // namespace
 
+AdapterTransport::AdapterTransport(SocketMode mode)
+    : _mode(mode), _connection_completed(0) {}
 AdapterTransport::~AdapterTransport() = default;
 
 AdapterTransport* AdapterTransport::Get(Socket* socket) {
@@ -127,7 +129,7 @@ int AdapterTransport::StartClientUpgrade(const Socket* socket,
 }
 
 ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
-    ParseResult result;
+    ParseResult result(PARSE_ERROR_NOT_ENOUGH_DATA);
     if (_socket->parsing_context() != NULL) {
         handshake::ServerHandshakeContext* context =
             static_cast<handshake::ServerHandshakeContext*>(
