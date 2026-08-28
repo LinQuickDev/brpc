@@ -25,7 +25,7 @@
 #include <mutex>
 #include <new>
 #include <vector>
-#include "bthread/bthread.h"
+#include "bthread/bthread.h"  // bthread_start_background
 #include "brpc/ubshm/timer/timer_mgr.h"
 
 namespace brpc {
@@ -78,18 +78,13 @@ struct TimerCallbackArgs {
 };
 
 static void RunTimerCallback(std::shared_ptr<TimerContext> ctx, uint64_t timer_id) {
-    {
-        std::lock_guard<bthread::Mutex> lock(ctx->mtx);
-        ctx->worker_tid = bthread_self();
-    }
-
     if (ctx->cb != nullptr) {
         ctx->cb(ctx->args);
     }
 
     bool need_remove = true;
     {
-        std::lock_guard<bthread::Mutex> lock(ctx->mtx);
+        std::lock_guard<std::mutex> lock(ctx->mtx);
         if (ctx->periodical && !ctx->stopped && !ctx->no_reschedule) {
             timespec abstime = add_timespec(get_current_realtime(), ctx->interval);
             if (bthread_timer_add(&ctx->timer_id, abstime, TimerCallbackWrapper,
@@ -102,13 +97,6 @@ static void RunTimerCallback(std::shared_ptr<TimerContext> ctx, uint64_t timer_i
     if (need_remove) {
         remove_timer_from_map(timer_id);
     }
-
-    {
-        std::lock_guard<bthread::Mutex> lock(ctx->mtx);
-        --ctx->running;
-        ctx->worker_tid = 0;
-    }
-    ctx->cv.notify_all();
 }
 
 static void *TimerCallbackWorker(void *arg) {
@@ -130,14 +118,11 @@ void TimerModuleDestroy() {
             contexts.push_back(pair.second);
         }
     }
+
     for (auto &ctx: contexts) {
-        {
-            std::lock_guard<bthread::Mutex> lock(ctx->mtx);
-            ctx->stopped = true;
-            bthread_timer_del(ctx->timer_id);
-        }
-        std::unique_lock<bthread::Mutex> lock(ctx->mtx);
-        ctx->cv.wait(lock, [&ctx] { return ctx->running == 0; });
+        std::lock_guard<std::mutex> lock(ctx->mtx);
+        ctx->stopped = true;
+        bthread_timer_del(ctx->timer_id);
     }
 
     {
@@ -183,34 +168,35 @@ uint32_t GetActiveTimerNum() {
     return g_total_timer_num.load();
 }
 
+// Hard delete: stop the timer so it never fires again. Non-blocking — it does
+// NOT wait for an in-flight callback; the caller is responsible for keeping
+// `args` alive until any already-running callback has returned.
 void DeleteTimerSafe(uint64_t timer_id) {
     std::shared_ptr<TimerContext> ctx;
     {
         std::lock_guard<std::mutex> lock(g_timer_ctx_mutex);
         auto it = g_timer_ctx_map.find(timer_id);
         if (it == g_timer_ctx_map.end()) {
+            LOG(WARNING) << "Timer id=" << timer_id << " not found";
             return;
         }
         ctx = it->second;
     }
 
-    bool self = false;
     {
-        std::lock_guard<bthread::Mutex> lock(ctx->mtx);
+        // Mark stopped and unschedule under ctx->mtx so this serializes with a
+        // concurrent reschedule (RunTimerCallback). After this scope no new
+        // firing can start a callback.
+        std::lock_guard<std::mutex> lock(ctx->mtx);
         ctx->stopped = true;
         bthread_timer_del(ctx->timer_id);
-        self = (bthread_self() != 0 && bthread_self() == ctx->worker_tid);
     }
-    if (self) {
-        return;
-    }
-
-    std::unique_lock<bthread::Mutex> lock(ctx->mtx);
-    ctx->cv.wait(lock, [&ctx] { return ctx->running == 0; });
 
     remove_timer_from_map(timer_id);
 }
 
+// Soft delete: stop future rescheduling but let the pending firing (if any)
+// run its callback once more, which then cleans itself up.
 void DeleteTimer(uint64_t timer_id) {
     std::shared_ptr<TimerContext> ctx;
     {
@@ -222,7 +208,7 @@ void DeleteTimer(uint64_t timer_id) {
         }
         ctx = it->second;
     }
-    std::lock_guard<bthread::Mutex> lock(ctx->mtx);
+    std::lock_guard<std::mutex> lock(ctx->mtx);
     ctx->no_reschedule = true;
 }
 
@@ -235,20 +221,22 @@ void TimerCallbackWrapper(void *arg) {
     }
 
     {
-        std::lock_guard<bthread::Mutex> lock(ctx->mtx);
+        std::lock_guard<std::mutex> lock(ctx->mtx);
         if (ctx->stopped) {
+            // Hard-deleted while this firing was in flight; don't run.
             return;
         }
-        ++ctx->running;
     }
 
     auto *holder = new (std::nothrow) TimerCallbackArgs{ctx, timer_id};
     if (holder == nullptr) {
+        // Allocation failed (OOM); run inline so the callback is not dropped.
         RunTimerCallback(ctx, timer_id);
         return;
     }
     bthread_t tid;
     if (bthread_start_background(&tid, nullptr, TimerCallbackWorker, holder) != 0) {
+        // Extremely unlikely (ENOMEM); fall back to running inline.
         delete holder;
         RunTimerCallback(ctx, timer_id);
     }

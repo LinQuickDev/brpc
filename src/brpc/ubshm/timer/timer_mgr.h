@@ -25,8 +25,6 @@
 #include <mutex>
 #include "bthread/types.h"
 #include "bthread/unstable.h"
-#include "bthread/mutex.h"
-#include "bthread/condition_variable.h"
 #include "brpc/ubshm/common/common.h"
 
 #if defined(OS_MACOSX)
@@ -47,20 +45,16 @@ typedef void * (*TimerCallback)(void *);
 struct TimerContext{
     TimerContext()
         : cb(nullptr), args(nullptr), periodical(false),
-          interval(), timer_id(0), stopped(false), no_reschedule(false),
-          running(0), worker_tid(0) {}
+          interval(), timer_id(0), stopped(false), no_reschedule(false) {}
 
     TimerCallback cb;
     void *args;
     bool periodical;
     timespec interval;
     bthread_timer_t timer_id;
-    bthread::Mutex mtx;
-    bthread::ConditionVariable cv;
+    std::mutex mtx;
     bool stopped;
     bool no_reschedule;
-    int running;
-    bthread_t worker_tid;
 };
 
 extern std::unordered_map<uint64_t, std::shared_ptr<TimerContext>> g_timer_ctx_map;
