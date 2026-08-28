@@ -25,7 +25,7 @@
 #include <mutex>
 #include <new>
 #include <vector>
-#include "bthread/bthread.h"  // bthread_start_background
+#include "bthread/bthread.h"
 #include "brpc/ubshm/timer/timer_mgr.h"
 
 namespace brpc {
@@ -168,9 +168,6 @@ uint32_t GetActiveTimerNum() {
     return g_total_timer_num.load();
 }
 
-// Hard delete: stop the timer so it never fires again. Non-blocking — it does
-// NOT wait for an in-flight callback; the caller is responsible for keeping
-// `args` alive until any already-running callback has returned.
 void DeleteTimerSafe(uint64_t timer_id) {
     std::shared_ptr<TimerContext> ctx;
     {
@@ -184,9 +181,6 @@ void DeleteTimerSafe(uint64_t timer_id) {
     }
 
     {
-        // Mark stopped and unschedule under ctx->mtx so this serializes with a
-        // concurrent reschedule (RunTimerCallback). After this scope no new
-        // firing can start a callback.
         std::lock_guard<std::mutex> lock(ctx->mtx);
         ctx->stopped = true;
         bthread_timer_del(ctx->timer_id);
@@ -195,8 +189,6 @@ void DeleteTimerSafe(uint64_t timer_id) {
     remove_timer_from_map(timer_id);
 }
 
-// Soft delete: stop future rescheduling but let the pending firing (if any)
-// run its callback once more, which then cleans itself up.
 void DeleteTimer(uint64_t timer_id) {
     std::shared_ptr<TimerContext> ctx;
     {
@@ -223,20 +215,17 @@ void TimerCallbackWrapper(void *arg) {
     {
         std::lock_guard<std::mutex> lock(ctx->mtx);
         if (ctx->stopped) {
-            // Hard-deleted while this firing was in flight; don't run.
             return;
         }
     }
 
     auto *holder = new (std::nothrow) TimerCallbackArgs{ctx, timer_id};
     if (holder == nullptr) {
-        // Allocation failed (OOM); run inline so the callback is not dropped.
         RunTimerCallback(ctx, timer_id);
         return;
     }
     bthread_t tid;
     if (bthread_start_background(&tid, nullptr, TimerCallbackWorker, holder) != 0) {
-        // Extremely unlikely (ENOMEM); fall back to running inline.
         delete holder;
         RunTimerCallback(ctx, timer_id);
     }
