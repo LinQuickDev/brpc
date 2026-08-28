@@ -78,7 +78,7 @@ struct TimerCallbackArgs {
 };
 
 static void RunTimerCallback(std::shared_ptr<TimerContext> ctx, uint64_t timer_id) {
-    if (ctx->cb != nullptr) {
+    if (ctx->cb != nullptr && !ctx->stopped) {
         ctx->cb(ctx->args);
     }
 
