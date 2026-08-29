@@ -34,6 +34,7 @@ typedef struct TagUbrMgr {
     uint32_t trx_cap;
     UbrTrx *trx_mgr;
     UbrMgrUnitStatus *trx_mgr_unit_status;
+    uint64_t *trx_mgr_unit_id;
 } UbrMgr;
 
 typedef struct TagUbrLinkInfo {
@@ -63,7 +64,11 @@ public:
 
     static RETURN_CODE AcquireUbrTrxFromMgr(UbrTrx **trx);
 
-    static RETURN_CODE ReleaseUbrTrxFromMgr(UbrTrx *trx);
+    // Release the pool slot of `trx'. `expect_ubr_id' must be snapshotted
+    // from trx->ubr_id before the caller started releasing the trx: a
+    // release racing a reuse of the same slot is refused.
+    static RETURN_CODE ReleaseUbrTrxFromMgr(UbrTrx *trx,
+                                            uint64_t expect_ubr_id);
 
     static void LinkInfoInit(void);
     static void LinkInfoFini(void);

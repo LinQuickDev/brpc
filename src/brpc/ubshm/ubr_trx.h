@@ -131,7 +131,7 @@ typedef struct TagUbrRx {
 typedef struct TagUbrTrx {
     UbrTx ubr_tx;
     UbrRx ubr_rx;
-    uint64_t ubr_id;
+    AtomicUintFast64 ubr_id;
     uint32_t trx_mgr_index;
     UbrTrxType type;
     SHM local_shm;
@@ -139,6 +139,9 @@ typedef struct TagUbrTrx {
     UbrTimerId close_timer;
     UbrTimerId hb_timer;
     UbrTimerId clear_timer;
+    // Write-once per acquisition: guards against scheduling a second
+    // delayed cleanup for the same trx. Reset by the pool memset on reuse.
+    AtomicBool clear_scheduled;
     // Last io ids seen by the close-check timer, used to reset its
     // back-off polling interval when the link has traffic.
     uint64_t close_chk_in_io_id;

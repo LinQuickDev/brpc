@@ -419,34 +419,44 @@ void *UbsShmCallback(void* args)
         return nullptr;
     }
 
-    LOCK_GUARD(shm_list->shm_lock);
-    while (shm_list->head != nullptr) {
-        SHM shm = shm_list->head->shm;
-        if (shm.addr == nullptr) {
-            LOG(ERROR) << "Ubs input shm param is invalid, addr is NULL.";
+    // Drain one node per fire and keep the SDK calls outside the lock, so
+    // a slow daemon cannot stall the timer thread for the whole list.
+    SHM shm;
+    {
+        LOCK_GUARD(shm_list->shm_lock);
+        if (shm_list->head == nullptr) {
             return nullptr;
         }
-
-        int ret = ubsmem_shmem_unmap(shm.addr, shm.len);
-        if (ret != UBSM_OK) {
-            if (ret == UBSM_ERR_NET) {
-                return nullptr;
-            }
-            LOG(ERROR) << "Ubs unmap shm=" << shm.name << " length=" << shm.len << " failed, ret=" << ret;
-            return nullptr;
-        }
-        LOG(INFO) << "Ubs unmap shm=" << shm.name << " length=" << shm.len << " success.";
-
-        ret = ubsmem_shmem_deallocate(shm.name);
-        if (ret != UBSM_OK) {
-            DeleteShmToList(shm_list);
-            LOG(ERROR) << "Ubs delete shm=" << shm.name << " failed, ret=" << ret;
-            return nullptr;
-        }
+        shm = shm_list->head->shm;
+    }
+    if (shm.addr == nullptr) {
+        LOG(ERROR) << "Ubs input shm param is invalid, addr is NULL.";
+        LOCK_GUARD(shm_list->shm_lock);
         DeleteShmToList(shm_list);
-        LOG(INFO) << "Ubs free local shm=" << shm.name << " length=" << shm.len << " success.";
+        return nullptr;
     }
 
+    int ret = ubsmem_shmem_unmap(shm.addr, shm.len);
+    if (ret != UBSM_OK) {
+        if (ret == UBSM_ERR_NET) {
+            return nullptr;              // retried on the next fire
+        }
+        LOG(ERROR) << "Ubs unmap shm=" << shm.name << " length=" << shm.len << " failed, ret=" << ret;
+        return nullptr;                  // node stays at head, retried
+    }
+    LOG(INFO) << "Ubs unmap shm=" << shm.name << " length=" << shm.len << " success.";
+
+    {
+        LOCK_GUARD(shm_list->shm_lock);
+        DeleteShmToList(shm_list);
+    }
+
+    ret = ubsmem_shmem_deallocate(shm.name);
+    if (ret != UBSM_OK) {
+        LOG(ERROR) << "Ubs delete shm=" << shm.name << " failed, ret=" << ret;
+        return nullptr;
+    }
+    LOG(INFO) << "Ubs free local shm=" << shm.name << " length=" << shm.len << " success.";
     return nullptr;
 }
 

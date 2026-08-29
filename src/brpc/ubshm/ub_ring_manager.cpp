@@ -54,6 +54,7 @@ RETURN_CODE UBRingManager::UbrMgrDefault()
     g_ubr_mgr.trx_cap = FLAGS_ubr_max_managed_num;
     g_ubr_mgr.trx_mgr_unit_status = nullptr;
     g_ubr_mgr.trx_mgr = nullptr;
+    g_ubr_mgr.trx_mgr_unit_id = nullptr;
     return UBRING_OK;
 }
 
@@ -68,8 +69,11 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
     g_ubr_mgr.trx_mgr = (UbrTrx *)malloc(trx_mgr_size);
     size_t trx_mgr_status_size = g_ubr_mgr.trx_cap * sizeof(UbrMgrUnitStatus);
     g_ubr_mgr.trx_mgr_unit_status = (UbrMgrUnitStatus *)malloc(trx_mgr_status_size);
+    size_t trx_mgr_id_size = g_ubr_mgr.trx_cap * sizeof(uint64_t);
+    g_ubr_mgr.trx_mgr_unit_id = (uint64_t *)malloc(trx_mgr_id_size);
     if (UNLIKELY(g_ubr_mgr.trx_mgr == nullptr ||
-                 g_ubr_mgr.trx_mgr_unit_status == nullptr)) {
+                 g_ubr_mgr.trx_mgr_unit_status == nullptr ||
+                 g_ubr_mgr.trx_mgr_unit_id == nullptr)) {
         LOG(ERROR) << "Ubr manager memory allocation failed.";
         UbrMgrFini();
         return UBRING_ERR;
@@ -77,6 +81,7 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
 
     memset(g_ubr_mgr.trx_mgr, 0, trx_mgr_size);
     memset(g_ubr_mgr.trx_mgr_unit_status, UBR_MGR_UNIT_FREE, trx_mgr_status_size);
+    memset(g_ubr_mgr.trx_mgr_unit_id, 0, trx_mgr_id_size);
     LinkInfoInit();
     return UBRING_OK;
 }
@@ -86,6 +91,7 @@ void UBRingManager::UbrMgrFini() {
         LOCK_GUARD(g_ubr_trx_mgr_mtx);
         FREE_PTR(g_ubr_mgr.trx_mgr);
         FREE_PTR(g_ubr_mgr.trx_mgr_unit_status);
+        FREE_PTR(g_ubr_mgr.trx_mgr_unit_id);
     }
     {
         LOCK_GUARD(g_ubr_listener_mgr_mtx);
@@ -118,10 +124,12 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
             g_ubr_mgr.trx_mgr[i].close_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].hb_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].clear_timer = nullptr;
+            g_ubr_mgr.trx_mgr[i].clear_scheduled.store(false);
             g_ubr_mgr.trx_mgr_unit_status[i] = UBR_MGR_UNIT_USED;
             *trx = &g_ubr_mgr.trx_mgr[i];
             (*trx)->trx_mgr_index = i;
-            (*trx)->ubr_id = g_ubr_trx_num;
+            ATOMIC_STORE((*trx)->ubr_id, g_ubr_trx_num);
+            g_ubr_mgr.trx_mgr_unit_id[i] = g_ubr_trx_num;
             (*trx)->close_state = UBR_CLOSE_FIRST;
             (*trx)->close_cnt = MAX_CLOSE_COUNT;
             ++g_ubr_mgr.trx_num;
@@ -133,7 +141,8 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
     return UBRING_ERR;
 }
 
-RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx) {
+RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx,
+                                                uint64_t expect_ubr_id) {
     if (UNLIKELY(trx == nullptr)) {
         LOG(ERROR) << "Release trx failed, trx is null.";
         return UBRING_ERR;
@@ -153,6 +162,13 @@ RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx) {
     uint32_t idx = trx->trx_mgr_index;
     if (g_ubr_mgr.trx_mgr_unit_status[idx] == UBR_MGR_UNIT_FREE) {
         LOG(INFO) << "Release trx already freed, name=" << trx->local_shm.name;
+        return UBRING_OK;
+    }
+
+    if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_id[idx] != expect_ubr_id)) {
+        // The slot was released and acquired again meanwhile; the stale
+        // caller must not free the new occupant.
+        LOG(WARNING) << "Release stale trx refused, name=" << trx->local_shm.name;
         return UBRING_OK;
     }
 

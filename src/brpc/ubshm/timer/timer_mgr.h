@@ -36,20 +36,14 @@ typedef struct UbrTimerTask* UbrTimerId;
 typedef uint64_t (*UbrTimerBackoffFn)(void* arg, uint64_t cur_interval_us);
 
 // Schedule `cb(arg)' to run after `delay_us' and, when `interval_us' > 0,
-// re-arm itself after every run until deleted. One-shot timers clear *slot
-// and release themselves when fired. The handle slot keeps the task object
-// alive, not `arg'.
+// re-arm itself after every run until deleted. One-shot timers release
+// their handle slot before running the callback, so the callback may free
+// the object that stores the slot; the task object itself is released
+// automatically.
 RETURN_CODE UbrTimerStart(UbrTimerId* slot, uint64_t delay_us,
                           uint64_t interval_us, void* (*cb)(void*),
                           void* arg,
                           UbrTimerBackoffFn backoff = nullptr);
-
-// Atomic check-and-start: UBRING_OK if scheduled by this call,
-// UBRING_REENTRY if *slot already holds a timer, UBRING_ERR on failure.
-RETURN_CODE UbrTimerStartOnce(UbrTimerId* slot, uint64_t delay_us,
-                              uint64_t interval_us, void* (*cb)(void*),
-                              void* arg,
-                              UbrTimerBackoffFn backoff = nullptr);
 
 // Non-blocking delete, safe from inside the timer callback itself. Does
 // not wait for a running callback and does not protect `arg'.
@@ -57,7 +51,9 @@ void UbrTimerDel(UbrTimerId* slot);
 
 // Delete and wait until a possibly running callback finished, so the
 // caller can free resources reachable from `arg'. Never call this on the
-// callback's own task.
+// callback's own task. A one-shot callback that is already running holds
+// the ownership of `arg' by itself (mirroring bthread_timer_del returning
+// 1) and cannot be waited for through the slot.
 void UbrTimerDelAndWait(UbrTimerId* slot);
 
 }  // namespace ubring

@@ -95,6 +95,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
             _trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
             // Wait out possibly running callbacks, including a delayed
             // clear one, before freeing what they may touch.
+            const uint64_t expect_ubr_id = ATOMIC_LOAD(_trx->ubr_id);
             UbrTimerDelAndWait(&_trx->close_timer);
             UbrTimerDelAndWait(&_trx->hb_timer);
             UbrTimerDelAndWait(&_trx->clear_timer);
@@ -104,7 +105,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
             if (UNLIKELY(UbrTrxFreeShm(_trx) != UBRING_OK)) {
                 LOG(WARNING) << "Force close, local shm " << _trx->local_shm.name << " free failed.";
             }
-            if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(_trx) != UBRING_OK)) {
+            if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(_trx, expect_ubr_id) != UBRING_OK)) {
                 LOG(WARNING) << "Force close, release trx " << _trx->local_shm.name << " failed.";
             }
             return UBRING_ERR_TIMEOUT;
@@ -267,15 +268,18 @@ RETURN_CODE UBRing::UbrPassiveClearTrx(UbrTrx *trx, int fd, PASSIVE_DISC_TYPE ty
     UbrTimerDel(&trx->close_timer);
     UbrTimerDel(&trx->hb_timer);
     // Wait for in-flight IO on a one-shot timer instead of sleeping on the
-    // timer thread.
-    RETURN_CODE clear_rc = UbrTimerStartOnce(
+    // timer thread. The write-once flag keeps concurrent close paths from
+    // scheduling a second delayed cleanup for this trx.
+    bool expected = false;
+    if (!ATOMIC_COMPARE_EXCHANGE_STRONG(trx->clear_scheduled, expected, true)) {
+        return UBRING_OK;
+    }
+    RETURN_CODE clear_rc = UbrTimerStart(
         &trx->clear_timer,
         (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
         UbrPassiveClearCallback, (void*)trx);
-    if (clear_rc == UBRING_REENTRY) {
-        return UBRING_OK;
-    }
     if (UNLIKELY(clear_rc != UBRING_OK)) {
+        ATOMIC_STORE(trx->clear_scheduled, false);
         LOG(ERROR) << type_name << ", add delayed clear timer failed, name=" << trx->local_shm.name;
         return UBRING_ERR;
     }
@@ -288,6 +292,7 @@ void* UBRing::UbrPassiveClearCallback(void* args) {
         LOG(ERROR) << "Trx passive clear callback failed, trx is null.";
         return nullptr;
     }
+    const uint64_t expect_ubr_id = ATOMIC_LOAD(trx->ubr_id);
 
     int rc = ShmLocalFree(&trx->remote_shm);
     if (rc != UBRING_OK) {
@@ -300,7 +305,7 @@ void* UBRing::UbrPassiveClearCallback(void* args) {
                    << " failed. ret=" << rc;
     }
 
-    if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(trx) != UBRING_OK)) {
+    if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(trx, expect_ubr_id) != UBRING_OK)) {
         LOG(ERROR) << "Trx passive clear, release shm " << trx->local_shm.name << " trx failed.";
     }
     return nullptr;
@@ -349,14 +354,16 @@ RETURN_CODE UBRing::UbrAddAsynClearTimer(UbrTrx *trx) {
         return UBRING_ERR;
     }
 
-    RETURN_CODE rc = UbrTimerStartOnce(
+    bool expected = false;
+    if (!ATOMIC_COMPARE_EXCHANGE_STRONG(trx->clear_scheduled, expected, true)) {
+        return UBRING_OK;
+    }
+    RETURN_CODE rc = UbrTimerStart(
         &trx->clear_timer,
         (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
         UbrAsynClearCallback, (void*)trx);
-    if (rc == UBRING_REENTRY) {
-        return UBRING_OK;
-    }
     if (UNLIKELY(rc != UBRING_OK)) {
+        ATOMIC_STORE(trx->clear_scheduled, false);
         LOG(ERROR) << "Start ubr clear timer failed, trx name=" << trx->local_shm.name;
         return UBRING_ERR;
     }
@@ -370,12 +377,13 @@ void *UBRing::UbrAsynClearCallback(void *args)
         LOG(ERROR) << "Trx close, trx is null.";
         return nullptr;
     }
+    const uint64_t expect_ubr_id = ATOMIC_LOAD(trx->ubr_id);
 
     if (UNLIKELY(UbrTrxFreeShm(trx) != UBRING_OK)) {
         LOG(ERROR) << "Trx close, wait for local shm " << trx->local_shm.name << " free fail.";
     }
 
-    if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(trx) != UBRING_OK)) {
+    if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(trx, expect_ubr_id) != UBRING_OK)) {
         LOG(ERROR) << "Trx close, release shm " << trx->local_shm.name << " trx failed.";
     }
     return nullptr;
@@ -875,7 +883,7 @@ int UBRing::UbrAllocateServerShm(SHM* remote_trx_shm, SHM* local_trx_shm) {
     if (UNLIKELY((UbrServerTrxInit(local_trx_shm, remote_trx_shm)) != UBRING_OK)) {
         LOG(ERROR) << "Server trx init failed.";
         UbrTrxFreeShm(_trx);
-        UBRingManager::ReleaseUbrTrxFromMgr(_trx);
+        UBRingManager::ReleaseUbrTrxFromMgr(_trx, ATOMIC_LOAD(_trx->ubr_id));
         _trx = nullptr;
         return -1;
     }
@@ -981,14 +989,14 @@ RETURN_CODE UBRing::ApplyAndMapLocalShm(SHM *local_trx_shm, const char *local_na
         if (rc == SHM_ERR_EXIST || rc == SHM_ERR_NOT_FOUND) {
             rc = UBR_ERR_ADDR_IN_USE;
         }
-        UBRingManager::ReleaseUbrTrxFromMgr(_trx);
+        UBRingManager::ReleaseUbrTrxFromMgr(_trx, ATOMIC_LOAD(_trx->ubr_id));
         return rc;
     }
     rc = UbrTrxMapLocalShm(local_trx_shm);
     if (UNLIKELY(rc != UBRING_OK)) {
         LOG(ERROR) << "Trx map local shared memory failed, local shm name=" << local_trx_shm->name;
         ShmLocalFree(local_trx_shm);
-        UBRingManager::ReleaseUbrTrxFromMgr(_trx);
+        UBRingManager::ReleaseUbrTrxFromMgr(_trx, ATOMIC_LOAD(_trx->ubr_id));
         return rc;
     }
     ((UbrDataStatusQMsg *)_trx->ubr_tx.local_data_status_q.addr)->timeout =
@@ -998,7 +1006,7 @@ RETURN_CODE UBRing::ApplyAndMapLocalShm(SHM *local_trx_shm, const char *local_na
     if (rc != UBRING_OK) {
         LOG(ERROR) << "Get ubring deal msg max cnt, local shm name=" << local_trx_shm->name;
         ShmLocalFree(local_trx_shm);
-        UBRingManager::ReleaseUbrTrxFromMgr(_trx);
+        UBRingManager::ReleaseUbrTrxFromMgr(_trx, ATOMIC_LOAD(_trx->ubr_id));
         return rc;
     }
     return UBRING_OK;

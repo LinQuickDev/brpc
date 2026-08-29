@@ -27,19 +27,24 @@ namespace ubring {
 
 namespace {
 
-// Sentinel occupying a slot while its task is being scheduled; never
-// dereferenced, deleters just clear it.
-const UbrTimerId kReservedSlot = (UbrTimerId)((uintptr_t)1);
+enum UbrTimerState {
+    kStarting = 0,                               // published, not scheduled yet
+    kScheduled = 1,
+    kDead = 2                                    // scheduling failed
+};
 
 }  // namespace
 
-// Reference rules: one "owner" ref for the handle slot plus one "schedule"
-// ref per pending/running bthread schedule. The schedule ref is consumed
-// by the firing callback or by the deleter whose bthread_timer_del
-// returned 0 (cancelled before run); the owner ref is consumed by whoever
-// takes the task out of *slot -- a deleter, or the one-shot firing
-// callback itself. All atomics are seq_cst so no interleaving can release
-// a ref twice or free the task while a callback still runs.
+// Reference rules: one "owner" ref for the handle slot, one "schedule" ref
+// per pending/running bthread schedule, plus one ref held by the starter
+// until its post-schedule bookkeeping is done. The schedule ref is
+// consumed by the firing callback or by the deleter whose
+// bthread_timer_del returned 0 (cancelled before run); the owner ref is
+// consumed by whoever takes the task out of *slot -- a deleter, or the
+// one-shot firing callback itself, which exits the slot BEFORE running
+// the callback so that the callback may free the object storing the slot.
+// All atomics are seq_cst so no interleaving can release a ref twice or
+// free the task while a callback or the starter still touches it.
 struct UbrTimerTask {
     UbrTimerId* slot;
     std::atomic<bthread_timer_t> id;
@@ -48,6 +53,7 @@ struct UbrTimerTask {
     UbrTimerBackoffFn backoff;
     uint64_t interval_us;                        // timer thread only
     bool periodic;
+    std::atomic<int> state;                      // kStarting/kScheduled/kDead
     std::atomic<bool> stopped;
     std::atomic<int> ref;
     std::atomic<bool> join_pending;              // a DelAndWait is waiting
@@ -68,11 +74,11 @@ void ReleaseRef(UbrTimerTask* task) {
 
 void UbrTimerOnFire(void* p) {
     UbrTimerTask* task = (UbrTimerTask*)p;
-    if (!task->stopped.load()) {
-        task->cb(task->arg);
-    }
 
     if (task->periodic) {
+        if (!task->stopped.load()) {
+            task->cb(task->arg);
+        }
         // Claim the next schedule's ref before re-reading `stopped' so a
         // racing delete can neither free the task nor orphan a re-arm.
         task->ref.fetch_add(1);
@@ -101,53 +107,37 @@ void UbrTimerOnFire(void* p) {
         return;
     }
 
-    // One-shot: release the schedule ref plus the owner ref if the slot
-    // still holds this task (CAS so a reused slot is left untouched).
+    // One-shot: exit the handle slot first -- after this the wrapper never
+    // touches the storage again, so the callback may release the object
+    // that holds it.
     UbrTimerId expected = task;
     const bool owned =
         __atomic_compare_exchange_n(task->slot, &expected, (UbrTimerId) nullptr,
                                     false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    ReleaseRef(task);
+    if (!task->stopped.load()) {
+        task->cb(task->arg);
+    }
+    ReleaseRef(task);                            // schedule
     if (owned) {
-        ReleaseRef(task);
+        ReleaseRef(task);                        // owner
     }
 }
 
 UbrTimerTask* TakeOutTask(UbrTimerId* slot) {
-    UbrTimerTask* task =
-        __atomic_exchange_n(slot, (UbrTimerId) nullptr, __ATOMIC_SEQ_CST);
-    return task == kReservedSlot ? nullptr : task;
-}
-
-// Give a reserved slot back unless a deleter already cleared it.
-void ReleaseReservation(UbrTimerId* slot) {
-    UbrTimerId expected = kReservedSlot;
-    __atomic_compare_exchange_n(slot, &expected, (UbrTimerId) nullptr, false,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return __atomic_exchange_n(slot, (UbrTimerId) nullptr, __ATOMIC_SEQ_CST);
 }
 
 RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
                                uint64_t interval_us, void* (*cb)(void*),
-                               void* arg, UbrTimerBackoffFn backoff,
-                               bool once) {
+                               void* arg, UbrTimerBackoffFn backoff) {
     if (UNLIKELY(slot == nullptr || cb == nullptr)) {
         LOG(ERROR) << "Ubr timer start invalid argument, slot=" << slot;
         return UBRING_ERR;
     }
 
-    // Reserve the slot so a concurrent start cannot schedule twice, and
-    // deleters see no half-built task: they just clear the reservation and
-    // this starter gives up.
-    UbrTimerId expected = nullptr;
-    if (!__atomic_compare_exchange_n(slot, &expected, kReservedSlot, false,
-                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-        return once ? UBRING_REENTRY : UBRING_ERR;
-    }
-
     UbrTimerTask* task = new (std::nothrow) UbrTimerTask();
     if (UNLIKELY(task == nullptr)) {
         LOG(ERROR) << "Fail to malloc ubring timer task.";
-        ReleaseReservation(slot);
         return UBRING_ERR;
     }
     task->slot = slot;
@@ -157,38 +147,48 @@ RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
     task->backoff = backoff;
     task->interval_us = interval_us;
     task->periodic = (interval_us > 0);
+    task->state.store(kStarting);
     task->stopped.store(false);
-    task->ref.store(2);
+    task->ref.store(3);                          // owner + schedule + starter
     task->join_pending.store(false);
     task->done.store(false);
+
+    // Publish the real task before scheduling so a delete or a DelAndWait
+    // racing the start always has an object to act on or wait for.
+    UbrTimerId expected = nullptr;
+    if (!__atomic_compare_exchange_n(slot, &expected, (UbrTimerId) task, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        delete task;                             // never published
+        return UBRING_ERR;
+    }
 
     bthread_timer_t id = 0;
     if (UNLIKELY(bthread_timer_add(
             &id, butil::microseconds_from_now((int64_t)delay_us),
             UbrTimerOnFire, task) != 0)) {
         LOG(ERROR) << "Fail to add ubring timer";
-        ReleaseReservation(slot);
-        ReleaseRef(task);
-        ReleaseRef(task);
-        return UBRING_ERR;
-    }
-    task->id.store(id);
-
-    // A deleter may have cleared the reservation meanwhile; cancel the
-    // fresh task instead of publishing it.
-    expected = kReservedSlot;
-    if (!__atomic_compare_exchange_n(slot, &expected, (UbrTimerId) task, false,
-                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-        task->stopped.store(true);
-        if (bthread_timer_del(id) == 0) {
-            ReleaseRef(task);
+        task->state.store(kDead);                // wake DelAndWait waiters
+        expected = task;
+        const bool owned =
+            __atomic_compare_exchange_n(slot, &expected, (UbrTimerId) nullptr,
+                                        false, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST);
+        ReleaseRef(task);                        // schedule, never ran
+        if (owned) {
+            ReleaseRef(task);                    // owner
         }
-        ReleaseRef(task);
+        ReleaseRef(task);                        // starter
         return UBRING_ERR;
     }
+    // A zero-delay task may have fired and re-armed already; keep a newer
+    // id if so.
+    bthread_timer_t expected_id = 0;
+    task->id.compare_exchange_strong(expected_id, id);
+    task->state.store(kScheduled);
     if (task->stopped.load() && bthread_timer_del(id) == 0) {
-        ReleaseRef(task);
+        ReleaseRef(task);                        // deleted before it could run
     }
+    ReleaseRef(task);                            // starter
     return UBRING_OK;
 }
 
@@ -197,15 +197,7 @@ RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
 RETURN_CODE UbrTimerStart(UbrTimerId* slot, uint64_t delay_us,
                           uint64_t interval_us, void* (*cb)(void*),
                           void* arg, UbrTimerBackoffFn backoff) {
-    return TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff,
-                              false);
-}
-
-RETURN_CODE UbrTimerStartOnce(UbrTimerId* slot, uint64_t delay_us,
-                              uint64_t interval_us, void* (*cb)(void*),
-                              void* arg, UbrTimerBackoffFn backoff) {
-    return TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff,
-                              true);
+    return TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff);
 }
 
 void UbrTimerDel(UbrTimerId* slot) {
@@ -217,11 +209,13 @@ void UbrTimerDel(UbrTimerId* slot) {
         return;
     }
     task->stopped.store(true);
-    bthread_timer_t id = task->id.load();
-    if (id != 0 && bthread_timer_del(id) == 0) {
-        ReleaseRef(task);
+    if (task->state.load() == kScheduled) {
+        bthread_timer_t id = task->id.load();
+        if (id != 0 && bthread_timer_del(id) == 0) {
+            ReleaseRef(task);                    // cancelled before run
+        }
     }
-    ReleaseRef(task);
+    ReleaseRef(task);                            // owner reference
 }
 
 void UbrTimerDelAndWait(UbrTimerId* slot) {
@@ -234,11 +228,18 @@ void UbrTimerDelAndWait(UbrTimerId* slot) {
     }
     task->join_pending.store(true);
     task->stopped.store(true);
-    bthread_timer_t id = task->id.load();
-    if (id != 0 && bthread_timer_del(id) == 0) {
-        ReleaseRef(task);
+    // A start still in flight cannot be cancelled yet; wait for the
+    // starter to schedule it or mark it dead.
+    while (task->state.load() == kStarting) {
+        bthread_usleep(1000);
     }
-    ReleaseRef(task);
+    if (task->state.load() == kScheduled) {
+        bthread_timer_t id = task->id.load();
+        if (id != 0 && bthread_timer_del(id) == 0) {
+            ReleaseRef(task);                    // cancelled before run
+        }
+    }
+    ReleaseRef(task);                            // owner reference
     while (!task->done.load()) {
         bthread_usleep(1000);
     }
