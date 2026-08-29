@@ -105,7 +105,7 @@ typedef struct TagUbrTx {
     UbrAddrInfo remote_rx_event_q;
     UbrAddrInfo local_data_status_q;
     UbrAddrInfo local_tx_event_q;
-    uint64_t out_io_id;
+    AtomicUintFast64 out_io_id;
     uint32_t write_pos;
     uint32_t capacity;
     UbrMsgFormat local_msg_space;
@@ -119,7 +119,7 @@ typedef struct TagUbrRx {
     UbrAddrInfo local_rx_event_q;
     UbrAddrInfo remote_data_status_q;
     UbrAddrInfo remote_tx_event_q;
-    uint64_t in_io_id;
+    AtomicUintFast64 in_io_id;
     uint32_t read_pos;
     uint32_t capacity;
     uint32_t deal_msg_num;

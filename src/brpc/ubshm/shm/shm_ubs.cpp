@@ -377,8 +377,7 @@ RETURN_CODE UbsShmInit(void)
 
 RETURN_CODE UbsShmFini(void)
 {
-    // Stop the cleanup timer (and wait out a running UbsShmCallback)
-    // BEFORE finalizing the SDK that the callback calls into.
+    // Stop the cleanup timer before finalizing the SDK it calls into.
     if (UNLIKELY(DestroyShmTimer(g_shm_list) != UBRING_OK)) {
         LOG(ERROR) << "Ubs shm list finalize failed.";
         return UBRING_ERR;
@@ -454,9 +453,9 @@ void *UbsShmCallback(void* args)
 RETURN_CODE UbsShmAddTimer(ShmList *shm_list)
 {
     const uint64_t timer_interval_us = (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL;
-    UbrTimerStart(&g_shm_timer_id, timer_interval_us, timer_interval_us,
-                  UbsShmCallback, (void*)shm_list);
-    if (UNLIKELY(g_shm_timer_id == nullptr)) {
+    RETURN_CODE rc = UbrTimerStart(&g_shm_timer_id, 0, timer_interval_us,
+                                   UbsShmCallback, (void*)shm_list);
+    if (UNLIKELY(rc != UBRING_OK)) {
         LOG(ERROR) << "Start shm timer failed.";
         return UBRING_ERR;
     }
@@ -491,8 +490,7 @@ RETURN_CODE InitShmTimer(ShmList **shm_list)
 
 RETURN_CODE DestroyShmTimer(ShmList *shm_list)
 {
-    // Wait out a possibly running UbsShmCallback: it walks shm_list under
-    // shm_lock and calls the SDK, neither of which may be torn down yet.
+    // Wait out a possibly running UbsShmCallback before tearing shm_list down.
     UbrTimerDelAndWait(&g_shm_timer_id);
     if (shm_list == nullptr) {
         LOG(WARNING) << "Shm list is null.";
