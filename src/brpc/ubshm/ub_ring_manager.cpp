@@ -124,7 +124,7 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
             g_ubr_mgr.trx_mgr[i].close_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].hb_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].clear_timer = nullptr;
-            g_ubr_mgr.trx_mgr[i].clear_scheduled.store(false);
+            g_ubr_mgr.trx_mgr[i].cleanup_state.store(UBR_CLEANUP_NONE);
             g_ubr_mgr.trx_mgr_unit_status[i] = UBR_MGR_UNIT_USED;
             *trx = &g_ubr_mgr.trx_mgr[i];
             (*trx)->trx_mgr_index = i;
@@ -147,12 +147,6 @@ RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx,
         LOG(ERROR) << "Release trx failed, trx is null.";
         return UBRING_ERR;
     }
-
-    trx->local_shm.addr = nullptr;
-    trx->ubr_tx.local_tx_event_q.addr = nullptr;
-    trx->ubr_tx.local_data_status_q.addr = nullptr;
-    trx->ubr_rx.local_rx_event_q.addr = nullptr;
-    trx->ubr_rx.remote_data_status_q.addr = nullptr;
     if (UNLIKELY(g_ubr_mgr.trx_mgr == nullptr)) {
         LOG(ERROR) << "Release trx failed, trx_mgr is null.";
         return UBRING_ERR;
@@ -167,7 +161,7 @@ RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx,
 
     if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_id[idx] != expect_ubr_id)) {
         // The slot was released and acquired again meanwhile; the stale
-        // caller must not free the new occupant.
+        // caller must not touch the new occupant.
         LOG(WARNING) << "Release stale trx refused, name=" << trx->local_shm.name;
         return UBRING_OK;
     }
@@ -177,6 +171,12 @@ RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx,
         return UBRING_ERR;
     }
 
+    // Mutate the trx only after the generation check passed.
+    trx->local_shm.addr = nullptr;
+    trx->ubr_tx.local_tx_event_q.addr = nullptr;
+    trx->ubr_tx.local_data_status_q.addr = nullptr;
+    trx->ubr_rx.local_rx_event_q.addr = nullptr;
+    trx->ubr_rx.remote_data_status_q.addr = nullptr;
     g_ubr_mgr.trx_mgr_unit_status[idx] = UBR_MGR_UNIT_FREE;
     --g_ubr_mgr.trx_num;
     return UBRING_OK;

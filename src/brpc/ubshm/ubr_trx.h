@@ -69,6 +69,15 @@ typedef enum {
     UBR_CLOSE_END
 } UbrCloseCount;
 
+// Ownership of the final delayed cleanup of a trx. Exactly one side (the
+// delayed-clear callback or a force close) may run it.
+typedef enum {
+    UBR_CLEANUP_NONE = 0,                        // no cleanup scheduled yet
+    UBR_CLEANUP_PENDING = 1,                     // cleanup timer scheduled
+    UBR_CLEANUP_RUNNING = 2,                     // cleanup owned, in progress
+    UBR_CLEANUP_DONE = 3                         // cleanup finished
+} UbrCleanupState;
+
 typedef enum {
     UDP_TRX,
     TCP_TRX,
@@ -139,9 +148,9 @@ typedef struct TagUbrTrx {
     UbrTimerId close_timer;
     UbrTimerId hb_timer;
     UbrTimerId clear_timer;
-    // Write-once per acquisition: guards against scheduling a second
-    // delayed cleanup for the same trx. Reset by the pool memset on reuse.
-    AtomicBool clear_scheduled;
+    // Write-once-per-acquisition cleanup ownership state (UbrCleanupState).
+    // Reset by the pool memset on reuse.
+    AtomicInt cleanup_state;
     // Last io ids seen by the close-check timer, used to reset its
     // back-off polling interval when the link has traffic.
     uint64_t close_chk_in_io_id;
