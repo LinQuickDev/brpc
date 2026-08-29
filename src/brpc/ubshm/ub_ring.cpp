@@ -114,7 +114,7 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     ctl->ubr_id = ATOMIC_LOAD(trx->ubr_id);
     ctl->state.store(UBR_CLEANUP_PENDING);
     ctl->timer = nullptr;
-    ctl->ref.store(2);                       // manager anchor + starter
+    ctl->ref.store(3);                       // manager + timer/callback + starter
 
     UbrCleanupCtl* expected = nullptr;
     if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &expected, ctl, false,
@@ -127,8 +127,11 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     RETURN_CODE rc = UbrTimerStart(&ctl->timer,
             (uint64_t)FLAGS_ub_flying_io_timeout_s * SEC_TO_USEC, 0, cb, ctl);
     if (UNLIKELY(rc != UBRING_OK)) {
-        // Roll the schedule back and run the cleanup inline so the trx does
-        // not end up with neither timers nor a queued cleanup.
+        // The timer was never scheduled: this path owns the manager,
+        // timer/callback and starter references. Roll the schedule back
+        // and run the cleanup inline so the trx does not end up with
+        // neither timers nor a queued cleanup. If force close claimed the
+        // ownership meanwhile, leave the manager anchor to it.
         int state_expected = UBR_CLEANUP_PENDING;
         if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, state_expected, UBR_CLEANUP_RUNNING)) {
             if (ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id) {
@@ -145,12 +148,15 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             UBRingManager::DetachUnitCleanupCtl(trx->trx_mgr_index, ctl);
         }
+        ctl->ReleaseRef();                   // timer/callback reference
         ctl->ReleaseRef();                   // starter reference
         return UBRING_ERR;
     }
     if (UNLIKELY(ATOMIC_LOAD(trx->ubr_id) != ctl->ubr_id)) {
         // Published onto a slot that was released and reused meanwhile.
-        UbrTimerDel(&ctl->timer);
+        if (UbrTimerDel(&ctl->timer) == 0) {
+            ctl->ReleaseRef();               // timer/callback reference
+        }
         UbrCleanupCtl* published = ctl;
         if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &published,
                                          (UbrCleanupCtl*) nullptr, false,
@@ -212,7 +218,9 @@ RETURN_CODE UBRing::UbrTrxClose() {
                 int expected = UBR_CLEANUP_PENDING;
                 if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, expected, UBR_CLEANUP_RUNNING)) {
                     cleanup_owned = true;
-                    UbrTimerDel(&ctl->timer);
+                    if (UbrTimerDel(&ctl->timer) == 0) {
+                        ctl->ReleaseRef();   // timer/callback reference
+                    }
                 }
             } else if (ATOMIC_LOAD(_trx->ubr_id) == expect_ubr_id) {
                 cleanup_owned = true;
@@ -400,15 +408,17 @@ void* UBRing::UbrPassiveClearCallback(void* args) {
     int expected = UBR_CLEANUP_PENDING;
     if (!ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state,
                                         expected, UBR_CLEANUP_RUNNING)) {
-        return nullptr;                      // force close owns the cleanup
+        // Force close owns the cleanup; this fire still holds the
+        // timer/callback reference inherited from the schedule.
+        ctl->ReleaseRef();
+        return nullptr;
     }
-    ctl->ref.fetch_add(1);                   // runner reference
     UbrTrx* trx = ctl->trx;
     if (UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
         UbrDoPassiveClearWork(trx, ctl->ubr_id);
     }
     ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-    ctl->ReleaseRef();                       // runner reference
+    ctl->ReleaseRef();                       // timer/callback reference
     return nullptr;
 }
 
@@ -467,15 +477,17 @@ void *UBRing::UbrAsynClearCallback(void *args)
     int expected = UBR_CLEANUP_PENDING;
     if (!ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state,
                                         expected, UBR_CLEANUP_RUNNING)) {
-        return nullptr;                      // force close owns the cleanup
+        // Force close owns the cleanup; this fire still holds the
+        // timer/callback reference inherited from the schedule.
+        ctl->ReleaseRef();
+        return nullptr;
     }
-    ctl->ref.fetch_add(1);                   // runner reference
     UbrTrx* trx = ctl->trx;
     if (UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
         UbrDoAsynClearWork(trx, ctl->ubr_id);
     }
     ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-    ctl->ReleaseRef();                       // runner reference
+    ctl->ReleaseRef();                       // timer/callback reference
     return nullptr;
 }
 

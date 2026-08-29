@@ -97,18 +97,10 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
 }
 
 void UBRingManager::UbrMgrFini() {
-    // Cancel the pending delayed cleanups first; already running ones are
-    // drained below, before the pool memory they touch is freed.
-    if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
-        LOCK_GUARD(g_ubr_trx_mgr_mtx);
-        for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
-            UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
-            if (ctl != nullptr) {
-                UbrTimerDel(&ctl->timer);
-            }
-        }
-    }
-    // In-flight cleanup callbacks hold one extra reference each.
+    // Cancel the pending delayed cleanups and wait for the in-flight ones
+    // (each holds one extra reference) to finish, before the pool memory
+    // they touch is freed. A ctl whose timer is still starting can only be
+    // cancelled in a later round, hence the retry-to-stability loop.
     bool busy = true;
     while (busy) {
         busy = false;
@@ -117,9 +109,14 @@ void UBRingManager::UbrMgrFini() {
             if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
                 for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
                     UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
-                    if (ctl != nullptr && ctl->ref.load() > kAnchoredRefOnly) {
+                    if (ctl == nullptr) {
+                        continue;
+                    }
+                    if (UbrTimerDel(&ctl->timer) == 0) {
+                        ctl->ReleaseRef();   // timer/callback reference
+                    }
+                    if (ctl->ref.load() > kAnchoredRefOnly) {
                         busy = true;
-                        break;
                     }
                 }
             }
@@ -182,8 +179,10 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
             UbrCleanupCtl* old_ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
             g_ubr_mgr.trx_mgr_unit_ctl[i] = nullptr;
             if (old_ctl != nullptr) {
-                UbrTimerDel(&old_ctl->timer);
-                old_ctl->ReleaseRef();
+                if (UbrTimerDel(&old_ctl->timer) == 0) {
+                    old_ctl->ReleaseRef();       // timer/callback reference
+                }
+                old_ctl->ReleaseRef();           // manager anchor
             }
             g_ubr_mgr.trx_mgr_unit_status[i] = UBR_MGR_UNIT_USED;
             *trx = &g_ubr_mgr.trx_mgr[i];

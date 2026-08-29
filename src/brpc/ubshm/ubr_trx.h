@@ -146,8 +146,9 @@ struct UbrCleanupCtl {
     AtomicInt state;                             // UbrCleanupState
     UbrTimerId timer;                            // delayed clear timer
     // References: manager anchor (until the slot is acquired again) +
-    // runner (while the cleanup callback runs, taken after it claims the
-    // ownership) + starter (until the schedule call completes).
+    // timer/callback (held from a successful schedule until the callback
+    // fully returned, or released by whoever cancels the timer before it
+    // fires) + starter (until the schedule call completes).
     AtomicInt ref;
 
     void ReleaseRef() {
