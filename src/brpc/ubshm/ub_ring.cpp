@@ -125,8 +125,8 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     if (UNLIKELY(rc != UBRING_OK)) {
         // Roll the schedule back and run the cleanup inline so the trx does
         // not end up with neither timers nor a queued cleanup.
-        expected = UBR_CLEANUP_PENDING;
-        if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, expected, UBR_CLEANUP_RUNNING)) {
+        int state_expected = UBR_CLEANUP_PENDING;
+        if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, state_expected, UBR_CLEANUP_RUNNING)) {
             ctl->ref.fetch_add(1);           // runner reference
             UbrCleanupCtl* published = ctl;
             if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &published,
@@ -325,7 +325,6 @@ void* UBRing::UbrTrxCloseCallback(void* args) {
         return nullptr;
     }
     trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
-    int fd = (int)trx->local_shm.fd;
     do {
         if (ATOMIC_LOAD(trx->close_cnt) == 0) {
             break;
@@ -437,7 +436,7 @@ void* UBRing::UbrTrxHBCallback(void* args) {
     }
 
     ++trx->ubr_tx.hb_retry_cnt;
-    if (trx->ubr_tx.hb_retry_cnt <= FLAGS_ub_hb_retry_cnt) {
+    if ((int)trx->ubr_tx.hb_retry_cnt <= FLAGS_ub_hb_retry_cnt) {
         return nullptr;
     }
 
@@ -1025,7 +1024,8 @@ RETURN_CODE UBRing::UbrMapRemoteShmAddTimer(SHM *local_trx_shm, const char *loca
         local_name,
         SERVER_SHM_NAME_SUFFIX);
     if (UNLIKELY(result < 0)) {
-        LOG(ERROR) << "Copy server shared memory name failed, local_name=%s, ret=%d.", local_name, result;
+        LOG(ERROR) << "Copy server shared memory name failed, local_name=" << local_name
+                   << ", ret=" << result;
         return UBRING_ERR;
     }
     UbrSetSleepTask(UBR_TASK_CONNECT_MAP_FRONT);
