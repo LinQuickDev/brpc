@@ -211,35 +211,33 @@ int UbrTimerDel(UbrTimerId* slot) {
     if (slot == nullptr) {
         return 1;
     }
-    UbrTimerTask* task =
-        __atomic_load_n(slot, __ATOMIC_SEQ_CST); // read-only: ownership not taken yet
+    // Take the ownership of the slot first: after this exchange every
+    // dereference below is safe (the task cannot be freed while we hold
+    // the owner reference the slot used to anchor).
+    UbrTimerTask* task = TakeOutTask(slot);
     if (task == nullptr) {
-        return 1;            // fired and cleared its slot: callback side consumed
+        return 1;        // fired and cleared its slot (callback side consumed)
+                         // or another del won the exchange (it consumes)
     }
-    // Re-validate: a one-shot fire may have completed and freed the task
-    // between the two loads; only proceed while the slot still anchors it
-    // (the anchor is the task's owner reference).
-    if (__atomic_load_n(slot, __ATOMIC_SEQ_CST) != task) {
-        return 1;
+    task->stopped.store(true);                   // meaningful for periodic only
+    // A start still in flight cannot be cancelled nor dispatched yet; wait
+    // for the starter to settle the fate (kScheduled/kDead). Bounded: the
+    // starter stores the state before taking any lock our caller holds.
+    while (task->state.load() == kStarting) {
+        bthread_usleep(1000);
     }
-    int st = task->state.load();
-    if (st == kStarting || st == kDead) {
-        task->stopped.store(true);           // meaningful for periodic only
-        return 1;      // fate undecided: the scheduler/callback settles it
+    if (task->state.load() == kDead) {
+        ReleaseRef(task);                        // owner; schedule/starter are
+        return 1;                                // settled by the kDead path
     }
-    // kScheduled: the exchange is the real cancellation, and it is the
-    // single arbiter between concurrent dels and a firing OnFire.
-    task = __atomic_exchange_n(slot, (UbrTimerId) nullptr, __ATOMIC_SEQ_CST);
-    if (task == nullptr) {
-        return 1;                            // lost to another del -- it consumes
-    }
-    task->stopped.store(true);
     bthread_timer_t id = task->id.load();
     if (id != 0 && bthread_timer_del(id) == 0) {
-        ReleaseRef(task);                    // schedule: cancelled before dispatch
-    }                                        // ==1: dispatched, OnFire releases it
-    ReleaseRef(task);                        // owner: we emptied the slot
-    return 0;                // caller consumes the timer/callback reference
+        ReleaseRef(task);                        // schedule: cancelled before dispatch
+    }                                            // ==1: dispatched, OnFire (owned==false)
+                                                 // releases it
+    ReleaseRef(task);                            // owner
+    return 0;            // the callback is guaranteed never to run: the caller
+                         // consumes the timer/callback reference
 }
 
 void UbrTimerDelAndWait(UbrTimerId* slot) {
