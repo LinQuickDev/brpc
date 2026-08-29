@@ -158,6 +158,7 @@ RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
     UbrTimerId expected = nullptr;
     if (!__atomic_compare_exchange_n(slot, &expected, (UbrTimerId) task, false,
                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        LOG(ERROR) << "Ubr timer start refused, slot already occupied";
         delete task;                             // never published
         return UBRING_ERR;
     }

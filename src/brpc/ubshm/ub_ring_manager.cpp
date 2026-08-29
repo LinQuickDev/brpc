@@ -55,6 +55,7 @@ RETURN_CODE UBRingManager::UbrMgrDefault()
     g_ubr_mgr.trx_mgr_unit_status = nullptr;
     g_ubr_mgr.trx_mgr = nullptr;
     g_ubr_mgr.trx_mgr_unit_id = nullptr;
+    g_ubr_mgr.trx_mgr_unit_ctl = nullptr;
     return UBRING_OK;
 }
 
@@ -71,9 +72,12 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
     g_ubr_mgr.trx_mgr_unit_status = (UbrMgrUnitStatus *)malloc(trx_mgr_status_size);
     size_t trx_mgr_id_size = g_ubr_mgr.trx_cap * sizeof(uint64_t);
     g_ubr_mgr.trx_mgr_unit_id = (uint64_t *)malloc(trx_mgr_id_size);
+    size_t trx_mgr_ctl_size = g_ubr_mgr.trx_cap * sizeof(UbrCleanupCtl *);
+    g_ubr_mgr.trx_mgr_unit_ctl = (UbrCleanupCtl **)malloc(trx_mgr_ctl_size);
     if (UNLIKELY(g_ubr_mgr.trx_mgr == nullptr ||
                  g_ubr_mgr.trx_mgr_unit_status == nullptr ||
-                 g_ubr_mgr.trx_mgr_unit_id == nullptr)) {
+                 g_ubr_mgr.trx_mgr_unit_id == nullptr ||
+                 g_ubr_mgr.trx_mgr_unit_ctl == nullptr)) {
         LOG(ERROR) << "Ubr manager memory allocation failed.";
         UbrMgrFini();
         return UBRING_ERR;
@@ -82,6 +86,7 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
     memset(g_ubr_mgr.trx_mgr, 0, trx_mgr_size);
     memset(g_ubr_mgr.trx_mgr_unit_status, UBR_MGR_UNIT_FREE, trx_mgr_status_size);
     memset(g_ubr_mgr.trx_mgr_unit_id, 0, trx_mgr_id_size);
+    memset(g_ubr_mgr.trx_mgr_unit_ctl, 0, trx_mgr_ctl_size);
     LinkInfoInit();
     return UBRING_OK;
 }
@@ -89,9 +94,20 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
 void UBRingManager::UbrMgrFini() {
     {
         LOCK_GUARD(g_ubr_trx_mgr_mtx);
+        if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
+            for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
+                UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
+                if (ctl != nullptr) {
+                    g_ubr_mgr.trx_mgr_unit_ctl[i] = nullptr;
+                    UbrTimerDel(&ctl->timer);
+                    ctl->ReleaseRef();
+                }
+            }
+        }
         FREE_PTR(g_ubr_mgr.trx_mgr);
         FREE_PTR(g_ubr_mgr.trx_mgr_unit_status);
         FREE_PTR(g_ubr_mgr.trx_mgr_unit_id);
+        FREE_PTR(g_ubr_mgr.trx_mgr_unit_ctl);
     }
     {
         LOCK_GUARD(g_ubr_listener_mgr_mtx);
@@ -123,8 +139,14 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
             memset(&g_ubr_mgr.trx_mgr[i], 0, sizeof(UbrTrx));
             g_ubr_mgr.trx_mgr[i].close_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].hb_timer = nullptr;
-            g_ubr_mgr.trx_mgr[i].clear_timer = nullptr;
-            g_ubr_mgr.trx_mgr[i].cleanup_state.store(UBR_CLEANUP_NONE);
+            g_ubr_mgr.trx_mgr[i].cleanup_ctl = nullptr;
+            // Retire the previous acquisition's cleanup control object.
+            UbrCleanupCtl* old_ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
+            g_ubr_mgr.trx_mgr_unit_ctl[i] = nullptr;
+            if (old_ctl != nullptr) {
+                UbrTimerDel(&old_ctl->timer);
+                old_ctl->ReleaseRef();
+            }
             g_ubr_mgr.trx_mgr_unit_status[i] = UBR_MGR_UNIT_USED;
             *trx = &g_ubr_mgr.trx_mgr[i];
             (*trx)->trx_mgr_index = i;
@@ -180,6 +202,31 @@ RETURN_CODE UBRingManager::ReleaseUbrTrxFromMgr(UbrTrx *trx,
     g_ubr_mgr.trx_mgr_unit_status[idx] = UBR_MGR_UNIT_FREE;
     --g_ubr_mgr.trx_num;
     return UBRING_OK;
+}
+
+UbrCleanupCtl* UBRingManager::SnapshotUnitCleanupCtl(uint32_t idx) {
+    LOCK_GUARD(g_ubr_trx_mgr_mtx);
+    if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_ctl == nullptr || idx >= g_ubr_mgr.trx_cap)) {
+        return nullptr;
+    }
+    return g_ubr_mgr.trx_mgr_unit_ctl[idx];
+}
+
+void UBRingManager::PublishUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl) {
+    LOCK_GUARD(g_ubr_trx_mgr_mtx);
+    g_ubr_mgr.trx_mgr_unit_ctl[idx] = ctl;
+}
+
+bool UBRingManager::DetachUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl) {
+    LOCK_GUARD(g_ubr_trx_mgr_mtx);
+    if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_ctl == nullptr ||
+                 idx >= g_ubr_mgr.trx_cap ||
+                 g_ubr_mgr.trx_mgr_unit_ctl[idx] != ctl)) {
+        return false;
+    }
+    g_ubr_mgr.trx_mgr_unit_ctl[idx] = nullptr;
+    ctl->ReleaseRef();                           // manager reference
+    return true;
 }
 
 void UBRingManager::LinkInfoInit(void) {

@@ -35,6 +35,7 @@ typedef struct TagUbrMgr {
     UbrTrx *trx_mgr;
     UbrMgrUnitStatus *trx_mgr_unit_status;
     uint64_t *trx_mgr_unit_id;
+    UbrCleanupCtl **trx_mgr_unit_ctl;
 } UbrMgr;
 
 typedef struct TagUbrLinkInfo {
@@ -69,6 +70,19 @@ public:
     // release racing a reuse of the same slot is refused.
     static RETURN_CODE ReleaseUbrTrxFromMgr(UbrTrx *trx,
                                             uint64_t expect_ubr_id);
+
+    // Snapshot the cleanup control object of a pool slot. Must be paired
+    // with a generation check by the caller.
+    static UbrCleanupCtl* SnapshotUnitCleanupCtl(uint32_t idx);
+
+    // Anchor `ctl' to the pool slot (called once per schedule). The object
+    // is retired and freed at the next Acquire of the same slot.
+    static void PublishUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl);
+
+    // Detach `ctl' from the pool slot if it is still anchored there.
+    // Returns true when the detach happened (the manager reference was
+    // released).
+    static bool DetachUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl);
 
     static void LinkInfoInit(void);
     static void LinkInfoFini(void);

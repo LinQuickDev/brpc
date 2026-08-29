@@ -53,7 +53,9 @@ void UbrTimerDel(UbrTimerId* slot);
 // caller can free resources reachable from `arg'. Never call this on the
 // callback's own task. A one-shot callback that is already running holds
 // the ownership of `arg' by itself (mirroring bthread_timer_del returning
-// 1) and cannot be waited for through the slot.
+// 1) and cannot be waited for through the slot. The wait polls with
+// bthread_usleep, which degrades to ::usleep on plain pthread callers
+// (e.g. process-exit paths).
 void UbrTimerDelAndWait(UbrTimerId* slot);
 
 }  // namespace ubring

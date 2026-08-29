@@ -184,6 +184,25 @@ TEST(UBRingConfigurationTest, time_flags_include_units_and_expected_defaults) {
                   USEC_TO_NSEC);
 }
 
+TEST(UBRingManagerTest, release_with_stale_ubr_id_is_refused) {
+    ASSERT_EQ(brpc::ubring::UBRING_OK, brpc::ubring::UBRingManager::UbrMgrInit());
+    brpc::ubring::UbrTrx* trx = nullptr;
+    ASSERT_EQ(brpc::ubring::UBRING_OK,
+              brpc::ubring::UBRingManager::AcquireUbrTrxFromMgr(&trx));
+    ASSERT_NE(nullptr, trx);
+    const uint64_t ubr_id = trx->ubr_id.load();
+
+    // A stale generation must not release the slot: it stays usable and a
+    // properly snapshotted release still succeeds afterwards.
+    EXPECT_EQ(brpc::ubring::UBRING_OK,
+              brpc::ubring::UBRingManager::ReleaseUbrTrxFromMgr(trx, ubr_id + 1));
+    EXPECT_EQ(brpc::ubring::UBRING_OK,
+              brpc::ubring::UBRingManager::ReleaseUbrTrxFromMgr(trx, ubr_id));
+    EXPECT_EQ(brpc::ubring::UBRING_OK,
+              brpc::ubring::UBRingManager::ReleaseUbrTrxFromMgr(trx, ubr_id));
+    brpc::ubring::UBRingManager::UbrMgrFini();
+}
+
 namespace brpc {
 namespace ubring {
 class UBShmEndpointTest : public ::testing::Test {

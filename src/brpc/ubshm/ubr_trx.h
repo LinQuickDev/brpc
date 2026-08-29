@@ -70,9 +70,10 @@ typedef enum {
 } UbrCloseCount;
 
 // Ownership of the final delayed cleanup of a trx. Exactly one side (the
-// delayed-clear callback or a force close) may run it.
+// delayed-clear callback or a force close) may run it. The state lives in
+// a per-acquisition heap control object (UbrCleanupCtl) anchored by the
+// trx manager, so it survives the pool slot reuse that wipes UbrTrx.
 typedef enum {
-    UBR_CLEANUP_NONE = 0,                        // no cleanup scheduled yet
     UBR_CLEANUP_PENDING = 1,                     // cleanup timer scheduled
     UBR_CLEANUP_RUNNING = 2,                     // cleanup owned, in progress
     UBR_CLEANUP_DONE = 3                         // cleanup finished
@@ -147,10 +148,7 @@ typedef struct TagUbrTrx {
     SHM remote_shm;
     UbrTimerId close_timer;
     UbrTimerId hb_timer;
-    UbrTimerId clear_timer;
-    // Write-once-per-acquisition cleanup ownership state (UbrCleanupState).
-    // Reset by the pool memset on reuse.
-    AtomicInt cleanup_state;
+    struct UbrCleanupCtl* cleanup_ctl;
     // Last io ids seen by the close-check timer, used to reset its
     // back-off polling interval when the link has traffic.
     uint64_t close_chk_in_io_id;
@@ -158,6 +156,25 @@ typedef struct TagUbrTrx {
     AtomicInt close_cnt;
     AtomicInt close_state;
 } UbrTrx;
+
+// Control object of one delayed cleanup, created when the cleanup is
+// scheduled and destroyed when the owning pool slot is acquired again.
+// It is anchored by the trx manager (not by the reusable UbrTrx memory),
+// so the ownership claim and the completion signal stay valid across the
+// release/reuse of the trx that owns the cleanup.
+struct UbrCleanupCtl {
+    UbrTrx* trx;                                 // immutable
+    uint64_t ubr_id;                             // immutable generation
+    AtomicInt state;                             // UbrCleanupState
+    UbrTimerId timer;                            // delayed clear timer
+    AtomicInt ref;                               // manager slot + starter
+
+    void ReleaseRef() {
+        if (ref.fetch_sub(1) == 1) {
+            delete this;
+        }
+    }
+};
 
 typedef struct TagFileLock {
     int lock_fd;
