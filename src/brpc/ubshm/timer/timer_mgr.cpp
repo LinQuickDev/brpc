@@ -78,13 +78,24 @@ struct TimerCallbackArgs {
 };
 
 static void RunTimerCallback(std::shared_ptr<TimerContext> ctx, uint64_t timer_id) {
-    if (ctx->cb != nullptr && !ctx->stopped) {
+    bool should_run_cb = false;
+    {
+        BAIDU_SCOPED_LOCK(ctx->mtx);
+        if (!ctx->stopped&&ctx->cb!=nullptr) {
+            should_run_cb = true;
+        }
+    }
+
+    if (should_run_cb) {
         ctx->cb(ctx->args);
     }
 
     bool need_remove = true;
     {
-        std::lock_guard<std::mutex> lock(ctx->mtx);
+        BAIDU_SCOPED_LOCK(ctx->mtx);
+        --ctx->running;
+        ctx->worker_tid = 0;
+        ctx->cv.notify_all();
         if (ctx->periodical && !ctx->stopped && !ctx->no_reschedule) {
             timespec abstime = add_timespec(get_current_realtime(), ctx->interval);
             if (bthread_timer_add(&ctx->timer_id, abstime, TimerCallbackWrapper,
@@ -120,7 +131,7 @@ void TimerModuleDestroy() {
     }
 
     for (auto &ctx: contexts) {
-        std::lock_guard<std::mutex> lock(ctx->mtx);
+        BAIDU_SCOPED_LOCK(ctx->mtx);
         ctx->stopped = true;
         bthread_timer_del(ctx->timer_id);
     }
@@ -168,6 +179,23 @@ uint32_t GetActiveTimerNum() {
     return g_total_timer_num.load();
 }
 
+void StopTimer(uint64_t timer_id) {
+    std::shared_ptr<TimerContext> ctx;
+    {
+        std::lock_guard<std::mutex> lock(g_timer_ctx_mutex);
+        auto it = g_timer_ctx_map.find(timer_id);
+        if (it == g_timer_ctx_map.end()) {
+            return;
+        }
+        ctx = it->second;
+    }
+
+    BAIDU_SCOPED_LOCK(ctx->mtx);
+    ctx->stopped = true;
+    ctx->no_reschedule = true;
+    bthread_timer_del(ctx->timer_id);
+}
+
 void DeleteTimerSafe(uint64_t timer_id) {
     std::shared_ptr<TimerContext> ctx;
     {
@@ -180,12 +208,16 @@ void DeleteTimerSafe(uint64_t timer_id) {
         ctx = it->second;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(ctx->mtx);
-        ctx->stopped = true;
-        bthread_timer_del(ctx->timer_id);
+    std::unique_lock<bthread::Mutex> lock(ctx->mtx);
+    ctx->stopped = true;
+    ctx->no_reschedule = true;
+    bthread_timer_del(ctx->timer_id);
+
+    while (ctx->running > 0) {
+        ctx->cv.wait(lock);
     }
 
+    lock.unlock();
     remove_timer_from_map(timer_id);
 }
 
@@ -200,7 +232,7 @@ void DeleteTimer(uint64_t timer_id) {
         }
         ctx = it->second;
     }
-    std::lock_guard<std::mutex> lock(ctx->mtx);
+    BAIDU_SCOPED_LOCK(ctx->mtx);
     ctx->no_reschedule = true;
 }
 
@@ -213,10 +245,11 @@ void TimerCallbackWrapper(void *arg) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(ctx->mtx);
+        BAIDU_SCOPED_LOCK(ctx->mtx);
         if (ctx->stopped) {
             return;
         }
+        ++ctx->running;
     }
 
     auto *holder = new (std::nothrow) TimerCallbackArgs{ctx, timer_id};

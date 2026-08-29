@@ -42,19 +42,22 @@ constexpr long long NS_PER_SEC = 1000000000LL;
 
 typedef void * (*TimerCallback)(void *);
 
-struct TimerContext{
+struct TimerContext {
     TimerContext()
-        : cb(nullptr), args(nullptr), periodical(false),
-          interval(), timer_id(0), stopped(false), no_reschedule(false) {}
+        : cb(nullptr), args(nullptr), periodical(false), interval(), timer_id(0),
+          stopped(false), no_reschedule(false), running(0), worker_tid(0) {}
 
     TimerCallback cb;
     void *args;
     bool periodical;
     timespec interval;
     bthread_timer_t timer_id;
-    std::mutex mtx;
+    bthread::Mutex mtx;
+    bthread::ConditionVariable cv;
     bool stopped;
     bool no_reschedule;
+    int running;
+    bthread_t worker_tid;
 };
 
 extern std::unordered_map<uint64_t, std::shared_ptr<TimerContext>> g_timer_ctx_map;
@@ -67,6 +70,7 @@ void TimerModuleDestroy(void);
 int32_t TimerStart(const itimerspec *time, TimerCallback cb, void *args);
 uint32_t GetActiveTimerNum(void);
 
+void StopTimer(uint64_t timer_id);
 void DeleteTimerSafe(uint64_t timer_id);
 void DeleteTimer(uint64_t timer_id);
 
