@@ -201,22 +201,27 @@ RETURN_CODE UbrTimerStart(UbrTimerId* slot, uint64_t delay_us,
     return TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff);
 }
 
-void UbrTimerDel(UbrTimerId* slot) {
+int UbrTimerDel(UbrTimerId* slot) {
     if (slot == nullptr) {
-        return;
+        return EINVAL;
     }
     UbrTimerTask* task = TakeOutTask(slot);
     if (task == nullptr) {
-        return;
+        return EINVAL;
     }
     task->stopped.store(true);
+    int rc = EINVAL;
     if (task->state.load() == kScheduled) {
         bthread_timer_t id = task->id.load();
-        if (id != 0 && bthread_timer_del(id) == 0) {
-            ReleaseRef(task);                    // cancelled before run
+        if (id != 0) {
+            rc = bthread_timer_del(id);
+            if (rc == 0) {
+                ReleaseRef(task);                // cancelled before run
+            }
         }
     }
     ReleaseRef(task);                            // owner reference
+    return rc;
 }
 
 void UbrTimerDelAndWait(UbrTimerId* slot) {

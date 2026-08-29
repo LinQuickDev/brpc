@@ -46,8 +46,11 @@ RETURN_CODE UbrTimerStart(UbrTimerId* slot, uint64_t delay_us,
                           UbrTimerBackoffFn backoff = nullptr);
 
 // Non-blocking delete, safe from inside the timer callback itself. Does
-// not wait for a running callback and does not protect `arg'.
-void UbrTimerDel(UbrTimerId* slot);
+// not wait for a running callback and does not protect `arg'. Returns 0
+// when the task was cancelled before it could run, 1 while the callback
+// is running, EINVAL when the task is gone (including a start still in
+// flight -- such a task is cancelled by its starter). Informational only.
+int UbrTimerDel(UbrTimerId* slot);
 
 // Delete and wait until a possibly running callback finished, so the
 // caller can free resources reachable from `arg'. Never call this on the

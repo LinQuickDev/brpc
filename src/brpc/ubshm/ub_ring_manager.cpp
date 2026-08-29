@@ -22,6 +22,11 @@
 
 namespace brpc {
 namespace ubring {
+
+// A UbrCleanupCtl reference count of 1 means only the manager anchor is
+// left, i.e. no cleanup callback is in flight for it.
+static constexpr int kAnchoredRefOnly = 1;
+
 DEFINE_int32(ubr_max_managed_num, 1024, "maximum number of managed ubring");
 DEFINE_int32(tail_update_after_read, 8, "Position of the tail update after the read");
 
@@ -112,7 +117,7 @@ void UBRingManager::UbrMgrFini() {
             if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
                 for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
                     UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
-                    if (ctl != nullptr && ctl->ref.load() > 1) {
+                    if (ctl != nullptr && ctl->ref.load() > kAnchoredRefOnly) {
                         busy = true;
                         break;
                     }
@@ -168,6 +173,8 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
     for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
         if (g_ubr_mgr.trx_mgr_unit_status[i] == UBR_MGR_UNIT_FREE) {
             memset(&g_ubr_mgr.trx_mgr[i], 0, sizeof(UbrTrx));
+            // The explicit re-initialization after memset is deliberate: it
+            // documents the per-acquisition invariants of these fields.
             g_ubr_mgr.trx_mgr[i].close_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].hb_timer = nullptr;
             g_ubr_mgr.trx_mgr[i].cleanup_ctl = nullptr;
@@ -367,7 +374,7 @@ int32_t UBRingManager::UbEventCallback(const char *shm_name)
             ++g_ub_event_cnt;
             int fd = (int)g_ubr_mgr.trx_mgr[i].local_shm.fd;
             LOG(WARNING) << "Ub event callback, the fd of the faulty link is " << fd;
-            return UBRing::UbrPassiveClearTrx(&g_ubr_mgr.trx_mgr[i], fd, UBR_UB_EVENT);
+            return UBRing::UbrPassiveClearTrx(&g_ubr_mgr.trx_mgr[i]);
         }
     }
     return UBRING_ERR;

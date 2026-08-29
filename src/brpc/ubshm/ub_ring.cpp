@@ -42,7 +42,11 @@ DEFINE_int32(ub_event_queue_timer_interval_us, 100,
 DEFINE_int32(ub_event_queue_timer_interval_max_us, 10000,
              "UBRing upper bound of the close-check polling interval in "
              "microseconds while the link is idle; the interval backs off "
-             "from ub_event_queue_timer_interval_us up to this value.");
+             "from ub_event_queue_timer_interval_us up to this value. "
+             "Set to 0 to keep the interval steady (back-off disabled).");
+
+// Exponential back-off multiplier of the close-check polling interval.
+constexpr uint64_t kCloseCheckBackoffFactor = 2;
 
 UBRing::UBRing()
 {}
@@ -110,7 +114,7 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     ctl->ubr_id = ATOMIC_LOAD(trx->ubr_id);
     ctl->state.store(UBR_CLEANUP_PENDING);
     ctl->timer = nullptr;
-    ctl->ref.store(2);                       // manager slot + starter
+    ctl->ref.store(2);                       // manager anchor + starter
 
     UbrCleanupCtl* expected = nullptr;
     if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &expected, ctl, false,
@@ -121,26 +125,25 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     UBRingManager::PublishUnitCleanupCtl(trx->trx_mgr_index, ctl);
 
     RETURN_CODE rc = UbrTimerStart(&ctl->timer,
-            (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0, cb, ctl);
+            (uint64_t)FLAGS_ub_flying_io_timeout_s * SEC_TO_USEC, 0, cb, ctl);
     if (UNLIKELY(rc != UBRING_OK)) {
         // Roll the schedule back and run the cleanup inline so the trx does
         // not end up with neither timers nor a queued cleanup.
         int state_expected = UBR_CLEANUP_PENDING;
         if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, state_expected, UBR_CLEANUP_RUNNING)) {
-            ctl->ref.fetch_add(1);           // runner reference
-            UbrCleanupCtl* published = ctl;
-            if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &published,
-                                             (UbrCleanupCtl*) nullptr, false,
-                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-                published = nullptr;         // slot reused, cleanup not ours
-            }
-            UBRingManager::DetachUnitCleanupCtl(trx->trx_mgr_index, ctl);
-            if (published != nullptr &&
-                ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id) {
+            if (ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id) {
                 work(trx, ctl->ubr_id);
             }
             ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-            ctl->ReleaseRef();               // runner reference
+            // Detach only after DONE: while the inline cleanup runs, the
+            // anchor and cleanup_ctl must keep telling a concurrent force
+            // close that this cleanup is owned (RUNNING/DONE), otherwise it
+            // would fall into its no-ctl branch and clean the trx again.
+            UbrCleanupCtl* published = ctl;
+            __atomic_compare_exchange_n(&trx->cleanup_ctl, &published,
+                                        (UbrCleanupCtl*) nullptr, false,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            UBRingManager::DetachUnitCleanupCtl(trx->trx_mgr_index, ctl);
         }
         ctl->ReleaseRef();                   // starter reference
         return UBRING_ERR;
@@ -155,7 +158,7 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
             published = nullptr;
         }
         UBRingManager::DetachUnitCleanupCtl(trx->trx_mgr_index, ctl);
-        ctl->ReleaseRef();
+        ctl->ReleaseRef();                   // starter reference
         return UBRING_OK;
     }
     ctl->ReleaseRef();                       // starter reference
@@ -237,7 +240,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
     }
     _trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
     RETURN_CODE rc;
-    if (UNLIKELY((rc = ClearTrxResource(_trx, start_time, UBR_SEND_CLOSE)) != UBRING_OK)) {
+    if (UNLIKELY((rc = ClearTrxResource(_trx)) != UBRING_OK)) {
         if (rc == UBRING_REENTRY) {
             LOG(INFO) << "Trx close, peer is closing, trx local name=" << _trx->local_shm.name;
             return UBRING_OK;
@@ -273,7 +276,7 @@ static uint64_t UbrCloseTimerBackoff(void* arg, uint64_t cur_interval_us) {
     if (has_traffic || closing || local_tx_event_q == nullptr) {
         return (uint64_t)FLAGS_ub_event_queue_timer_interval_us;
     }
-    uint64_t next = cur_interval_us * 2;
+    uint64_t next = cur_interval_us * kCloseCheckBackoffFactor;
     const uint64_t max_us = (uint64_t)FLAGS_ub_event_queue_timer_interval_max_us;
     if (max_us > 0 && next > max_us) {
         next = max_us;
@@ -334,8 +337,6 @@ void* UBRing::UbrTrxCloseCallback(void* args) {
         }
         ATOMIC_SUB(trx->close_cnt, 1);
 
-        uint64_t start_time = GetCurNanoSeconds();
-
         if (local_tx_event_q->flag == UBR_STATE_CONNECTED || ATOMIC_LOAD(trx->close_cnt) == 1) {
             local_tx_event_q->flag = UBR_STATE_CLOSED;
             trx->ubr_tx.trx_state = UBR_STATE_CLOSED;
@@ -346,7 +347,7 @@ void* UBRing::UbrTrxCloseCallback(void* args) {
             break;
         }
         remote_rx_event_q->flag = UBR_STATE_CLOSED;
-        RETURN_CODE clear_rc = ClearTrxResource(trx, start_time, UBR_CALL_BACK_CLOSE, 1);
+        RETURN_CODE clear_rc = ClearTrxResource(trx);
         if (UNLIKELY(clear_rc != UBRING_OK && clear_rc != UBRING_REENTRY)) {
             LOG(ERROR) << "Trx close callback failed, " << trx->local_shm.name << " clear trx resource failed.";
             break;
@@ -361,7 +362,7 @@ RETURN_CODE UBRing::UbrAddHBTimer() {
         return UBRING_ERR;
     }
 
-    const uint64_t interval_us = (uint64_t)FLAGS_ub_hb_timer_interval_s * 1000000ULL;
+    const uint64_t interval_us = (uint64_t)FLAGS_ub_hb_timer_interval_s * SEC_TO_USEC;
     RETURN_CODE rc = UbrTimerStart(&_trx->hb_timer, 0, interval_us,
                                    UbrTrxHBCallback, (void*)_trx);
     if (UNLIKELY(rc != UBRING_OK)) {
@@ -371,19 +372,17 @@ RETURN_CODE UBRing::UbrAddHBTimer() {
     return UBRING_OK;
 }
 
-RETURN_CODE UBRing::UbrPassiveClearTrx(UbrTrx *trx, int fd, PASSIVE_DISC_TYPE type) {
+RETURN_CODE UBRing::UbrPassiveClearTrx(UbrTrx *trx) {
     RETURN_CODE passive_close_check_rc = UbrTrxCloseCheck(trx);
     if (UNLIKELY(passive_close_check_rc != UBRING_OK)) {
         if (passive_close_check_rc == UBRING_REENTRY) {
             LOG(INFO) << "Passive close skipped, active close in progress, name=" << trx->local_shm.name;
-            uint64_t start_time = GetCurNanoSeconds();
-            return ClearTrxResource(trx, start_time, UBR_CALL_BACK_CLOSE);
+            return ClearTrxResource(trx);
         }
         return UBRING_ERR;
     }
     trx->ubr_tx.trx_state = UBR_STATE_CLOSED;
     trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
-    UNREFERENCE_PARAM(fd);
     // Non-blocking: this may run inside the heartbeat callback itself.
     UbrTimerDel(&trx->close_timer);
     UbrTimerDel(&trx->hb_timer);
@@ -439,14 +438,14 @@ void* UBRing::UbrTrxHBCallback(void* args) {
     }
 
     ++trx->ubr_tx.hb_retry_cnt;
-    if ((int)trx->ubr_tx.hb_retry_cnt <= FLAGS_ub_hb_retry_cnt) {
+    if (trx->ubr_tx.hb_retry_cnt <= FLAGS_ub_hb_retry_cnt) {
         return nullptr;
     }
 
     int fd = (int)trx->local_shm.fd;
-    LOG(INFO) << "Hlc heartbeat, start to clear trx resource. shm_fd=" << fd << ", shm_name=" << trx->local_shm.name;
-    UbrPassiveClearTrx(trx, fd, UBR_HEARTBEAT);
-    LOG(INFO) << "Hlc heartbeat clear trx resource finish.";
+    LOG(INFO) << "Ubr heartbeat, start to clear trx resource. shm_fd=" << fd << ", shm_name=" << trx->local_shm.name;
+    UbrPassiveClearTrx(trx);
+    LOG(INFO) << "Ubr heartbeat clear trx resource finish.";
     return nullptr;
 }
 
@@ -1141,7 +1140,7 @@ RETURN_CODE UBRing::WritevHasEnoughSpace(size_t buf_len)
     return UBRING_OK;
 }
 
-RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrCloseType close_type)
+RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx)
 {
     if (UNLIKELY(trx == nullptr)) {
         LOG(ERROR) << "Trx close failed, trx is null.";
@@ -1158,7 +1157,6 @@ RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrC
     }
 
     // Non-blocking: may run inside the close callback itself.
-    UNREFERENCE_PARAM(close_type);
     UbrTimerDel(&trx->close_timer);
     UbrTimerDel(&trx->hb_timer);
 
@@ -1170,9 +1168,9 @@ RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrC
     return UBRING_OK;
 }
 
-RETURN_CODE UBRing::ClearTrxResource(UbrTrx *trx, uint64_t start_time, UbrCloseType close_type, int op)
+RETURN_CODE UBRing::ClearTrxResource(UbrTrx *trx)
 {
-    RETURN_CODE rc = UbrClearResourceCheck(trx, start_time, close_type);
+    RETURN_CODE rc = UbrClearResourceCheck(trx);
     if (rc != UBRING_OK) {
         return rc;
     }

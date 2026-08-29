@@ -462,7 +462,7 @@ void *UbsShmCallback(void* args)
 
 RETURN_CODE UbsShmAddTimer(ShmList *shm_list)
 {
-    const uint64_t timer_interval_us = (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL;
+    const uint64_t timer_interval_us = (uint64_t)FLAGS_ub_flying_io_timeout_s * SEC_TO_USEC;
     RETURN_CODE rc = UbrTimerStart(&g_shm_timer_id, 0, timer_interval_us,
                                    UbsShmCallback, (void*)shm_list);
     if (UNLIKELY(rc != UBRING_OK)) {
