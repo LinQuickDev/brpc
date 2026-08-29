@@ -92,6 +92,38 @@ RETURN_CODE UBRingManager::UbrMgrInit() {
 }
 
 void UBRingManager::UbrMgrFini() {
+    // Cancel the pending delayed cleanups first; already running ones are
+    // drained below, before the pool memory they touch is freed.
+    if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
+        LOCK_GUARD(g_ubr_trx_mgr_mtx);
+        for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
+            UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
+            if (ctl != nullptr) {
+                UbrTimerDel(&ctl->timer);
+            }
+        }
+    }
+    // In-flight cleanup callbacks hold one extra reference each.
+    bool busy = true;
+    while (busy) {
+        busy = false;
+        {
+            LOCK_GUARD(g_ubr_trx_mgr_mtx);
+            if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
+                for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
+                    UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
+                    if (ctl != nullptr && ctl->ref.load() > 1) {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (busy) {
+            LOG_EVERY_SECOND(INFO) << "UbrMgrFini waits for in-flight cleanups.";
+            usleep(1000);
+        }
+    }
     {
         LOCK_GUARD(g_ubr_trx_mgr_mtx);
         if (g_ubr_mgr.trx_mgr_unit_ctl != nullptr) {
@@ -99,8 +131,7 @@ void UBRingManager::UbrMgrFini() {
                 UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[i];
                 if (ctl != nullptr) {
                     g_ubr_mgr.trx_mgr_unit_ctl[i] = nullptr;
-                    UbrTimerDel(&ctl->timer);
-                    ctl->ReleaseRef();
+                    ctl->ReleaseRef();           // manager reference
                 }
             }
         }
@@ -209,7 +240,22 @@ UbrCleanupCtl* UBRingManager::SnapshotUnitCleanupCtl(uint32_t idx) {
     if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_ctl == nullptr || idx >= g_ubr_mgr.trx_cap)) {
         return nullptr;
     }
-    return g_ubr_mgr.trx_mgr_unit_ctl[idx];
+    UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[idx];
+    if (ctl != nullptr) {
+        ctl->ref.fetch_add(1);               // snapshot reference
+    }
+    return ctl;
+}
+
+bool UBRingManager::IsUbrTrxSlotUsed(uint32_t idx, uint64_t expect_ubr_id) {
+    LOCK_GUARD(g_ubr_trx_mgr_mtx);
+    if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_id == nullptr ||
+                 g_ubr_mgr.trx_mgr_unit_status == nullptr ||
+                 idx >= g_ubr_mgr.trx_cap)) {
+        return false;
+    }
+    return g_ubr_mgr.trx_mgr_unit_status[idx] == UBR_MGR_UNIT_USED &&
+           g_ubr_mgr.trx_mgr_unit_id[idx] == expect_ubr_id;
 }
 
 void UBRingManager::PublishUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl) {

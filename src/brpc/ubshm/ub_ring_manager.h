@@ -71,9 +71,13 @@ public:
     static RETURN_CODE ReleaseUbrTrxFromMgr(UbrTrx *trx,
                                             uint64_t expect_ubr_id);
 
-    // Snapshot the cleanup control object of a pool slot. Must be paired
-    // with a generation check by the caller.
+    // Snapshot the cleanup control object of a pool slot. The caller
+    // receives a reference and must ReleaseRef it on every exit path.
     static UbrCleanupCtl* SnapshotUnitCleanupCtl(uint32_t idx);
+
+    // Under the manager lock, confirm the pool slot is still used by the
+    // given generation (not released or reused meanwhile).
+    static bool IsUbrTrxSlotUsed(uint32_t idx, uint64_t expect_ubr_id);
 
     // Anchor `ctl' to the pool slot (called once per schedule). The object
     // is retired and freed at the next Acquire of the same slot.

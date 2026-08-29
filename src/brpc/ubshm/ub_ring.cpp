@@ -98,7 +98,7 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     if (UNLIKELY(trx == nullptr || trx->local_shm.addr == nullptr)) {
         return UBRING_OK;                    // released trx, stale event
     }
-    if (trx->cleanup_ctl != nullptr) {
+    if (__atomic_load_n(&trx->cleanup_ctl, __ATOMIC_SEQ_CST) != nullptr) {
         return UBRING_OK;                    // cleanup already scheduled
     }
     auto* ctl = new (std::nothrow) UbrCleanupCtl();
@@ -138,9 +138,8 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
             if (published != nullptr &&
                 ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id) {
                 work(trx, ctl->ubr_id);
-            } else {
-                ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
             }
+            ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
             ctl->ReleaseRef();               // runner reference
         }
         ctl->ReleaseRef();                   // starter reference
@@ -202,6 +201,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
             UbrTimerDelAndWait(&_trx->hb_timer);
             UbrCleanupCtl* ctl = UBRingManager::SnapshotUnitCleanupCtl(_trx->trx_mgr_index);
             if (ctl != nullptr && ctl->ubr_id != expect_ubr_id) {
+                ctl->ReleaseRef();               // snapshot reference
                 ctl = nullptr;                   // slot reused, not ours
             }
             bool cleanup_owned = false;
@@ -227,6 +227,9 @@ RETURN_CODE UBRing::UbrTrxClose() {
                 if (ctl != nullptr) {
                     ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
                 }
+            }
+            if (ctl != nullptr) {
+                ctl->ReleaseRef();               // snapshot reference
             }
             return UBRING_ERR_TIMEOUT;
         }
@@ -402,7 +405,7 @@ void* UBRing::UbrPassiveClearCallback(void* args) {
     }
     ctl->ref.fetch_add(1);                   // runner reference
     UbrTrx* trx = ctl->trx;
-    if (UNLIKELY(ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id)) {
+    if (UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
         UbrDoPassiveClearWork(trx, ctl->ubr_id);
     }
     ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
@@ -469,7 +472,7 @@ void *UBRing::UbrAsynClearCallback(void *args)
     }
     ctl->ref.fetch_add(1);                   // runner reference
     UbrTrx* trx = ctl->trx;
-    if (UNLIKELY(ATOMIC_LOAD(trx->ubr_id) == ctl->ubr_id)) {
+    if (UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
         UbrDoAsynClearWork(trx, ctl->ubr_id);
     }
     ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
