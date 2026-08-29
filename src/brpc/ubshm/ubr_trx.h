@@ -140,6 +140,7 @@ typedef struct TagUbrTrx {
     int clear_timer_fd;
     AtomicInt close_cnt;
     AtomicInt close_state;
+    AtomicInt cleanup_pending;
 } UbrTrx;
 
 typedef struct TagFileLock {

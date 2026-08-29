@@ -18,20 +18,15 @@
 #ifndef BRPC_TIMER_MGR_H
 #define BRPC_TIMER_MGR_H
 #include <pthread.h>
-#include <time.h>
+#include <ctime>
+#include <atomic>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+#include "bthread/types.h"
+#include "bthread/unstable.h"
+#include "bthread/bthread.h"
 #include "brpc/ubshm/common/common.h"
-
-#if defined(OS_LINUX)
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#elif defined(OS_MACOSX)
-#include <sys/types.h>
-#include <sys/event.h>
-#include <sys/time.h>
-#endif
-
-#define MAX_TIMER 1024
-#define TIMER_EPOLL_WAIT_TIMEOUT 1000
 
 #if defined(OS_MACOSX)
 struct itimerspec
@@ -40,34 +35,47 @@ struct itimerspec
     struct timespec it_value;
 };
 #endif
+
 namespace brpc {
 namespace ubring {
-typedef enum {
-    TIMER_CONTEXT_NOT_USING,
-    TIMER_CONTEXT_EPOLL_WAITING,
-    TIMER_CONTEXT_CALLBACK_ONGOING
-} TimerFdCtxStatus;
 
-typedef struct {
-    void *(*cb)(void*);
+constexpr long long NS_PER_SEC = 1000000000LL;
+
+typedef void * (*TimerCallback)(void *);
+
+struct TimerContext {
+    TimerContext()
+        : cb(nullptr), args(nullptr), periodical(false), interval(), timer_id(0),
+          stopped(false), no_reschedule(false), running(0), worker_tid(0) {}
+
+    TimerCallback cb;
     void *args;
-    uint32_t fd;
-    TimerFdCtxStatus status;
-    uint32_t periodical;
-    pthread_spinlock_t spin_lock;
-} TimerFdCtx;
+    bool periodical;
+    timespec interval;
+    bthread_timer_t timer_id;
+    bthread::Mutex mtx;
+    bthread::ConditionVariable cv;
+    bool stopped;
+    bool no_reschedule;
+    int running;
+    bthread_t worker_tid;
+};
 
-RETURN_CODE TimerInit(void);
+extern std::unordered_map<uint64_t, std::shared_ptr<TimerContext>> g_timer_ctx_map;
+extern std::mutex g_timer_ctx_mutex;
+extern std::atomic<uint64_t> g_total_timer_num;
+
+
+int TimerInit(void);
 void TimerModuleDestroy(void);
-void *UnifiedCallback(void *args);
-void *TimerEpoll(void *args);
-int32_t TimerStart(const itimerspec *time, void *(*cb)(void *), void *args);
+int32_t TimerStart(const itimerspec *time, TimerCallback cb, void *args);
 uint32_t GetActiveTimerNum(void);
-void CloseTimerFd(int fd);
 
-void DeleteTimerSafe(uint32_t fd);
-void DeleteTimer(uint32_t fd);
-RETURN_CODE TimerFdCtxValidate(uint32_t fd);
+void StopTimer(uint64_t timer_id);
+void DeleteTimerSafe(uint64_t timer_id);
+void DeleteTimer(uint64_t timer_id);
+
+void TimerCallbackWrapper(void *arg);
 }
 }
 #endif //BRPC_TIMER_MGR_H
