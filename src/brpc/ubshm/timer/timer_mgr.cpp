@@ -15,454 +15,285 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#define _GNU_SOURCE
-#include <pthread.h>
-#include <sched.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <atomic>
-#include <sys/resource.h>
+#include <new>
+#include "bthread/bthread.h"                     // bthread_usleep
+#include "bthread/unstable.h"                    // bthread_timer_add/del
+#include "butil/time.h"
 #include "brpc/ubshm/timer/timer_mgr.h"
 
 namespace brpc {
 namespace ubring {
 
-int32_t g_epoll_fd = -1;
+namespace {
+
 std::atomic<uint32_t> g_total_timer_num(0);
-TimerFdCtx *g_timer_fd_ctx_map = nullptr;
-uint32_t g_max_system_fd = 0;
-static pthread_t g_epoll_execute_thread = 0;
-static int32_t g_timer_module_initialized = 0;
 
-#if defined(OS_MACOSX)
-static int timerfd_create_macosx(int clockid, int flags);
-static int timerfd_settime_macosx(int fd, int flags,
-                                   const itimerspec *new_value,
-                                   itimerspec *old_value);
-#endif
+// Sentinel occupying a slot while its task is being constructed and
+// scheduled. Never dereferenced: deleters just clear it, and the starter
+// gives up when it finds the reservation gone.
+const UbrTimerId kReservedSlot = (UbrTimerId)((uintptr_t)1);
 
-static RETURN_CODE DeleteTimerInner(uint32_t fd) {
-    if (g_timer_fd_ctx_map == nullptr) {
-        return UBRING_OK;
+}  // namespace
+
+// Ownership rules (all atomics are seq_cst so no interleaving can break
+// them):
+// - "schedule" reference: one per pending/running bthread schedule. It is
+//   consumed exactly once -- by the firing callback, or by the deleter
+//   whose bthread_timer_del returned 0 (cancelled before run; guaranteed
+//   never to run by TimerThread's version CAS).
+// - "owner" reference: stands for the handle slot. It is consumed exactly
+//   once by whoever takes the task out of *slot: a deleter, or -- for
+//   one-shot timers -- the firing callback itself (auto-consume, mirroring
+//   the old UnifiedCallback behavior of deleting non-periodic timers after
+//   their run). While a slot only holds the reservation sentinel, the task
+//   is unreachable to deleters and the starter owns both references.
+// - The handle slot keeps the task object alive; it does NOT keep `arg'
+//   alive. Freeing resources reachable from `arg' therefore requires
+//   UbrTimerDelAndWait, which waits until every schedule reference is gone
+//   (and with it, any running callback).
+//
+// The re-arm of a periodic timer claims its next schedule reference BEFORE
+// re-reading `stopped', and deleters store `stopped' before cancelling, so
+// either the re-arm gives the claim up or somebody successfully cancels the
+// freshly scheduled timer and consumes the claim: the task cannot be freed
+// while a schedule or a running callback still refers to it (no UAF).
+struct UbrTimerTask {
+    UbrTimerId* slot;                            // where this task is published
+    std::atomic<bthread_timer_t> id;
+    void* (*cb)(void*);
+    void* arg;
+    UbrTimerBackoffFn backoff;
+    uint64_t interval_us;                        // timer thread only
+    bool periodic;
+    std::atomic<bool> stopped;
+    std::atomic<int> ref;                        // owner + schedule refs
+    std::atomic<bool> join_pending;              // a DelAndWait is waiting
+    std::atomic<bool> done;                      // refs hit zero, joiner frees
+};
+
+namespace {
+
+void ReleaseRef(UbrTimerTask* task) {
+    if (task->ref.fetch_sub(1) == 1) {
+        g_total_timer_num.fetch_sub(1);
+        if (task->join_pending.load()) {
+            task->done.store(true);              // the joiner frees the task
+        } else {
+            delete task;
+        }
     }
-
-    if (pthread_spin_lock(&g_timer_fd_ctx_map[fd].spin_lock) != 0) {
-        return UBRING_ERR;
-    }
-
-    if (g_timer_fd_ctx_map[fd].status == TIMER_CONTEXT_NOT_USING) {
-        pthread_spin_unlock(&g_timer_fd_ctx_map[fd].spin_lock);
-        return UBRING_OK;
-    }
-
-    g_timer_fd_ctx_map[fd].status = TIMER_CONTEXT_NOT_USING;
-    g_timer_fd_ctx_map[fd].cb = nullptr;
-    g_timer_fd_ctx_map[fd].args = nullptr;
-    g_timer_fd_ctx_map[fd].periodical = 0;
-    g_timer_fd_ctx_map[fd].fd = 0;
-
-    pthread_spin_unlock(&g_timer_fd_ctx_map[fd].spin_lock);
-
-#if defined(OS_LINUX)
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, (int)fd, nullptr);
-#elif defined(OS_MACOSX)
-    struct kevent evt;
-    EV_SET(&evt, fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
-    kevent(g_epoll_fd, &evt, 1, nullptr, 0, nullptr);
-#endif
-
-    uint64_t exp = 0;
-    read((int)fd, &exp, sizeof(exp));
-
-    close((int)fd);
-    std::atomic_fetch_sub(&g_total_timer_num, 1U);
-    return UBRING_OK;
 }
 
-static RETURN_CODE StartTimeEpoll(void) {
-#if defined(OS_LINUX)
-    g_epoll_fd = epoll_create1(0);
-#elif defined(OS_MACOSX)
-    g_epoll_fd = kqueue();
-#endif
-    if (UNLIKELY(g_epoll_fd == -1)) {
-        LOG(ERROR) << "Failed to create epoll/kqueue. errno=" << errno;
-        return UBRING_ERR;
+void UbrTimerOnFire(void* p) {
+    UbrTimerTask* task = (UbrTimerTask*)p;
+    if (!task->stopped.load()) {
+        task->cb(task->arg);
     }
 
-    int ret = pthread_create(&g_epoll_execute_thread, nullptr, TimerEpoll, nullptr);
-    if (UNLIKELY(ret != 0)) {
-        LOG(ERROR) << "Failed to create thread err=" << ret;
-        return UBRING_ERR;
-    }
-    return UBRING_OK;
-}
-
-static RETURN_CODE TimerSpinLocksInit(void) {
-    if (g_timer_fd_ctx_map == nullptr) {
-        LOG(ERROR) << "Timer module is not fully initialized.";
-        return UBRING_ERR;
-    }
-
-    for (uint32_t fd = 0; fd < g_max_system_fd; fd++) {
-        int ret = pthread_spin_init(&g_timer_fd_ctx_map[fd].spin_lock,
-                                    PTHREAD_PROCESS_PRIVATE);
-        if (ret != EOK) {
-            LOG(ERROR) << "Failed to initialize spin lock for fd=" << fd;
-            for (uint32_t cleanup_fd = 0; cleanup_fd < fd; cleanup_fd++) {
-                pthread_spin_destroy(&g_timer_fd_ctx_map[cleanup_fd].spin_lock);
+    if (task->periodic) {
+        // Claim the next schedule's reference BEFORE re-reading `stopped':
+        // a racing delete either sees our claim (it will not free the
+        // task) or we see its stop flag (we will not re-arm).
+        task->ref.fetch_add(1);
+        if (task->stopped.load()) {
+            ReleaseRef(task);                    // give up re-arming
+        } else {
+            uint64_t interval = task->interval_us;
+            if (task->backoff != nullptr) {
+                interval = task->backoff(task->arg, interval);
+                task->interval_us = interval;
             }
-            return UBRING_ERR;
-        }
-    }
-    return UBRING_OK;
-}
-
-static RETURN_CODE ExecuteCallback(int32_t timer_fd) {
-    UnifiedCallback((void *)(&g_timer_fd_ctx_map[timer_fd]));
-    return UBRING_OK;
-}
-
-static RETURN_CODE TimerCtxMapCompletion(void) {
-    memset(g_timer_fd_ctx_map, 0, sizeof(TimerFdCtx) * g_max_system_fd);
-
-    RETURN_CODE ret = TimerSpinLocksInit();
-    if (ret != UBRING_OK) {
-        LOG(ERROR) << "Failed to init spin locks for timer module.";
-        return UBRING_ERR;
-    }
-    return UBRING_OK;
-}
-
-RETURN_CODE TimerInit(void) {
-    if (g_timer_module_initialized > 0) {
-        return UBRING_OK;
-    }
-
-    g_total_timer_num.store(0);
-
-    struct rlimit rlim;
-    if (getrlimit(RLIMIT_NOFILE, &rlim) != UBRING_OK) {
-        LOG(ERROR) << "Failed to get fd";
-        return UBRING_ERR;
-    }
-    g_max_system_fd = (uint32_t)rlim.rlim_cur;
-
-    if (g_timer_fd_ctx_map == nullptr) {
-        g_timer_fd_ctx_map = (TimerFdCtx *)malloc(sizeof(TimerFdCtx) * g_max_system_fd);
-        if (UNLIKELY(!g_timer_fd_ctx_map)) {
-            LOG(ERROR) << "Fail to malloc space for timer modules. errno=%d", errno;
-            return UBRING_ERR;
-        }
-
-        RETURN_CODE ret = TimerCtxMapCompletion();
-        if (ret != UBRING_OK) {
-            LOG(ERROR) << "Failed to init main data structure of Time Module. ret=" << ret;
-            free(g_timer_fd_ctx_map);
-            g_timer_fd_ctx_map = nullptr;
-            return UBRING_ERR;
-        }
-    }
-
-    RETURN_CODE ret = StartTimeEpoll();
-    if (ret != UBRING_OK) {
-        LOG(ERROR) << "Failed to start Timer Epoll. ret=" << ret;
-        if (LIKELY(g_timer_fd_ctx_map != nullptr)) {
-            FREE_PTR(g_timer_fd_ctx_map);
-        }
-        return UBRING_ERR;
-    }
-    g_timer_module_initialized = 1;
-    return UBRING_OK;
-}
-
-void *UnifiedCallback(void *args) {
-    TimerFdCtx *ctx = (TimerFdCtx *)args;
-    if (pthread_spin_lock(&ctx->spin_lock) != 0) {
-        return nullptr;
-    }
-
-    if (ctx->status == TIMER_CONTEXT_NOT_USING) {
-        pthread_spin_unlock(&ctx->spin_lock);
-        return nullptr;
-    }
-
-    void *(*cb)(void *) = ctx->cb;
-    void *cb_args = ctx->args;
-    uint32_t fd = ctx->fd;
-    int is_periodical = ctx->periodical;
-    ctx->status = TIMER_CONTEXT_CALLBACK_ONGOING;
-
-    pthread_spin_unlock(&ctx->spin_lock);
-
-    cb(cb_args);
-
-    if (!is_periodical) {
-        DeleteTimerInner(fd);
-    }
-    return nullptr;
-}
-
-void *TimerEpoll(void *args) {
-    UNREFERENCE_PARAM(args);
-#if defined(OS_LINUX)
-    struct epoll_event ready_events[MAX_TIMER];
-#elif defined(OS_MACOSX)
-    struct kevent ready_events[MAX_TIMER];
-#endif
-
-    while (1) {
-        if (g_timer_module_initialized <= 0) {
-            LOG(ERROR) << "The Timer module is not initialized.";
-            break;
-        }
-
-#if defined(OS_LINUX)
-        int32_t ready_num = epoll_wait(g_epoll_fd, ready_events, MAX_TIMER,
-                                      TIMER_EPOLL_WAIT_TIMEOUT);
-#elif defined(OS_MACOSX)
-        struct timespec timeout = {0, TIMER_EPOLL_WAIT_TIMEOUT * 1000000};
-        int32_t ready_num = kevent(g_epoll_fd, nullptr, 0, ready_events, MAX_TIMER, &timeout);
-#endif
-
-        if (UNLIKELY(ready_num == -1)) {
-            errno_t err = errno;
-            if (err == EINTR) {
-                LOG_EVERY_SECOND(WARNING) << "Epoll/Kqueue wait was interrupted. errno=" << err;
-                continue;
-            } else if (err == EBADF) {
-                LOG(WARNING) << "The Timer module is destroyed.";
-                break;
-            }
-            LOG(ERROR) << "Epoll/Kqueue wait internal error. errno=" << err;
-            break;
-        }
-
-        for (int32_t i = 0; i < ready_num; i++) {
-#if defined(OS_LINUX)
-            struct epoll_event *event = &ready_events[i];
-            int32_t timer_fd = event->data.fd;
-#elif defined(OS_MACOSX)
-            struct kevent *event = &ready_events[i];
-            int32_t timer_fd = event->ident;
-#endif
-
-            uint64_t exp = 0;
-            if (read(timer_fd, &exp, sizeof(exp)) < 0) {
-                if (errno != EBADF) {
-                    LOG(ERROR) << "Failed to read timerfd=" << timer_fd << " errno=" << errno;
+            bthread_timer_t id = 0;
+            int rc = bthread_timer_add(
+                &id, butil::microseconds_from_now((int64_t)interval),
+                UbrTimerOnFire, task);
+            if (rc == 0) {
+                task->id.store(id);
+                if (task->stopped.load() && bthread_timer_del(id) == 0) {
+                    ReleaseRef(task);            // cancelled what we scheduled
                 }
-                continue;
-            }
-            if (TimerFdCtxValidate((uint32_t)timer_fd) != UBRING_OK) {
-                continue;
-            }
-
-            RETURN_CODE ret = ExecuteCallback(timer_fd);
-            if (ret != UBRING_OK) {
-                LOG(ERROR) << "Failed execute callback ret=" << ret;
-                DeleteTimerInner((uint32_t)timer_fd);
-                continue;
+            } else {
+                LOG(ERROR) << "Fail to re-arm ubring timer, rc=" << rc;
+                ReleaseRef(task);                // stop the periodic chain
             }
         }
+        ReleaseRef(task);                        // consume current schedule
+        return;
     }
-    return nullptr;
+
+    // One-shot: consume the schedule reference, and the owner reference as
+    // well if this fire still owns the slot (nobody deleted the timer).
+    // Exactly one of this CAS and a racing deleter's exchange succeeds, so
+    // the owner reference is released exactly once. CAS (not exchange) so
+    // that a slot already reused by another task is left untouched.
+    UbrTimerId expected = task;
+    const bool owned =
+        __atomic_compare_exchange_n(task->slot, &expected, (UbrTimerId) nullptr,
+                                    false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    ReleaseRef(task);                            // consume current schedule
+    if (owned) {
+        ReleaseRef(task);                        // consume owner reference
+    }
 }
 
-void DeleteTimerSafe(uint32_t fd) {
-    if (g_timer_fd_ctx_map == nullptr) {
-        return;
+// Take the task out of *slot. Returns nullptr when the slot is empty.
+// A reservation sentinel is never returned: the caller treats it as
+// "start still in flight, nothing to stop or wait for".
+UbrTimerTask* TakeOutTask(UbrTimerId* slot) {
+    UbrTimerTask* task =
+        __atomic_exchange_n(slot, (UbrTimerId) nullptr, __ATOMIC_SEQ_CST);
+    if (task == kReservedSlot) {
+        // The starter will observe the cleared reservation, cancel the
+        // fresh task and release it by itself.
+        return nullptr;
     }
-
-    if (pthread_spin_lock(&g_timer_fd_ctx_map[fd].spin_lock) != 0) {
-        return;
-    }
-
-    if (g_timer_fd_ctx_map[fd].status == TIMER_CONTEXT_NOT_USING) {
-        pthread_spin_unlock(&g_timer_fd_ctx_map[fd].spin_lock);
-        return;
-    }
-
-    g_timer_fd_ctx_map[fd].status = TIMER_CONTEXT_NOT_USING;
-    g_timer_fd_ctx_map[fd].cb = nullptr;
-    g_timer_fd_ctx_map[fd].args = nullptr;
-    g_timer_fd_ctx_map[fd].periodical = 0;
-    g_timer_fd_ctx_map[fd].fd = 0;
-
-    pthread_spin_unlock(&g_timer_fd_ctx_map[fd].spin_lock);
-
-#if defined(OS_LINUX)
-    epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, (int)fd, nullptr);
-#elif defined(OS_MACOSX)
-    struct kevent evt;
-    EV_SET(&evt, fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
-    kevent(g_epoll_fd, &evt, 1, nullptr, 0, nullptr);
-#endif
-
-    uint64_t exp = 0;
-    read((int)fd, &exp, sizeof(exp));
-
-    close((int)fd);
-    std::atomic_fetch_sub(&g_total_timer_num, 1U);
+    return task;
 }
 
-void DeleteTimer(uint32_t fd) {
-    if (g_timer_fd_ctx_map == nullptr) {
-        LOG(WARNING) << "The timer is not initialized.";
-        return;
-    }
-
-    g_timer_fd_ctx_map[fd].periodical = 0;
+// Give a reserved slot back unless a deleter already cleared it.
+void ReleaseReservation(UbrTimerId* slot) {
+    UbrTimerId expected = kReservedSlot;
+    __atomic_compare_exchange_n(slot, &expected, (UbrTimerId) nullptr, false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 
-int32_t TimerStart(const itimerspec *time, void *(*cb)(void *), void *args) {
-    if (g_epoll_fd == -1) {
-        LOG(ERROR) << "Timer epoll/kqueue encountered internal error.";
-        return -1;
+RETURN_CODE TimerStartInternal(UbrTimerId* slot, uint64_t delay_us,
+                               uint64_t interval_us, void* (*cb)(void*),
+                               void* arg, UbrTimerBackoffFn backoff,
+                               bool once) {
+    if (UNLIKELY(slot == nullptr || cb == nullptr)) {
+        LOG(ERROR) << "UbrTimerStart invalid argument, slot=" << slot;
+        return UBRING_ERR;
     }
 
-#if defined(OS_LINUX)
-    int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
-#elif defined(OS_MACOSX)
-    int timer_fd = timerfd_create_macosx(CLOCK_MONOTONIC, 0);
-#endif
-
-    if (UNLIKELY(timer_fd >= (int)g_max_system_fd || timer_fd == -1)) {
-        LOG(ERROR) << "Failed to create timerfd=" << timer_fd << " errno=" << errno;
-        return -1;
+    // Reserve the slot atomically (nullptr -> reserved) so that a
+    // concurrent UbrTimerStartOnce on the same slot cannot schedule twice.
+    // The task is only published once it is fully scheduled; until then
+    // deleters just clear the reservation and the starter gives up.
+    UbrTimerId expected = nullptr;
+    if (!__atomic_compare_exchange_n(slot, &expected, kReservedSlot, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        // Slot occupied or reserved by a concurrent start.
+        return once ? UBRING_REENTRY : UBRING_ERR;
     }
 
-    g_timer_fd_ctx_map[timer_fd].status = TIMER_CONTEXT_EPOLL_WAITING;
-    g_timer_fd_ctx_map[timer_fd].cb = cb;
-    g_timer_fd_ctx_map[timer_fd].args = args;
-    g_timer_fd_ctx_map[timer_fd].fd = (uint32_t)timer_fd;
-
-    if (LIKELY(time->it_interval.tv_sec > 0 || time->it_interval.tv_nsec > 0)) {
-        g_timer_fd_ctx_map[timer_fd].periodical = 1;
+    UbrTimerTask* task = new (std::nothrow) UbrTimerTask();
+    if (UNLIKELY(task == nullptr)) {
+        LOG(ERROR) << "Fail to malloc ubring timer task.";
+        ReleaseReservation(slot);
+        return UBRING_ERR;
     }
+    task->slot = slot;
+    task->id.store(0);
+    task->cb = cb;
+    task->arg = arg;
+    task->backoff = backoff;
+    task->interval_us = interval_us;
+    task->periodic = (interval_us > 0);
+    task->stopped.store(false);
+    task->ref.store(2);                          // owner + first schedule
+    task->join_pending.store(false);
+    task->done.store(false);
+    g_total_timer_num.fetch_add(1);
 
-#if defined(OS_LINUX)
-    struct epoll_event event = {
-        .events = EPOLLIN,
-        .data = {.fd = timer_fd}
-    };
-
-    int32_t ret = epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, timer_fd, &event);
-#elif defined(OS_MACOSX)
-    struct kevent event;
-    uint64_t timeout_nsec = time->it_value.tv_sec * 1000000000ULL + time->it_value.tv_nsec;
-    uint64_t interval_nsec = time->it_interval.tv_sec * 1000000000ULL + time->it_interval.tv_nsec;
-    EV_SET(&event, timer_fd, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0,
-           timeout_nsec / 1000000, nullptr);
-    int32_t ret = kevent(g_epoll_fd, &event, 1, nullptr, 0, nullptr);
-#endif
-
-    if (UNLIKELY(ret != 0)) {
-        CloseTimerFd(timer_fd);
-        LOG(ERROR) << "Failed to add event to epoll/kqueue. errno=" << errno;
-        return -1;
+    bthread_timer_t id = 0;
+    int rc = bthread_timer_add(
+        &id, butil::microseconds_from_now((int64_t)delay_us),
+        UbrTimerOnFire, task);
+    if (UNLIKELY(rc != 0)) {
+        LOG(ERROR) << "Fail to add ubring timer, rc=" << rc;
+        ReleaseReservation(slot);                // no-op if a deleter cleared it
+        ReleaseRef(task);                        // owner (never published)
+        ReleaseRef(task);                        // schedule, never ran
+        return UBRING_ERR;
     }
+    task->id.store(id);
 
-    std::atomic_fetch_add(&g_total_timer_num, 1U);
-
-#if defined(OS_LINUX)
-    ret = timerfd_settime(timer_fd, 0, time, nullptr);
-#elif defined(OS_MACOSX)
-    ret = timerfd_settime_macosx(timer_fd, 0, time, nullptr);
-#endif
-
-    if (UNLIKELY(ret != 0)) {
-#if defined(OS_LINUX)
-        if (epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, timer_fd, nullptr) != 0) {
-#elif defined(OS_MACOSX)
-        struct kevent evt;
-        EV_SET(&evt, timer_fd, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
-        if (kevent(g_epoll_fd, &evt, 1, nullptr, 0, nullptr) != 0) {
-#endif
-            LOG(ERROR) << "Failed to delete the timer fd=" << timer_fd << " with errno=" << errno;
+    // Publish. If a deleter cleared the reservation meanwhile, cancel the
+    // fresh task instead: the deleter already conceptually owns it.
+    expected = kReservedSlot;
+    if (!__atomic_compare_exchange_n(slot, &expected, (UbrTimerId) task, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        task->stopped.store(true);
+        if (bthread_timer_del(id) == 0) {
+            ReleaseRef(task);                    // schedule never runs
         }
-        CloseTimerFd(timer_fd);
-        std::atomic_fetch_sub(&g_total_timer_num, 1U);
-        LOG(ERROR) << "Failed to set timer";
-        return -1;
+        ReleaseRef(task);                        // owner (never published)
+        return UBRING_ERR;
+    }
+    if (task->stopped.load() && bthread_timer_del(id) == 0) {
+        ReleaseRef(task);                        // deleted before it could run
+    }
+    return UBRING_OK;
+}
+
+}  // namespace
+
+void UbrTimerStart(UbrTimerId* slot, uint64_t delay_us, uint64_t interval_us,
+                   void* (*cb)(void*), void* arg, UbrTimerBackoffFn backoff) {
+    TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff, false);
+}
+
+RETURN_CODE UbrTimerStartOnce(UbrTimerId* slot, uint64_t delay_us,
+                              uint64_t interval_us, void* (*cb)(void*),
+                              void* arg, UbrTimerBackoffFn backoff) {
+    return TimerStartInternal(slot, delay_us, interval_us, cb, arg, backoff,
+                              true);
+}
+
+void UbrTimerDel(UbrTimerId* slot) {
+    if (slot == nullptr) {
+        return;
+    }
+    UbrTimerTask* task = TakeOutTask(slot);
+    if (task == nullptr) {
+        return;
     }
 
-    return timer_fd;
+    task->stopped.store(true);
+    // Never wait for a running callback: self-delete from inside the
+    // callback lands here (bthread_timer_del reports 1/EINVAL) and the
+    // schedule reference is consumed when the callback returns.
+    bthread_timer_t id = task->id.load();
+    if (id != 0 && bthread_timer_del(id) == 0) {
+        ReleaseRef(task);                        // cancelled before run
+    }
+    ReleaseRef(task);                            // owner reference
+}
+
+void UbrTimerDelAndWait(UbrTimerId* slot) {
+    if (slot == nullptr) {
+        return;
+    }
+    UbrTimerTask* task = TakeOutTask(slot);
+    if (task == nullptr) {
+        return;
+    }
+
+    // Register as joiner while the owner reference still keeps the task
+    // alive, so the last schedule release hands the deletion over to us
+    // instead of freeing the task we are about to inspect.
+    task->join_pending.store(true);
+    task->stopped.store(true);
+    bthread_timer_t id = task->id.load();
+    if (id != 0 && bthread_timer_del(id) == 0) {
+        ReleaseRef(task);                        // cancelled before run
+    }
+    ReleaseRef(task);                            // owner reference
+
+    // The exchange above makes this the only joiner of the task, so once
+    // `done' is observed no one else touches it and we free it.
+    while (!task->done.load()) {
+        bthread_usleep(1000);
+    }
+    task->join_pending.store(false);
+    delete task;
 }
 
 uint32_t GetActiveTimerNum(void) {
-    return std::atomic_load(&g_total_timer_num);
+    return g_total_timer_num.load();
 }
-
-void CloseTimerFd(int fd) {
-    g_timer_fd_ctx_map[fd].cb = nullptr;
-    g_timer_fd_ctx_map[fd].args = nullptr;
-    g_timer_fd_ctx_map[fd].status = TIMER_CONTEXT_NOT_USING;
-    g_timer_fd_ctx_map[fd].fd = 0;
-    g_timer_fd_ctx_map[fd].periodical = 0;
-    if (close((int)fd) != 0) {
-        LOG(ERROR) << "Failed to close timer fd=" << fd << " errno=" << errno;
-        return;
-    }
-}
-
-void TimerModuleDestroy(void) {
-    uint32_t max_fd = g_max_system_fd;
-    if (g_timer_fd_ctx_map) {
-        for (uint32_t fd = 0; fd < max_fd; fd++) {
-            if (g_timer_fd_ctx_map[fd].status != TIMER_CONTEXT_NOT_USING) {
-                DeleteTimerSafe(fd);
-            }
-        }
-    }
-    close(g_epoll_fd);
-    g_epoll_fd = -1;
-    g_total_timer_num = 0;
-    g_timer_module_initialized = 0;
-    int32_t ret = pthread_join(g_epoll_execute_thread, nullptr);
-    if (ret != EOK) {
-        LOG(ERROR) << "Failed to join pthread, during destroying timer module. ret=" << ret;
-        return;
-    }
-}
-
-RETURN_CODE TimerFdCtxValidate(uint32_t fd) {
-    if (fd >= g_max_system_fd) {
-        LOG(ERROR) << "TimerFd=" << fd << " is out of range=" << g_max_system_fd;
-        return UBRING_ERR;
-    }
-    if (g_timer_fd_ctx_map[fd].status == TIMER_CONTEXT_NOT_USING) {
-        LOG(ERROR) << "TimerFd=" << fd << " has wrong status=" << g_timer_fd_ctx_map[fd].status;
-        return UBRING_ERR;
-    }
-    if (g_timer_fd_ctx_map[fd].cb == nullptr) {
-        LOG(ERROR) << "The callback is not set.";
-        return UBRING_ERR;
-    }
-
-    return UBRING_OK;
-}
-
-#if defined(OS_MACOSX)
-static int timerfd_create_macosx(int clockid, int flags) {
-    int pipefd[2];
-    if (pipe(pipefd) == -1) {
-        return -1;
-    }
-    return pipefd[0];
-}
-
-static int timerfd_settime_macosx(int fd, int flags,
-                                   const itimerspec *new_value,
-                                   itimerspec *old_value) {
-    if (old_value != nullptr) {
-        memset(old_value, 0, sizeof(itimerspec));
-    }
-    return 0;
-}
-#endif
 
 }  // namespace ubring
 }  // namespace brpc

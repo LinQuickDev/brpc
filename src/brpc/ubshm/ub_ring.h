@@ -61,6 +61,8 @@ public:
 
     static void *UbrAsynClearCallback(void *args);
 
+    static void *UbrPassiveClearCallback(void *args);
+
     int UbrTrxSend(const void *buf, uint32_t buf_len);
 
     int UbrTrxRecv(void *buf, uint32_t buf_len);

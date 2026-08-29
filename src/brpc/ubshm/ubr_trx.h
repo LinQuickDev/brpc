@@ -24,6 +24,7 @@
 #include "brpc/ubshm/common/common.h"
 #include "brpc/ubshm/common/thread_lock.h"
 #include "brpc/ubshm/ubr_msg.h"
+#include "brpc/ubshm/timer/timer_mgr.h"
 
 /* +----------------------------------------------------------------------------+
    │                                 UbrTrx shm                                 │
@@ -135,9 +136,13 @@ typedef struct TagUbrTrx {
     UbrTrxType type;
     SHM local_shm;
     SHM remote_shm;
-    int timer_fd;
-    int hb_timer_fd;
-    int clear_timer_fd;
+    UbrTimerId close_timer;
+    UbrTimerId hb_timer;
+    UbrTimerId clear_timer;
+    // Last io ids seen by the close-check timer, used to reset its
+    // back-off polling interval when the link has traffic.
+    uint64_t close_chk_in_io_id;
+    uint64_t close_chk_out_io_id;
     AtomicInt close_cnt;
     AtomicInt close_state;
 } UbrTrx;

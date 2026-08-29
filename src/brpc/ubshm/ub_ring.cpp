@@ -38,6 +38,10 @@ DEFINE_int32(ub_hb_retry_cnt, 10,
              "UBRing heartbeat retry count.");
 DEFINE_int32(ub_event_queue_timer_interval_us, 100,
              "UBRing disconnection check interval in microseconds.");
+DEFINE_int32(ub_event_queue_timer_interval_max_us, 10000,
+             "UBRing upper bound of the close-check polling interval while "
+             "the link is idle; the interval backs off from "
+             "ub_event_queue_timer_interval_us up to this value.");
 
 UBRing::UBRing()
 {}
@@ -89,9 +93,15 @@ RETURN_CODE UBRing::UbrTrxClose() {
             LOG(WARNING) << "Local shm " << _trx->local_shm.name
             << " wait for the peer to close timed out, force cleanup.";
             _trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
-            // Force synchronous cleanup instead of relying on async timer
-            DeleteTimerSafe((uint32_t)_trx->timer_fd);
-            DeleteTimerSafe((uint32_t)_trx->hb_timer_fd);
+            // Force synchronous cleanup instead of relying on async timer.
+            // Wait out possibly running callbacks before freeing everything
+            // they may still touch. The clear timer is cancelled too: a
+            // concurrent heartbeat callback may have scheduled a delayed
+            // cleanup through the reentry path of UbrPassiveClearTrx, and
+            // this path performs the cleanup itself.
+            UbrTimerDelAndWait(&_trx->close_timer);
+            UbrTimerDelAndWait(&_trx->hb_timer);
+            UbrTimerDelAndWait(&_trx->clear_timer);
             if (_trx->ubr_tx.remote_rx_event_q.addr != nullptr) {
                 ((UbrEventQMsg *)_trx->ubr_tx.remote_rx_event_q.addr)->flag = UBR_STATE_CLOSED;
             }
@@ -124,24 +134,48 @@ RETURN_CODE UBRing::UbrTrxClose() {
     return UBRING_OK;
 }
 
+// Back-off policy of the close-check timer: poll fast while the link has
+// traffic or a close is in progress, double the interval (up to
+// ub_event_queue_timer_interval_max_us) while idle. Runs on the timer
+// thread only.
+static uint64_t UbrCloseTimerBackoff(void* arg, uint64_t cur_interval_us) {
+    auto* trx = (UbrTrx*)arg;
+    auto* local_rx_event_q = (UbrEventQMsg *)trx->ubr_rx.local_rx_event_q.addr;
+    auto* local_tx_event_q = (UbrEventQMsg *)trx->ubr_tx.local_tx_event_q.addr;
+    const uint64_t in_io_id = trx->ubr_rx.in_io_id;
+    const uint64_t out_io_id = trx->ubr_tx.out_io_id;
+    if (UNLIKELY(local_rx_event_q == nullptr)) {
+        return (uint64_t)FLAGS_ub_event_queue_timer_interval_us;
+    }
+    const bool has_traffic = (in_io_id != trx->close_chk_in_io_id) ||
+                             (out_io_id != trx->close_chk_out_io_id);
+    const bool closing = (local_rx_event_q->flag != UBR_STATE_CONNECTED);
+    trx->close_chk_in_io_id = in_io_id;
+    trx->close_chk_out_io_id = out_io_id;
+    if (has_traffic || closing ||
+        local_tx_event_q == nullptr) {
+        return (uint64_t)FLAGS_ub_event_queue_timer_interval_us;
+    }
+    uint64_t next = cur_interval_us * 2;
+    const uint64_t max_us = (uint64_t)FLAGS_ub_event_queue_timer_interval_max_us;
+    return (max_us > 0 && next > max_us) ? max_us : next;
+}
+
 RETURN_CODE UBRing::UbrAddCloseTimer() {
     if (UNLIKELY(_trx == nullptr)) {
         LOG(ERROR) << "Trx add close timer failed, trx is null.";
         return UBRING_ERR;
     }
 
-    const uint32_t event_q_timer_interval_ns =
-        FLAGS_ub_event_queue_timer_interval_us * USEC_TO_NSEC;
-    itimerspec time_spec = {
-            .it_interval = {.tv_sec = 0, .tv_nsec = event_q_timer_interval_ns},
-            .it_value = {.tv_sec = 0, .tv_nsec = 1}
-    };
-    int timer_fd = TimerStart(&time_spec, UbrTrxCloseCallback, (void*)_trx);
-    if (UNLIKELY(timer_fd == -1)) {
+    const uint32_t interval_us = FLAGS_ub_event_queue_timer_interval_us;
+    _trx->close_chk_in_io_id = _trx->ubr_rx.in_io_id;
+    _trx->close_chk_out_io_id = _trx->ubr_tx.out_io_id;
+    UbrTimerStart(&_trx->close_timer, interval_us, interval_us,
+                  UbrTrxCloseCallback, (void*)_trx, UbrCloseTimerBackoff);
+    if (UNLIKELY(_trx->close_timer == nullptr)) {
         LOG(ERROR) << "Start ubr close timer failed, trx local name=" << _trx->local_shm.name;
         return UBRING_ERR;
     }
-    _trx->timer_fd = timer_fd;
     return UBRING_OK;
 }
 
@@ -152,7 +186,9 @@ RETURN_CODE UBRing::UbrAddTimer() {
     }
 
     if (UNLIKELY(UbrAddHBTimer() != UBRING_OK)) {
-        DeleteTimerSafe((uint32_t)_trx->timer_fd);
+        // Called from the connect setup thread, never from a timer
+        // callback, so waiting out a running close callback is safe.
+        UbrTimerDelAndWait(&_trx->close_timer);
         LOG(ERROR) << "Ubr " << _trx->local_shm.name << " add heartbeat timer failed.";
         return UBRING_ERR;
     }
@@ -205,16 +241,13 @@ RETURN_CODE UBRing::UbrAddHBTimer() {
         return UBRING_ERR;
     }
 
-    itimerspec time_spec = {
-            .it_interval = {.tv_sec = FLAGS_ub_hb_timer_interval_s, .tv_nsec = 0},
-            .it_value = {.tv_sec = 0, .tv_nsec = 1}
-    };
-    int timer_fd = TimerStart(&time_spec, UbrTrxHBCallback, (void*)_trx);
-    if (UNLIKELY(timer_fd == -1)) {
+    const uint64_t interval_us = (uint64_t)FLAGS_ub_hb_timer_interval_s * 1000000ULL;
+    UbrTimerStart(&_trx->hb_timer, interval_us, interval_us,
+                  UbrTrxHBCallback, (void*)_trx);
+    if (UNLIKELY(_trx->hb_timer == nullptr)) {
         LOG(ERROR) << "Start ubr heartbeat timer failed.";
         return UBRING_ERR;
     }
-    _trx->hb_timer_fd = timer_fd;
     return UBRING_OK;
 }
 
@@ -230,29 +263,57 @@ RETURN_CODE UBRing::UbrPassiveClearTrx(UbrTrx *trx, int fd, PASSIVE_DISC_TYPE ty
     }
     trx->ubr_tx.trx_state = UBR_STATE_CLOSED;
     trx->ubr_rx.trx_state = UBR_STATE_CLOSED;
-    DeleteTimerSafe((uint32_t)trx->timer_fd);
-    const char *type_name = nullptr;
-    if (type == UBR_HEARTBEAT) {
-        DeleteTimer((uint32_t)trx->hb_timer_fd);
-        type_name = "Trx heartbeat";
-    } else if (type == UBR_UB_EVENT) {
-        DeleteTimerSafe((uint32_t)trx->hb_timer_fd);
-        type_name = "Ub event callback";
+    UNREFERENCE_PARAM(fd);
+    const char *type_name =
+        (type == UBR_HEARTBEAT) ? "Trx heartbeat" : "Ub event callback";
+    // Stop both timers first so no pending callback touches the trx while
+    // it is being released. Non-blocking on purpose: this may run inside
+    // the heartbeat callback itself, which must not wait on its own task.
+    UbrTimerDel(&trx->close_timer);
+    UbrTimerDel(&trx->hb_timer);
+    // Wait for in-flight IO on a one-shot timer instead of sleeping on the
+    // timer thread. The slot reservation is atomic, so a concurrent close
+    // path cannot schedule a second delayed cleanup for this trx.
+    RETURN_CODE clear_rc = UbrTimerStartOnce(
+        &trx->clear_timer,
+        (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
+        UbrPassiveClearCallback, (void*)trx);
+    if (clear_rc == UBRING_REENTRY) {
+        return UBRING_OK;                        // cleanup already scheduled
     }
-    constexpr int64_t kMicrosecondsPerSecond = 1000000LL;
-    bthread_usleep(FLAGS_ub_flying_io_timeout_s * kMicrosecondsPerSecond);
+    if (UNLIKELY(clear_rc != UBRING_OK)) {
+        LOG(ERROR) << type_name << ", add delayed clear timer failed, name=" << trx->local_shm.name;
+        return UBRING_ERR;
+    }
+    return UBRING_OK;
+}
+
+void* UBRing::UbrPassiveClearCallback(void* args) {
+    auto* trx = (UbrTrx*)args;
+    if (UNLIKELY(trx == nullptr)) {
+        LOG(ERROR) << "Trx passive clear callback failed, trx is null.";
+        return nullptr;
+    }
+
+    // Consume this one-shot timer before releasing the trx that holds its
+    // handle slot.
+    UbrTimerDel(&trx->clear_timer);
 
     int rc = ShmLocalFree(&trx->remote_shm);
     if (rc != UBRING_OK) {
-        LOG(ERROR) << type_name << ", delete remote shm failed. ret=" << rc;
+        LOG(ERROR) << "Trx passive clear, delete remote shm " << trx->remote_shm.name
+                   << " failed. ret=" << rc;
     }
     rc = ShmLocalFree(&trx->local_shm);
     if (rc != UBRING_OK) {
-        LOG(ERROR) << type_name << ", delete local shm failed. ret=" << rc;
+        LOG(ERROR) << "Trx passive clear, delete local shm " << trx->local_shm.name
+                   << " failed. ret=" << rc;
     }
 
-    UBRingManager::ReleaseUbrTrxFromMgr(trx);
-    return UBRING_OK;
+    if (UNLIKELY(UBRingManager::ReleaseUbrTrxFromMgr(trx) != UBRING_OK)) {
+        LOG(ERROR) << "Trx passive clear, release shm " << trx->local_shm.name << " trx failed.";
+    }
+    return nullptr;
 }
 
 void* UBRing::UbrTrxHBCallback(void* args) {
@@ -286,7 +347,7 @@ void* UBRing::UbrTrxHBCallback(void* args) {
     }
 
     int fd = (int)trx->local_shm.fd;
-    LOG(INFO) << "Hlc heartbeat, start to clear trx resource. hb_timer_fd=" << fd << ", shm_name=" << trx->local_shm.name;
+    LOG(INFO) << "Hlc heartbeat, start to clear trx resource. shm_fd=" << fd << ", shm_name=" << trx->local_shm.name;
     UbrPassiveClearTrx(trx, fd, UBR_HEARTBEAT);
     LOG(INFO) << "Hlc heartbeat clear trx resource finish.";
     return nullptr;
@@ -298,21 +359,19 @@ RETURN_CODE UBRing::UbrAddAsynClearTimer(UbrTrx *trx) {
         return UBRING_ERR;
     }
 
-    if (trx->clear_timer_fd > 0) {
-        return UBRING_OK;
+    // The slot reservation is atomic, so a concurrent close path cannot
+    // schedule a second delayed cleanup for the same trx.
+    RETURN_CODE rc = UbrTimerStartOnce(
+        &trx->clear_timer,
+        (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL, 0,
+        UbrAsynClearCallback, (void*)trx);
+    if (rc == UBRING_REENTRY) {
+        return UBRING_OK;                        // cleanup already scheduled
     }
-
-    itimerspec time_spec = {
-            .it_interval = {.tv_sec = 0, .tv_nsec = 0},
-            .it_value = {.tv_sec = FLAGS_ub_flying_io_timeout_s, .tv_nsec = 0}
-    };
-
-    int timer_fd = TimerStart(&time_spec, UbrAsynClearCallback, (void*)trx);
-    if (UNLIKELY(timer_fd == -1)) {
-        LOG(ERROR) << "Start ubr close timer failed, trx name=%s.", trx->local_shm.name;
+    if (UNLIKELY(rc != UBRING_OK)) {
+        LOG(ERROR) << "Start ubr clear timer failed, trx name=" << trx->local_shm.name;
         return UBRING_ERR;
     }
-    trx->clear_timer_fd = timer_fd;
     return UBRING_OK;
 }
 
@@ -323,6 +382,10 @@ void *UBRing::UbrAsynClearCallback(void *args)
         LOG(ERROR) << "Trx close, trx is null.";
         return nullptr;
     }
+
+    // Consume this one-shot timer before releasing the trx that holds its
+    // handle slot.
+    UbrTimerDel(&trx->clear_timer);
 
     if (UNLIKELY(UbrTrxFreeShm(trx) != UBRING_OK)) {
         LOG(ERROR) << "Trx close, wait for local shm " << trx->local_shm.name << " free fail.";
@@ -902,8 +965,11 @@ RETURN_CODE UBRing::UbrMapRemoteShmAddTimer(SHM *local_trx_shm, const char *loca
     uint32_t timeout = ((UbrDataStatusQMsg *)(_trx->ubr_tx.local_data_status_q.addr))->timeout;
     if (HasTimedOut(start_time, timeout) != UBRING_OK) {
         LOG(ERROR) << "Local shm " << local_trx_shm->name << " wait for connect remote map timeout.";
-        DeleteTimerSafe((uint32_t)_trx->hb_timer_fd);
-        DeleteTimerSafe((uint32_t)_trx->timer_fd);
+        // Connect-setup context, never a timer callback: waiting out a
+        // running callback is safe and keeps the freed remote shm
+        // unreachable from pending callbacks.
+        UbrTimerDelAndWait(&_trx->hb_timer);
+        UbrTimerDelAndWait(&_trx->close_timer);
         ShmRemoteFree(&_trx->remote_shm);
         return UBRING_ERR_TIMEOUT;
     }
@@ -1006,12 +1072,13 @@ RETURN_CODE UBRing::UbrClearResourceCheck(UbrTrx *trx, uint64_t start_time, UbrC
         local_tx_event_q->flag = UBR_STATE_CLOSING;
     }
 
-    if (close_type == UBR_SEND_CLOSE) {
-        DeleteTimerSafe((uint32_t)trx->timer_fd);
-    } else {
-        DeleteTimer((uint32_t)trx->timer_fd);
-    }
-    DeleteTimerSafe((uint32_t)trx->hb_timer_fd);
+    // Safe even when called from inside the close callback itself, so the
+    // former eager/lazy distinction between close types is no longer
+    // needed. Non-blocking on purpose: this runs on the timer thread in
+    // that case and must not wait on its own task.
+    UNREFERENCE_PARAM(close_type);
+    UbrTimerDel(&trx->close_timer);
+    UbrTimerDel(&trx->hb_timer);
 
     if (local_tx_event_q->flag == UBR_STATE_CLOSING) {
         local_tx_event_q->flag = UBR_STATE_CLOSED;

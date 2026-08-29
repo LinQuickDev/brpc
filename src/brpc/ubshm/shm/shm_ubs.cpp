@@ -47,7 +47,7 @@ DEFINE_int32(ub_flying_io_timeout_s, 5,
              "Time in seconds to wait for stopping data sending and receiving "
              "when the link is disconnected.");
 char g_region_name[MAX_REGION_NAME_DESC_LENGTH] = {0};
-int g_shm_timer_fd = 0;
+UbrTimerId g_shm_timer_id = nullptr;
 ShmList *g_shm_list = nullptr;
 static RETURN_CODE UbsShmInterfacesLoad(void);
 char hostname[MAX_HOST_NAME_DESC_LENGTH];
@@ -377,14 +377,16 @@ RETURN_CODE UbsShmInit(void)
 
 RETURN_CODE UbsShmFini(void)
 {
-    int ret = ubsmem_finalize();
-    if (ret != UBSM_OK) {
-        LOG(ERROR) << "Ubs shm finalize fail, ret=" << ret;
+    // Stop the cleanup timer (and wait out a running UbsShmCallback)
+    // BEFORE finalizing the SDK that the callback calls into.
+    if (UNLIKELY(DestroyShmTimer(g_shm_list) != UBRING_OK)) {
+        LOG(ERROR) << "Ubs shm list finalize failed.";
         return UBRING_ERR;
     }
 
-    if (UNLIKELY(DestroyShmTimer(g_shm_list) != UBRING_OK)) {
-        LOG(ERROR) << "Ubs shm list finalize failed.";
+    int ret = ubsmem_finalize();
+    if (ret != UBSM_OK) {
+        LOG(ERROR) << "Ubs shm finalize fail, ret=" << ret;
         return UBRING_ERR;
     }
 
@@ -451,17 +453,13 @@ void *UbsShmCallback(void* args)
 
 RETURN_CODE UbsShmAddTimer(ShmList *shm_list)
 {
-    const uint32_t timer_interval_s = FLAGS_ub_flying_io_timeout_s;
-    itimerspec time_spec = {
-        .it_interval = {.tv_sec = timer_interval_s, .tv_nsec = 0},
-        .it_value = {.tv_sec = 0, .tv_nsec = 1}
-    };
-    int timer_fd = TimerStart(&time_spec, UbsShmCallback, (void*)shm_list);
-    if (UNLIKELY(timer_fd == -1)) {
+    const uint64_t timer_interval_us = (uint64_t)FLAGS_ub_flying_io_timeout_s * 1000000ULL;
+    UbrTimerStart(&g_shm_timer_id, timer_interval_us, timer_interval_us,
+                  UbsShmCallback, (void*)shm_list);
+    if (UNLIKELY(g_shm_timer_id == nullptr)) {
         LOG(ERROR) << "Start shm timer failed.";
         return UBRING_ERR;
     }
-    g_shm_timer_fd = timer_fd;
 
     return UBRING_OK;
 }
@@ -493,7 +491,9 @@ RETURN_CODE InitShmTimer(ShmList **shm_list)
 
 RETURN_CODE DestroyShmTimer(ShmList *shm_list)
 {
-    DeleteTimerSafe((uint32_t)g_shm_timer_fd);
+    // Wait out a possibly running UbsShmCallback: it walks shm_list under
+    // shm_lock and calls the SDK, neither of which may be torn down yet.
+    UbrTimerDelAndWait(&g_shm_timer_id);
     if (shm_list == nullptr) {
         LOG(WARNING) << "Shm list is null.";
         return UBRING_ERR;

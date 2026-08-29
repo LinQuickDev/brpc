@@ -115,6 +115,9 @@ RETURN_CODE UBRingManager::AcquireUbrTrxFromMgr(UbrTrx **trx) {
     for (uint32_t i = 0; i < g_ubr_mgr.trx_cap; ++i) {
         if (g_ubr_mgr.trx_mgr_unit_status[i] == UBR_MGR_UNIT_FREE) {
             memset(&g_ubr_mgr.trx_mgr[i], 0, sizeof(UbrTrx));
+            g_ubr_mgr.trx_mgr[i].close_timer = nullptr;
+            g_ubr_mgr.trx_mgr[i].hb_timer = nullptr;
+            g_ubr_mgr.trx_mgr[i].clear_timer = nullptr;
             g_ubr_mgr.trx_mgr_unit_status[i] = UBR_MGR_UNIT_USED;
             *trx = &g_ubr_mgr.trx_mgr[i];
             (*trx)->trx_mgr_index = i;
