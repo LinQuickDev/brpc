@@ -25,6 +25,7 @@
 #include <mutex>
 #include "bthread/types.h"
 #include "bthread/unstable.h"
+#include "bthread/bthread.h"
 #include "brpc/ubshm/common/common.h"
 
 #if defined(OS_MACOSX)
