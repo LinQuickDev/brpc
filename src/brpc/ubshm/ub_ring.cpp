@@ -114,7 +114,9 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
     ctl->ubr_id = ATOMIC_LOAD(trx->ubr_id);
     ctl->state.store(UBR_CLEANUP_PENDING);
     ctl->timer = nullptr;
-    ctl->ref.store(3);                       // manager + timer/callback + starter
+    ctl->ref.store(2);                       // timer/callback + starter; the
+                                             // manager anchor is taken by
+                                             // TryPublishUnitCleanupCtl
 
     UbrCleanupCtl* expected = nullptr;
     if (!__atomic_compare_exchange_n(&trx->cleanup_ctl, &expected, ctl, false,

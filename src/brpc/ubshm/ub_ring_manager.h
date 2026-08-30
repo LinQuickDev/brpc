@@ -81,9 +81,11 @@ public:
 
     // Atomically (under the manager lock) anchor `ctl' to the pool slot,
     // but only while the slot is still used by the given generation and
-    // carries no other cleanup control object. Returns false -- leaving
-    // the slot untouched -- when the trx was released, reused, or a
-    // cleanup is already anchored.
+    // carries no other cleanup control object. On success the ctl gains
+    // the manager anchor reference (released when the anchor is detached
+    // or the slot is retired); returns false -- leaving the slot and the
+    // reference counts untouched -- when the trx was released, reused, or
+    // a cleanup is already anchored.
     static bool TryPublishUnitCleanupCtl(uint32_t idx, uint64_t expect_ubr_id,
                                          UbrCleanupCtl *ctl);
 

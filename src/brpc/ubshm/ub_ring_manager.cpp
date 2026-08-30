@@ -277,6 +277,7 @@ bool UBRingManager::TryPublishUnitCleanupCtl(uint32_t idx,
                  g_ubr_mgr.trx_mgr_unit_ctl[idx] != nullptr)) {
         return false;                        // released / reused / already anchored
     }
+    ctl->ref.fetch_add(1);                   // manager anchor reference
     g_ubr_mgr.trx_mgr_unit_ctl[idx] = ctl;
     return true;
 }

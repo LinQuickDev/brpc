@@ -145,10 +145,11 @@ struct UbrCleanupCtl {
     uint64_t ubr_id;                             // immutable generation
     AtomicInt state;                             // UbrCleanupState
     UbrTimerId timer;                            // delayed clear timer
-    // References: manager anchor (until the slot is acquired again) +
-    // timer/callback (held from a successful schedule until the callback
-    // fully returned, or released by whoever cancels the timer before it
-    // fires) + starter (until the schedule call completes).
+    // References: timer/callback (held from a successful schedule until
+    // the callback fully returned, or released by whoever cancels the
+    // timer before it fires) + starter (until the schedule call
+    // completes) + manager anchor (taken when the ctl is anchored to the
+    // pool slot, released when the anchor is detached or retired).
     AtomicInt ref;
 
     void ReleaseRef() {
