@@ -122,8 +122,19 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, void* (*cb)(void*),
         delete ctl;                          // another schedule won
         return UBRING_OK;
     }
-    UBRingManager::PublishUnitCleanupCtl(trx->trx_mgr_index, ctl);
-
+    if (!UBRingManager::TryPublishUnitCleanupCtl(trx->trx_mgr_index,
+                                                 ctl->ubr_id, ctl)) {
+        // The slot was released (and possibly reused) before we could
+        // anchor: force close or the new occupant owns it now. Nothing
+        // was armed yet -- just undo the trx-side publication.
+        expected = ctl;
+        __atomic_compare_exchange_n(&trx->cleanup_ctl, &expected,
+                                    (UbrCleanupCtl*) nullptr, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        ctl->ReleaseRef();                   // timer/callback reference, never armed
+        ctl->ReleaseRef();                   // starter reference
+        return UBRING_OK;
+    }
     RETURN_CODE rc = UbrTimerStart(&ctl->timer,
             (uint64_t)FLAGS_ub_flying_io_timeout_s * SEC_TO_USEC, 0, cb, ctl);
     if (UNLIKELY(rc != UBRING_OK)) {

@@ -264,9 +264,21 @@ bool UBRingManager::IsUbrTrxSlotUsed(uint32_t idx, uint64_t expect_ubr_id) {
            g_ubr_mgr.trx_mgr_unit_id[idx] == expect_ubr_id;
 }
 
-void UBRingManager::PublishUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl) {
+bool UBRingManager::TryPublishUnitCleanupCtl(uint32_t idx,
+                                             uint64_t expect_ubr_id,
+                                             UbrCleanupCtl *ctl) {
     LOCK_GUARD(g_ubr_trx_mgr_mtx);
+    if (UNLIKELY(g_ubr_mgr.trx_mgr_unit_ctl == nullptr ||
+                 g_ubr_mgr.trx_mgr_unit_status == nullptr ||
+                 g_ubr_mgr.trx_mgr_unit_id == nullptr ||
+                 idx >= g_ubr_mgr.trx_cap ||
+                 g_ubr_mgr.trx_mgr_unit_status[idx] != UBR_MGR_UNIT_USED ||
+                 g_ubr_mgr.trx_mgr_unit_id[idx] != expect_ubr_id ||
+                 g_ubr_mgr.trx_mgr_unit_ctl[idx] != nullptr)) {
+        return false;                        // released / reused / already anchored
+    }
     g_ubr_mgr.trx_mgr_unit_ctl[idx] = ctl;
+    return true;
 }
 
 bool UBRingManager::DetachUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl) {

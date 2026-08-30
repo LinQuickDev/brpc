@@ -79,9 +79,13 @@ public:
     // given generation (not released or reused meanwhile).
     static bool IsUbrTrxSlotUsed(uint32_t idx, uint64_t expect_ubr_id);
 
-    // Anchor `ctl' to the pool slot (called once per schedule). The object
-    // is retired and freed at the next Acquire of the same slot.
-    static void PublishUnitCleanupCtl(uint32_t idx, UbrCleanupCtl *ctl);
+    // Atomically (under the manager lock) anchor `ctl' to the pool slot,
+    // but only while the slot is still used by the given generation and
+    // carries no other cleanup control object. Returns false -- leaving
+    // the slot untouched -- when the trx was released, reused, or a
+    // cleanup is already anchored.
+    static bool TryPublishUnitCleanupCtl(uint32_t idx, uint64_t expect_ubr_id,
+                                         UbrCleanupCtl *ctl);
 
     // Detach `ctl' from the pool slot if it is still anchored there.
     // Returns true when the detach happened (the manager reference was
