@@ -532,7 +532,7 @@ StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
         callbacks.codecs.push_back(codec);
     }
     callbacks.transport.prepare_resources = [&]() {
-        if (transport->NegotiateUpgradeResources(remote, true) < 0) {
+        if (transport->PrepareUpgradeResources() < 0) {
             PLOG(WARNING)
                 << "Fail to allocate rdma resources, fallback to tcp:"
                 << socket->description();
@@ -542,6 +542,13 @@ StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
         return STEP_OK;
     };
     callbacks.transport.negotiate_resources = [&]() {
+        if (transport->NegotiateUpgradeResources(remote, true) < 0) {
+            PLOG(WARNING)
+                << "Fail to negotiate rdma resources, fallback to tcp:"
+                << socket->description();
+            transport->DeactivateUpgrade();
+            return STEP_FALLBACK;
+        }
         return STEP_OK;
     };
     callbacks.validate_established = [&]() {
