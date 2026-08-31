@@ -111,7 +111,7 @@ RdmaResource::~RdmaResource() {
 }
 
 RdmaEndpoint::RdmaEndpoint(Socket *s)
-    : _socket(s), _state(UNINIT), _handshake_version(0), _resource(nullptr),
+    : _socket(s), _resource(nullptr),
       _send_cq_events(0), _recv_cq_events(0), _cq_sid(INVALID_SOCKET_ID),
       _sq_size(FLAGS_rdma_sq_size), _rq_size(FLAGS_rdma_rq_size),
       _remote_recv_block_size(0), _accumulated_ack(0), _unsolicited(0),

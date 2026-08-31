@@ -42,7 +42,6 @@ DECLARE_bool(rdma_use_polling);
 DECLARE_int32(rdma_poller_num);
 DECLARE_bool(rdma_disable_bthread);
 
-<<<<<<< HEAD
 // Wire-independent RDMA connection parameters consumed by resource setup.
 // Transport adapters translate their protocol-specific payload into this DTO.
 struct RdmaConnectionInfo {
@@ -53,42 +52,6 @@ struct RdmaConnectionInfo {
     ibv_gid gid;
     uint32_t qp_num;
     butil::optional<ibv_ece> ece;
-=======
-class RdmaHandshakeClientV2;
-class RdmaHandshakeServerV2;
-class RdmaHandshakeClientV3;
-class RdmaHandshakeServerV3;
-struct ParsedHello;
-enum class RemoteHelloResult;
-class RdmaHello;
-class RdmaEndpoint;
-namespace v2_wire {
-    RemoteHelloResult ReadBodyAndNegotiate(RdmaEndpoint* ep, ParsedHello* remote);
-    int DrainBytes(RdmaEndpoint* ep, size_t n);
-}  // namespace v2_wire
-
-namespace v3_wire {
-    void FillLocalRdmaHello(const RdmaEndpoint* ep, RdmaHello* msg);
-    int  ReadAndParseV3Hello(RdmaEndpoint* ep, RdmaHello* out);
-    int  WriteV3Hello(RdmaEndpoint* ep, const RdmaHello& msg);
-}  // namespace v3_wire
-
-class RdmaConnect : public AppConnect {
-public:
-    void StartConnect(const Socket* socket, 
-            void (*done)(int err, void* data), void* data) override;
-    void StopConnect(Socket*) override;
-    struct RunGuard {
-        RunGuard(RdmaConnect* rc) { this_rc = rc; }
-        ~RunGuard() { if (this_rc) this_rc->Run(); }
-        RdmaConnect* this_rc;
-    };
-
-private:
-    void Run();
-    void (*_done)(int, void*){nullptr};
-    void* _data{nullptr};
->>>>>>> apache/master
 };
 
 struct RdmaResource {
