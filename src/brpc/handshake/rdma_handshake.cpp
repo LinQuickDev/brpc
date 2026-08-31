@@ -552,8 +552,7 @@ StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
         return STEP_OK;
     };
     callbacks.validate_established = [&]() {
-        if (!source->empty() ||
-            !transport->UpgradeActive()) {
+        if (!source->empty()) {
             return STEP_ERROR;
         }
         return STEP_OK;
