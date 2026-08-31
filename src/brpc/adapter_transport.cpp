@@ -94,6 +94,7 @@ struct ClientHandshakeTask {
     AdapterTransport* adapter;
     void (*done)(int, void*);
     void* data;
+    SocketUniquePtr socket;
 };
 
 }  // namespace
@@ -117,6 +118,10 @@ int AdapterTransport::StartClientUpgrade(const Socket* socket,
                                          void* data) {
     AdapterTransport* adapter = Get(const_cast<Socket*>(socket));
     ClientHandshakeTask* task = new ClientHandshakeTask{adapter, done, data};
+    if (Socket::Address(socket->id(), &task->socket) != 0) {
+        delete task;
+        return -1;
+    }
     bthread_t tid;
     bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
     bthread_attr_set_name(&attr, "StartClientUpgrade");
@@ -171,7 +176,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
     std::unique_ptr<ClientHandshakeTask> task(
         static_cast<ClientHandshakeTask*>(arg));
     AdapterTransport* adapter = task->adapter;
-    SocketUniquePtr socket(adapter->_socket);
+    Socket* socket = task->socket.get();
     int connect_error = 0;
 
 #if BRPC_WITH_RDMA
