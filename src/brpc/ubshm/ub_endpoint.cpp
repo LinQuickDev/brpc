@@ -356,12 +356,12 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
           continue;
         }
 
-        if (cq.events & EPOLLIN) {
-          PollIn(ep, cq.events);
+        if (cq.event & EPOLLIN) {
+          PollIn(ep, cq.event);
         }
 
-        if (cq.events & EPOLLOUT) {
-          PollOut(ep, cq.events);
+        if (cq.event & EPOLLOUT) {
+          PollOut(ep, cq.event);
         }
       }
       if (poller->callback) {
