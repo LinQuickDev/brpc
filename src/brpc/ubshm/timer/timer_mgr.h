@@ -47,14 +47,20 @@ RETURN_CODE UbrTimerStart(UbrTimerId* slot, uint64_t delay_us,
 
 // Non-blocking delete, safe from inside the timer callback itself. Does
 // not wait for a running callback and does not protect `arg' on its own.
-// Returns 0 when the call won the slot competition: a one-shot callback
-// is guaranteed never to run, and the caller consumes any per-task
-// resources it tracks for this timer (ownership of them transfers to the
-// caller); for a periodic timer an already-started callback is not
-// interrupted. Returns 1 when the callback has been dispatched (it
-// consumes those resources itself on every exit) or its fate is still
-// being settled by the scheduler -- the caller must not consume anything
-// then.
+// Suppression is arbitrated by the handle-slot competition (see OnFire):
+// this call returns 0 when it won that competition. For a one-shot timer
+// the callback is then guaranteed never to run -- OnFire observes the
+// lost slot race and skips -- even when bthread_timer_del reports the
+// timer as already dispatched; ownership of caller-tracked per-task
+// resources transfers to the caller. For a periodic timer winning the
+// competition only removes the timer from the dispatch queue: an already
+// dispatched or started callback may still run (at most once more), so
+// the caller must not reclaim resources reachable from `arg' on this
+// return alone; use UbrTimerDelAndWait for that.
+// Returns 1 when the callback side owns the resources: the callback has
+// run or will run and consumes them on every exit, or the timer was never
+// armed and the scheduling path settles them. The caller must not consume
+// anything on 1.
 int UbrTimerDel(UbrTimerId* slot);
 
 // Delete and wait until a possibly running callback finished, so the
