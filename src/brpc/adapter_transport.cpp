@@ -117,7 +117,7 @@ int AdapterTransport::StartClientUpgrade(const Socket* socket,
                                          void (*done)(int, void*),
                                          void* data) {
     AdapterTransport* adapter = Get(const_cast<Socket*>(socket));
-    ClientHandshakeTask* task = new ClientHandshakeTask{adapter, done, data};
+    ClientHandshakeTask* task = new ClientHandshakeTask{adapter, done, data, SocketUniquePtr()};
     if (Socket::Address(socket->id(), &task->socket) != 0) {
         delete task;
         return -1;
@@ -178,6 +178,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
     AdapterTransport* adapter = task->adapter;
     Socket* socket = task->socket.get();
     int connect_error = 0;
+    (void)connect_error;
 
 #if BRPC_WITH_RDMA
     if (adapter->_mode == SOCKET_MODE_RDMA) {
@@ -246,7 +247,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             static_cast<size_t>(ubring::FLAGS_data_queue_size) * MB_TO_BYTE;
         ubring::SHM local_trx_shm = {
             NULL, local_shm_len, 0, {0}, static_cast<uint32_t>(socket->fd())};
-        const std::string shm_name_str =
+        const auto shm_name_str =
             butil::endpoint2str(socket->local_side());
         ubring::HelloMessage remote{};
         ubring::UBShmHandshakeAdapter wire;

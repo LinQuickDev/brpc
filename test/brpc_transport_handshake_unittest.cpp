@@ -407,7 +407,7 @@ TEST(TransportHandshakeTest,
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
     ASSERT_TRUE(source.empty());
-    ASSERT_NE(NULL, socket->parsing_context());
+    ASSERT_NE(nullptr, socket->parsing_context());
 
     char reply[64];
     ASSERT_EQ(sizeof(reply), read(peer_fd, reply, sizeof(reply)));
@@ -429,7 +429,7 @@ TEST(TransportHandshakeTest,
     ASSERT_TRUE(source.empty());
     ASSERT_EQ(FALLBACK_TCP,
               AdapterTransport::Get(socket.get())->handshake_phase());
-    ASSERT_EQ(NULL, socket->parsing_context());
+    ASSERT_EQ(nullptr, socket->parsing_context());
     socket->SetFailed();
 }
 
@@ -455,7 +455,7 @@ TEST(TransportHandshakeTest, plain_tcp_server_consumes_coalesced_ubshm_ack) {
     ASSERT_TRUE(source.empty());
     ASSERT_EQ(FALLBACK_TCP,
               AdapterTransport::Get(socket.get())->handshake_phase());
-    ASSERT_EQ(NULL, socket->parsing_context());
+    ASSERT_EQ(nullptr, socket->parsing_context());
     socket->SetFailed();
 }
 
