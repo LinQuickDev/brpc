@@ -54,7 +54,7 @@ static butil::Mutex *g_ubring_resource_mutex = NULL;
 
 UBShmEndpoint::UBShmEndpoint(Socket *s)
     : _socket(s), _socket_id(s ? s->id() : INVALID_SOCKET_ID),
-      _ub_ring(nullptr), _cq_sid(INVALID_SOCKET_ID) {}
+      _ub_ring(nullptr), _poller_sid(INVALID_SOCKET_ID) {}
 
 UBShmEndpoint::~UBShmEndpoint() { Reset(); }
 
@@ -63,7 +63,7 @@ void UBShmEndpoint::Reset() {
 
   delete _ub_ring;
   _ub_ring = nullptr;
-  _cq_sid = INVALID_SOCKET_ID;
+  _poller_sid = INVALID_SOCKET_ID;
 }
 
 bool UBShmEndpoint::IsWritable() const {
@@ -142,12 +142,12 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM *local_trx_shm,
   SocketOptions options;
   options.user = this;
   options.keytable_pool = _socket->_keytable_pool;
-  if (Socket::Create(options, &_cq_sid) < 0) {
+  if (Socket::Create(options, &_poller_sid) < 0) {
     const int saved_errno = errno;
-    PLOG(WARNING) << "Fail to create socket for cq";
+    PLOG(WARNING) << "Fail to create socket for UBRing poller";
     delete _ub_ring;
     _ub_ring = NULL;
-    _cq_sid = INVALID_SOCKET_ID;
+    _poller_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return -1;
   }
@@ -157,11 +157,11 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM *local_trx_shm,
     DeallocateResources();
     delete _ub_ring;
     _ub_ring = NULL;
-    _cq_sid = INVALID_SOCKET_ID;
+    _poller_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return ret;
   }
-  PollerRegisterEvent(CqSidOp::ADD, EPOLLIN);
+  PollerRegisterEvent(PollerSidOp::ADD, EPOLLIN);
   return 0;
 }
 
@@ -179,12 +179,12 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM *remote_trx_shm,
   SocketOptions options;
   options.user = this;
   options.keytable_pool = _socket->_keytable_pool;
-  if (Socket::Create(options, &_cq_sid) < 0) {
+  if (Socket::Create(options, &_poller_sid) < 0) {
     const int saved_errno = errno;
-    PLOG(WARNING) << "Fail to create socket for cq";
+    PLOG(WARNING) << "Fail to create socket for UBRing poller";
     delete _ub_ring;
     _ub_ring = NULL;
-    _cq_sid = INVALID_SOCKET_ID;
+    _poller_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return -1;
   }
@@ -194,12 +194,12 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM *remote_trx_shm,
     DeallocateResources();
     delete _ub_ring;
     _ub_ring = NULL;
-    _cq_sid = INVALID_SOCKET_ID;
+    _poller_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return ret;
   }
   // TODO mwj should polling start after the connection is established?
-  PollerRegisterEvent(CqSidOp::ADD, EPOLLIN);
+  PollerRegisterEvent(PollerSidOp::ADD, EPOLLIN);
   return ret;
 }
 
@@ -207,11 +207,11 @@ void UBShmEndpoint::DeallocateResources() {
   if (!_ub_ring) {
     return;
   }
-  PollerRegisterEvent(CqSidOp::REMOVE);
+  PollerRegisterEvent(PollerSidOp::REMOVE);
   _ub_ring->UbrTrxClose();
-  if (INVALID_SOCKET_ID != _cq_sid) {
+  if (INVALID_SOCKET_ID != _poller_sid) {
     SocketUniquePtr s;
-    if (Socket::Address(_cq_sid, &s) == 0) {
+    if (Socket::Address(_poller_sid, &s) == 0) {
       s->_user = nullptr;
       s->_fd = -1;
       s->SetFailed();
@@ -328,20 +328,20 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
     std::unique_ptr<FnArgs> args(static_cast<FnArgs *>(p));
     auto poller = args->poller;
     auto running = args->running;
-    std::unordered_set<CqSidOp, CqSidOpHash, CqSidOpEqual> cq_sids;
-    CqSidOp op;
+    std::unordered_set<PollerSidOp, PollerSidOpHash, PollerSidOpEqual> cq_sids;
+    PollerSidOp op;
 
     if (poller->init_fn) {
       poller->init_fn();
     }
     while (running->load(std::memory_order_relaxed)) {
       while (poller->op_queue.Dequeue(op)) {
-        if (op.type == CqSidOp::ADD) {
+        if (op.type == PollerSidOp::ADD) {
           cq_sids.emplace(op);
-        } else if (op.type == CqSidOp::REMOVE) {
+        } else if (op.type == PollerSidOp::REMOVE) {
           cq_sids.erase(op);
 
-        } else if (op.type == CqSidOp::MOD) {
+        } else if (op.type == PollerSidOp::MOD) {
           cq_sids.erase(op);
           cq_sids.emplace(op);
         }
@@ -356,12 +356,12 @@ int UBShmEndpoint::PollingModeInitialize(bthread_tag_t tag,
           continue;
         }
 
-        if (cq.event & EPOLLIN) {
-          PollIn(ep, cq.event);
+        if (cq.events & EPOLLIN) {
+          PollIn(ep, cq.events);
         }
 
-        if (cq.event & EPOLLOUT) {
-          PollOut(ep, cq.event);
+        if (cq.events & EPOLLOUT) {
+          PollOut(ep, cq.events);
         }
       }
       if (poller->callback) {
@@ -406,13 +406,13 @@ void UBShmEndpoint::PollingModeRelease(bthread_tag_t tag) {
   }
 }
 
-void UBShmEndpoint::PollerRegisterEvent(CqSidOp::OpType op, uint32_t events) {
-  auto index = butil::fmix32(_cq_sid) % FLAGS_ub_poller_num;
+void UBShmEndpoint::PollerRegisterEvent(PollerSidOp::OpType op, uint32_t events) {
+  auto index = butil::fmix32(_poller_sid) % FLAGS_ub_poller_num;
   auto &group = _poller_groups[bthread_self_tag()];
   auto &pollers = group.pollers;
   auto &poller = pollers[index];
-  if (INVALID_SOCKET_ID != _cq_sid) {
-    poller.op_queue.Enqueue(CqSidOp{_cq_sid, events, op});
+  if (INVALID_SOCKET_ID != _poller_sid) {
+    poller.op_queue.Enqueue(PollerSidOp{_poller_sid, events, op});
   }
 }
 

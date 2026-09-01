@@ -16,20 +16,30 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <gflags/gflags.h>
 #include <string>
 #include "butil/macros.h"
 #include "butil/sys_byteorder.h"
 #include "brpc/socket.h"
 
 #if BRPC_WITH_UBRING
+#include "brpc/ubshm/common/common.h"
 #include "brpc/handshake/ubshm_handshake.h"
 #include "brpc/ubshm/ub_endpoint.h"
 #include "brpc/ubshm/shm/shm_def.h"
 #include "brpc/ubshm/shm/shm_mgr.h"
 #include "brpc/ubshm/ub_ring_manager.h"
+#include "brpc/ubshm/ub_ring.h"
+#include "brpc/ubshm/ubr_msg.h"
 
 namespace brpc {
 namespace ubring {
+DECLARE_int32(ub_disconnect_timeout_s);
+DECLARE_int32(ub_connect_timeout_s);
+DECLARE_int32(ub_hb_timer_interval_s);
+DECLARE_int32(ub_event_queue_timer_interval_us);
+DECLARE_int32(ub_flying_io_timeout_s);
+
 extern bool g_skip_ub_init;
 }  // namespace ubring
 }  // namespace brpc
@@ -175,6 +185,44 @@ TEST(UBShmHandshakeAdapterTest, disabled_hello_requests_tcp_fallback) {
     EXPECT_EQ(64, decoded.msg_len);
 }
 
+TEST(UBRingConfigurationTest, time_flags_include_units_and_expected_defaults) {
+    struct TimeFlagExpectation {
+        const char* name;
+        const char* suffix;
+        const char* unit;
+        const char* default_value;
+    };
+    const TimeFlagExpectation expected_flags[] = {
+        {"ub_disconnect_timeout_s", "_s", "seconds", "5"},
+        {"ub_connect_timeout_s", "_s", "seconds", "1"},
+        {"ub_hb_timer_interval_s", "_s", "seconds", "5"},
+        {"ub_event_queue_timer_interval_us", "_us", "microseconds", "100"},
+        {"ub_flying_io_timeout_s", "_s", "seconds", "5"},
+    };
+
+    for (const auto& expected : expected_flags) {
+        GFLAGS_NAMESPACE::CommandLineFlagInfo info;
+        ASSERT_TRUE(GFLAGS_NAMESPACE::GetCommandLineFlagInfo(
+            expected.name, &info)) << expected.name;
+        const std::string flag_name(expected.name);
+        const std::string suffix(expected.suffix);
+        ASSERT_GE(flag_name.size(), suffix.size());
+        EXPECT_EQ(flag_name.size() - suffix.size(), flag_name.rfind(suffix));
+        EXPECT_NE(std::string::npos, info.description.find(expected.unit));
+        EXPECT_EQ(std::string(expected.default_value), info.default_value);
+    }
+
+    EXPECT_EQ(5, brpc::ubring::FLAGS_ub_disconnect_timeout_s);
+    EXPECT_EQ(1, brpc::ubring::FLAGS_ub_connect_timeout_s);
+    EXPECT_EQ(5, brpc::ubring::FLAGS_ub_hb_timer_interval_s);
+    EXPECT_EQ(100, brpc::ubring::FLAGS_ub_event_queue_timer_interval_us);
+    EXPECT_EQ(5, brpc::ubring::FLAGS_ub_flying_io_timeout_s);
+    EXPECT_EQ(100U * USEC_TO_NSEC,
+              static_cast<uint32_t>(
+                  brpc::ubring::FLAGS_ub_event_queue_timer_interval_us) *
+                  USEC_TO_NSEC);
+}
+
 namespace brpc {
 namespace ubring {
 class UBShmEndpointTest : public ::testing::Test {
@@ -237,6 +285,46 @@ TEST_F(UBShmEndpointTest, reset_cleans_up_resources) {
 TEST_F(UBShmEndpointTest, reset_is_idempotent) {
     _ep->Reset();
     _ep->Reset();
+}
+
+// The receive paths (UbrTrxRecvBlockMode / StartReadv) read `msg_len' and
+// `cur_index' out of a chunk header the remote peer writes into the ring, then
+// copy `msg_len - cur_index' bytes from the 60-byte `payload.inner'. A peer
+// that writes msg_len > 60, or cur_index > msg_len (which underflows the
+// uint8_t subtraction), makes that copy over-read the payload into adjacent
+// shared memory. IsRecvChunkHeaderValid is the guard both paths now apply.
+TEST(UBRingRecvChunkHeaderTest, reject_out_of_range_len_and_index) {
+    using brpc::ubring::UBRing;
+    // Legitimate values a well-formed peer produces: full payload, partial
+    // consume, and the fully-consumed boundary.
+    EXPECT_TRUE(UBRing::IsRecvChunkHeaderValid(UBR_MSG_PAYLOAD_LEN, 0));
+    EXPECT_TRUE(UBRing::IsRecvChunkHeaderValid(10, 5));
+    EXPECT_TRUE(UBRing::IsRecvChunkHeaderValid(0, 0));
+    EXPECT_TRUE(UBRing::IsRecvChunkHeaderValid(UBR_MSG_PAYLOAD_LEN,
+                                               UBR_MSG_PAYLOAD_LEN));
+    // msg_len past the payload capacity -> over-read source.
+    EXPECT_FALSE(UBRing::IsRecvChunkHeaderValid(UBR_MSG_PAYLOAD_LEN + 1, 0));
+    EXPECT_FALSE(UBRing::IsRecvChunkHeaderValid(255, 0));
+    // cur_index past msg_len -> `msg_len - cur_index' underflows to a large
+    // uint8_t.
+    EXPECT_FALSE(UBRing::IsRecvChunkHeaderValid(0, 1));
+    EXPECT_FALSE(UBRing::IsRecvChunkHeaderValid(10, 20));
+}
+
+// A crafted chunk laid out exactly like one in the ring: the guard rejects it
+// so the recv loop never reaches the over-reading memcpy.
+TEST(UBRingRecvChunkHeaderTest, crafted_chunk_is_rejected) {
+    brpc::ubring::UbrMsgFormat chunk;
+    memset(&chunk, 0xAB, sizeof(chunk));
+    chunk.header[UBR_MSG_LEN_INDEX] = 255;  // peer claims 255 bytes in a 60-byte payload
+    chunk.header[UBR_MSG_CUR_INDEX] = 0;
+    EXPECT_FALSE(brpc::ubring::UBRing::IsRecvChunkHeaderValid(
+        chunk.header[UBR_MSG_LEN_INDEX], chunk.header[UBR_MSG_CUR_INDEX]));
+
+    chunk.header[UBR_MSG_LEN_INDEX] = UBR_MSG_PAYLOAD_LEN;
+    chunk.header[UBR_MSG_CUR_INDEX] = 0;
+    EXPECT_TRUE(brpc::ubring::UBRing::IsRecvChunkHeaderValid(
+        chunk.header[UBR_MSG_LEN_INDEX], chunk.header[UBR_MSG_CUR_INDEX]));
 }
 
 #else

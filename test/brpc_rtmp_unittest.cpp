@@ -659,6 +659,82 @@ TEST(RtmpTest, amf_rejects_oversized_ecma_array_count) {
     EXPECT_FALSE(brpc::ReadAMFObject(&obj, &istream));
 }
 
+TEST(RtmpTest, amf_truncated_long_string_does_not_allocate_declared_size) {
+    // Regression: a tiny message declaring a huge (but under-the-cap)
+    // string length must not cause the declared size to be allocated
+    // before the bytes are actually available in the stream.
+    const uint32_t declared_len = 8 * 1024 * 1024;
+    std::string req_buf;
+    AppendAMFLongStringHeader(&req_buf, declared_len);
+    req_buf.append("only-a-few-bytes", 16);
+
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    std::string result;
+    EXPECT_FALSE(brpc::ReadAMFString(&result, &istream));
+    EXPECT_TRUE(result.empty());
+    // Reading is chunked, so a truncated stream leaves at most one chunk
+    // of capacity behind instead of the full declared length.
+    EXPECT_LT(result.capacity(), (size_t)declared_len);
+}
+
+TEST(RtmpTest, amf_reads_long_string_larger_than_one_chunk) {
+    const std::string big(200 * 1024, 'x');
+    std::string req_buf;
+    {
+        google::protobuf::io::StringOutputStream zc_stream(&req_buf);
+        brpc::AMFOutputStream ostream(&zc_stream);
+        brpc::WriteAMFString(big, &ostream);
+        ASSERT_TRUE(ostream.good());
+    }
+    google::protobuf::io::ArrayInputStream zc_stream(req_buf.data(), req_buf.size());
+    brpc::AMFInputStream istream(&zc_stream);
+    std::string result;
+    ASSERT_TRUE(brpc::ReadAMFString(&result, &istream));
+    ASSERT_EQ(big, result);
+}
+
+TEST(RtmpTest, chunk_stream_rejects_message_length_over_max_body_size) {
+    int pipe_fds[2];
+    ASSERT_EQ(0, pipe(pipe_fds));
+    butil::fd_guard guard0(pipe_fds[0]);   // read end, closed by this guard
+    butil::fd_guard guard1(pipe_fds[1]);   // write end, handed over to Socket
+
+    brpc::SocketId id;
+    brpc::SocketOptions options;
+    options.fd = guard1.release();         // Socket takes ownership of the fd
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id));
+    brpc::SocketUniquePtr sock;
+    ASSERT_EQ(0, brpc::Socket::Address(id, &sock));
+
+    brpc::policy::RtmpContext ctx(nullptr, nullptr);
+    ctx.SetState(sock->remote_side(),
+                 brpc::policy::RtmpContext::STATE_RECEIVED_C2);
+
+    // The message length declared by a chunk header is remote-controlled and
+    // was never bounded: with repeated mid-message headers a connection's
+    // reassembly buffer could grow without limit. A type-0 header declaring
+    // a length above -max_body_size must be rejected up front.
+    GFLAGS_NAMESPACE::FlagSaver flag_saver;
+    brpc::FLAGS_max_body_size = 1024;
+
+    std::string chunk;
+    chunk.push_back((char)0x02);   // basic header: fmt=0, cs_id=2
+    chunk.append(3, '\0');         // timestamp = 0
+    chunk.push_back('\0');         // message_length (3 bytes) = 4096
+    chunk.push_back((char)0x10);
+    chunk.push_back('\0');
+    chunk.push_back((char)0x02);   // message_type = Abort
+    chunk.append(4, '\0');         // stream_id = 0 (little endian)
+    chunk.append(128, '\0');       // one full chunk of payload
+
+    butil::IOBuf buf;
+    buf.append(chunk);
+    ASSERT_EQ(brpc::PARSE_ERROR_TOO_BIG_DATA,
+              ctx.Feed(&buf, sock.get()).error());
+}
+
+
 TEST(RtmpTest, amf_rejects_oversized_strict_array_count) {
     ScopedAMFLimit scoped_limit(&brpc::FLAGS_amf_max_array_size, 1);
 
@@ -748,6 +824,33 @@ TEST(RtmpTest, avc_seq_header_sps_without_zero_byte) {
     brpc::AVCDecoderConfigurationRecord avc;
     // Only requirement: the call must not read past the copied record.
     avc.Create(buf);
+}
+
+// The Exp-Golomb decoder used by ParseSPS placed every value bit at the same
+// shift (leadingZeroBits-1) instead of the descending (leadingZeroBits-1-i)
+// position, so any ue(v) code with leadingZeroBits>=2 decoded to the wrong
+// number (and a crafted code could overflow the int32 accumulator). Here the
+// SPS encodes pic_width/pic_height as ue(4); the old code decoded 5 (width 96),
+// the correct value is 4 (width 80).
+TEST(RtmpTest, avc_seq_header_sps_exp_golomb) {
+    butil::IOBuf buf;
+    // configurationVersion, profile, compat, level, lengthSizeMinusOne=3, numSPS=1
+    const char head[6] = { 0x01, 0x42, 0x00, 0x1E, (char)0xff, (char)0xe1 };
+    buf.append(head, sizeof(head));
+    // Baseline SPS (profile_idc=66 skips the chroma block). The bitstream after
+    // profile/flags/level encodes: seq_parameter_set_id=0, log2_max_frame_num=0,
+    // pic_order_cnt_type=2, max_num_ref_frames=0, gaps_flag=0, then
+    // pic_width_in_mbs_minus1=ue(4) and pic_height_in_map_units_minus1=ue(4).
+    const char sps[7] = { 0x67, 0x42, 0x00, 0x1E, (char)0xdc, 0x52, (char)0xc0 };
+    const char len_be[2] = { 0x00, (char)sizeof(sps) };
+    buf.append(len_be, sizeof(len_be));
+    buf.append(sps, sizeof(sps));
+    buf.push_back('\0'); // numPPS=0
+
+    brpc::AVCDecoderConfigurationRecord avc;
+    ASSERT_TRUE(avc.Create(buf).ok());
+    ASSERT_EQ(80, avc.width);
+    ASSERT_EQ(80, avc.height);
 }
 
 static void AppendBigEndian3Bytes(std::string* s, uint32_t v) {

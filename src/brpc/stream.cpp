@@ -35,10 +35,16 @@
 namespace brpc {
 
 DECLARE_bool(usercode_in_pthread);
+DECLARE_uint64(max_body_size);
 DECLARE_int64(socket_max_streams_unconsumed_bytes);
 DEFINE_uint64(stream_write_max_segment_size, 512 * 1024 * 1024,
               "Stream message exceeding this size will be automatically split into smaller segments");
 BRPC_VALIDATE_GFLAG(stream_write_max_segment_size, PositiveInteger);
+DEFINE_int32(stream_max_streams_per_request, 64,
+             "Maximum number of streams that StreamAccept creates for one "
+             "request. Raise this flag if an application needs to accept "
+             "more streams per request");
+BRPC_VALIDATE_GFLAG(stream_max_streams_per_request, PositiveInteger);
 
 const static butil::IOBuf *TIMEOUT_TASK = (butil::IOBuf*)-1L;
 
@@ -54,6 +60,7 @@ Stream::Stream(Forbidden f)
     , _local_consumed(0)
     , _atomic_local_consumed(0)
     , _parse_rpc_response(false)
+    , _server_accepted_stream(false)
     , _pending_buf(nullptr)
     , _start_idle_timer_us(0)
     , _idle_timer(0) {
@@ -94,6 +101,7 @@ int Stream::OnCreated(const StreamOptions& options,
     _local_consumed = 0;
     _atomic_local_consumed.store(0, butil::memory_order_relaxed);
     _parse_rpc_response = parse_rpc_response;
+    _server_accepted_stream = (remote_settings != nullptr);
     _pending_buf = nullptr;
     _start_idle_timer_us = 0;
     _idle_timer = 0;
@@ -330,57 +338,71 @@ int Stream::AppendIfNotFull(const butil::IOBuf &data,
     return 0;
 }
 
-void Stream::SetRemoteConsumed(size_t new_remote_consumed) {
-    CHECK(_cur_buf_size > 0);
+int Stream::SetRemoteConsumed(size_t new_remote_consumed) {
     bthread_id_list_t tmplist;
     CHECK_EQ(0, bthread_id_list_init(&tmplist, 0, 0));
-    bthread_mutex_lock(&_congestion_control_mutex);
-    if (_remote_consumed >= new_remote_consumed) {
-        bthread_mutex_unlock(&_congestion_control_mutex);
-        return;
-    }
-    const bool was_full = _produced >= _remote_consumed + _cur_buf_size;
-
-    if (FLAGS_socket_max_streams_unconsumed_bytes > 0 && _host_socket != nullptr) {
-        const size_t consumed_delta = new_remote_consumed - _remote_consumed;
-        const size_t accounted_delta =
-            std::min(consumed_delta, _socket_unconsumed_size);
-        if (accounted_delta != 0) {
-            _host_socket->_total_streams_unconsumed_size.fetch_sub(
-                accounted_delta, butil::memory_order_relaxed);
-            _socket_unconsumed_size -= accounted_delta;
+    BRPC_SCOPE_EXIT { bthread_id_list_destroy(&tmplist); };
+    {
+        BAIDU_SCOPED_LOCK(_congestion_control_mutex);
+        if (_cur_buf_size == 0) {
+            return -1;
         }
-        const int64_t total_unconsumed = _host_socket->_total_streams_unconsumed_size.load(
-                butil::memory_order_relaxed);
-        if (total_unconsumed > FLAGS_socket_max_streams_unconsumed_bytes) {
-            if (_options.min_buf_size > 0) {
-                _cur_buf_size = _options.min_buf_size;
-            } else {
-                _cur_buf_size /= 2;
+        if (_remote_consumed >= new_remote_consumed) {
+            return 0;
+        }
+        const bool was_full = _produced >= _remote_consumed + _cur_buf_size;
+
+        if (FLAGS_socket_max_streams_unconsumed_bytes > 0 &&
+            _host_socket != nullptr) {
+            const size_t consumed_delta =
+                new_remote_consumed - _remote_consumed;
+            const size_t accounted_delta =
+                std::min(consumed_delta, _socket_unconsumed_size);
+            if (accounted_delta != 0) {
+                _host_socket->_total_streams_unconsumed_size.fetch_sub(
+                    accounted_delta, butil::memory_order_relaxed);
+                _socket_unconsumed_size -= accounted_delta;
             }
-            LOG(INFO) << "stream consumers on socket " << _host_socket->id()
-                      << " is crowded, cut stream " << id()
-                      << " buffer to " << _cur_buf_size;
-        } else if (_produced >= new_remote_consumed + _cur_buf_size &&
-                   (_options.max_buf_size <= 0 || _cur_buf_size < (size_t)_options.max_buf_size)) {
-            if (_options.max_buf_size > 0 && _cur_buf_size * 2 > (size_t)_options.max_buf_size) {
-                _cur_buf_size = _options.max_buf_size;
-            } else {
-                _cur_buf_size *= 2;
+            const int64_t total_unconsumed =
+                _host_socket->_total_streams_unconsumed_size.load(
+                    butil::memory_order_relaxed);
+            if (total_unconsumed >
+                FLAGS_socket_max_streams_unconsumed_bytes) {
+                if (_options.min_buf_size > 0) {
+                    _cur_buf_size = _options.min_buf_size;
+                } else if (_cur_buf_size > 1) {
+                    _cur_buf_size /= 2;
+                }
+                LOG(INFO) << "stream consumers on socket "
+                          << _host_socket->id()
+                          << " is crowded, cut stream " << id()
+                          << " buffer to " << _cur_buf_size;
+            } else if (_produced >=
+                           new_remote_consumed + _cur_buf_size &&
+                       (_options.max_buf_size <= 0 ||
+                        _cur_buf_size <
+                            (size_t)_options.max_buf_size)) {
+                if (_options.max_buf_size > 0 &&
+                    _cur_buf_size * 2 >
+                        (size_t)_options.max_buf_size) {
+                    _cur_buf_size = _options.max_buf_size;
+                } else {
+                    _cur_buf_size *= 2;
+                }
             }
         }
-    }
 
-    _remote_consumed = new_remote_consumed;
-    const bool is_full = _produced >= _remote_consumed + _cur_buf_size;
-    if (was_full && !is_full) {
-        bthread_id_list_swap(&tmplist, &_writable_wait_list);
+        _remote_consumed = new_remote_consumed;
+        const bool is_full =
+            _produced >= _remote_consumed + _cur_buf_size;
+        if (was_full && !is_full) {
+            bthread_id_list_swap(&tmplist, &_writable_wait_list);
+        }
     }
-    bthread_mutex_unlock(&_congestion_control_mutex);
 
     // broadcast
     bthread_id_list_reset(&tmplist, 0);
-    bthread_id_list_destroy(&tmplist);
+    return 0;
 }
 
 void* Stream::RunOnWritable(void* arg) {
@@ -584,21 +606,54 @@ void Stream::SetConnected(const StreamSettings* remote_settings) {
 
 int Stream::OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* sock) {
     if (!_connected.load(butil::memory_order_acquire)) {
-        // Before connection is published, let the locked slow path initialize
-        // the host socket or confirm that another thread already did so.
-        if (SetHostSocket(sock) != 0) {
+        if (_server_accepted_stream) {
+            BAIDU_SCOPED_LOCK(_connect_mutex);
+            if (_host_socket == nullptr || _host_socket->id() != sock->id()) {
+                LOG(WARNING) << "stream=" << id()
+                             << " dropped a frame from a foreign socket";
+                return -1;
+            }
+        } else if (SetHostSocket(sock) != 0) {
             return -1;
         }
+    } else if (_host_socket == nullptr || _host_socket->id() != sock->id()) {
+        LOG(WARNING) << "stream=" << id()
+                     << " dropped a frame from a foreign socket";
+        return -1;
     }
 
     switch (fm.frame_type()) {
     case FRAME_TYPE_FEEDBACK:
-        if (_connected.load(butil::memory_order_acquire)) {
-            SetRemoteConsumed(fm.feedback().consumed_size());
+        if (!buf->empty()) {
+            LOG(WARNING) << "Close stream=" << id()
+                         << " whose feedback frame has payload_size="
+                         << buf->size();
+            Close(EPROTO, "Feedback frame must not contain a payload");
+            return -1;
         }
-        CHECK(buf->empty());
+        if (_connected.load(butil::memory_order_acquire)) {
+            if (SetRemoteConsumed(fm.feedback().consumed_size()) != 0) {
+                LOG(WARNING) << "Close stream=" << id()
+                             << " that received unexpected feedback";
+                Close(EPROTO, "Feedback is disabled for this stream");
+                return -1;
+            }
+        }
         break;
     case FRAME_TYPE_DATA:
+        if (buf->length() > FLAGS_max_body_size ||
+            (_pending_buf != nullptr &&
+             _pending_buf->length() > FLAGS_max_body_size - buf->length())) {
+            LOG(WARNING) << "Close stream=" << id()
+                         << " whose pending message size="
+                         << (_pending_buf != nullptr ? _pending_buf->length() : 0)
+                         << " plus frame size=" << buf->length()
+                         << " exceeds max_body_size=" << FLAGS_max_body_size;
+            delete _pending_buf;
+            _pending_buf = nullptr;
+            Close(EMSGSIZE, "Reassembled stream message is too large");
+            return -1;
+        }
         if (_pending_buf != nullptr) {
             _pending_buf->append(*buf);
             buf->clear();
@@ -758,7 +813,7 @@ int Stream::SetHostSocket(Socket* host_socket) {
         return -1;
     }
     if (_host_socket != nullptr) {
-        return 0;
+        return _host_socket->id() == host_socket->id() ? 0 : -1;
     }
 
     SocketUniquePtr ptr;
@@ -1007,6 +1062,21 @@ int StreamAccept(StreamIds& response_streams, Controller& cntl,
     }
     if (!cntl.has_remote_stream()) {
         LOG(ERROR) << "No stream along with this request";
+        return -1;
+    }
+    const int64_t stream_count = static_cast<int64_t>(
+        cntl._remote_stream_settings->extra_stream_ids_size()) + 1;
+    if (stream_count > FLAGS_stream_max_streams_per_request) {
+        cntl.SetFailed(EREQUEST,
+                       "Reject %" PRId64 " streams in one request, exceeding "
+                       "-stream_max_streams_per_request=%" PRId64,
+                       stream_count,
+                       static_cast<int64_t>(
+                           FLAGS_stream_max_streams_per_request));
+        LOG(ERROR) << "Reject " << stream_count
+                   << " streams in one request, exceeding "
+                      "-stream_max_streams_per_request="
+                   << FLAGS_stream_max_streams_per_request;
         return -1;
     }
     StreamOptions opt;
