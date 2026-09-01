@@ -959,7 +959,10 @@ TEST_F(RdmaTest, server_miss_during_hello_msg) {
   ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN,
             read(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
   ASSERT_EQ(4, write(acc_fd, "RDMA", 4));
-  ASSERT_EQ(2, write(acc_fd, "00", 2));
+    const uint16_t msg_len = butil::HostToNet16(
+      static_cast<uint16_t>(rdma::HELLO_V2_MSG_LEN_MIN));
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(msg_len)),
+            write(acc_fd, &msg_len, sizeof(msg_len)));
   bthread_id_join(cntl.call_id());
 
   ASSERT_EQ(ERPCTIMEDOUT, cntl.ErrorCode());
@@ -995,7 +998,10 @@ TEST_F(RdmaTest, server_close_during_hello_msg) {
   ASSERT_EQ(rdma::HELLO_V2_MSG_LEN_MIN,
             read(acc_fd, data, rdma::HELLO_V2_MSG_LEN_MIN));
   ASSERT_EQ(4, write(acc_fd, "RDMA", 4));
-  ASSERT_EQ(2, write(acc_fd, "00", 2));
+    const uint16_t msg_len = butil::HostToNet16(
+      static_cast<uint16_t>(rdma::HELLO_V2_MSG_LEN_MIN));
+    ASSERT_EQ(static_cast<ssize_t>(sizeof(msg_len)),
+            write(acc_fd, &msg_len, sizeof(msg_len)));
   close(acc_fd);
   usleep(100000);
   ASSERT_EQ(handshake::FAILED, AdapterTransport::Get(s.get())->handshake_phase());

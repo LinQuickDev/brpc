@@ -284,7 +284,7 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
     callbacks.transport.on_failed = []() {};
 
     ASSERT_EQ(STEP_NEED_MORE, session.RunServer(callbacks));
-    ASSERT_EQ(16, session.phase());
+    ASSERT_EQ(ACK_WAIT, session.phase());
     ASSERT_EQ("HSLO", io.output());
     ASSERT_TRUE(source.empty());
 
@@ -373,7 +373,7 @@ TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
 
     source.append("S", 1);
     ASSERT_EQ(STEP_NEED_MORE, session.RunServer(callbacks));
-    ASSERT_EQ(13, session.phase());
+    ASSERT_EQ(HELLO_WAIT, session.phase());
     ASSERT_EQ(7, session.protocol_version());
     ASSERT_EQ(2UL, source.size());
 }

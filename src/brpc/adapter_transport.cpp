@@ -216,13 +216,14 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         };
         callbacks.transport.on_failed = [&]() {
             const int saved_errno = errno != 0 ? errno : EPROTO;
+            connect_error = saved_errno;
             socket->SetFailed(saved_errno,
                               "Fail to complete rdma handshake from %s: %s",
                               socket->description().c_str(),
                               berror(saved_errno));
         };
         const handshake::StepResult result = adapter->_handshake.RunClient(callbacks);
-        if (result == handshake::STEP_ERROR) {
+        if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
         adapter->CompleteConnection(static_cast<handshake::Phase>(
@@ -279,6 +280,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         };
         callbacks.transport.on_failed = [&]() {
             const int saved_errno = errno != 0 ? errno : EPROTO;
+            connect_error = saved_errno;
             socket->SetFailed(saved_errno,
                               "Fail to complete ubring handshake from %s: %s",
                               socket->description().c_str(),
@@ -288,7 +290,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         if (result == handshake::STEP_OK) {
             transport->FinishUpgrade();
         }
-        if (result == handshake::STEP_ERROR) {
+        if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
         adapter->CompleteConnection(static_cast<handshake::Phase>(

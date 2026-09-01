@@ -174,6 +174,9 @@ StepResult HandshakeSession::RunClient(
     CHECK(callbacks.transport.negotiate_resources);
     CHECK(callbacks.transport.set_high_speed_active);
     CHECK(callbacks.transport.set_tcp_active);
+    // A client handshake runs once on a potentially reused bthread. Do not
+    // let an errno left by earlier work override this handshake's result.
+    errno = 0;
 
     SetPhase(PREPARING);
     StepResult result = callbacks.transport.prepare_resources();
@@ -191,6 +194,9 @@ StepResult HandshakeSession::RunClient(
 
     SetPhase(HELLO_WAIT);
     result = ReceiveHello(callbacks.codec, NULL, false);
+    if (result == STEP_NOT_MINE || result == STEP_NEED_MORE) {
+        errno = EPROTO;
+    }
     if (result == STEP_ERROR || result == STEP_NOT_MINE ||
         result == STEP_NEED_MORE) {
         return FinishWithFailure(this, callbacks.transport.on_failed);
