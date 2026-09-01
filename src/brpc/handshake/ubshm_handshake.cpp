@@ -48,8 +48,10 @@ static const char* const MAGIC = "UB";
 static const size_t MAGIC_LEN = 2;
 static const size_t HELLO_LEN = 64;
 static const size_t ACK_LEN = 4;
+#if BRPC_WITH_UBRING
 static const uint16_t HELLO_VERSION = 2;
 static const uint16_t IMPL_VERSION = 1;
+#endif  // BRPC_WITH_UBRING
 static const uint32_t ACK_OK = 0x1;
 
 static const FrameSpec& HelloFrameSpec() {
@@ -224,12 +226,6 @@ private:
     DISALLOW_COPY_AND_ASSIGN(UBShmServerHandshakeAdapter);
 };
 
-static const int FALLBACK_PREPARE = 1;
-static const int FALLBACK_HELLO_SEND = 2;
-static const int FALLBACK_HELLO_WAIT = 3;
-static const int FALLBACK_NEGOTIATE = 4;
-static const int FALLBACK_ACK_SEND = 5;
-static const int FALLBACK_ACK_WAIT = 6;
 
 static HandshakeCodec MakeUBShmFallbackCodec() {
     HandshakeCodec codec{};

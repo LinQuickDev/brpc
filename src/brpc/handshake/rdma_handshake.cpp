@@ -414,12 +414,6 @@ private:
     DISALLOW_COPY_AND_ASSIGN(RdmaServerHandshakeAdapter);
 };
 
-static const int FALLBACK_PREPARE = 1;
-static const int FALLBACK_HELLO_SEND = 2;
-static const int FALLBACK_HELLO_WAIT = 3;
-static const int FALLBACK_NEGOTIATE = 4;
-static const int FALLBACK_ACK_SEND = 5;
-static const int FALLBACK_ACK_WAIT = 6;
 static constexpr uint16_t V2_HELLO_VERSION_INVALID =
     std::numeric_limits<uint16_t>::max();
 static constexpr size_t V3_GID_LEN = 16;
