@@ -36,6 +36,8 @@ header:
     - 'example/*/*.port'
     - 'example/build_with_bazel_module/.bazelversion'
     - 'src/bthread/offset_inl.list'
+    # Generated URMA graphify cache
+    - 'src/brpc/urma/graphify-out/cache/**'
     - 'test/*.crt'
     - 'test/*.key'
     - 'test/jsonout'
