@@ -74,11 +74,11 @@ static FrameSpec FixedSpec(const char* magic, size_t magic_len,
                      FrameSpec::FIXED);
 }
 
-static HandshakeCodec MakeTestCodec(std::string* calls = NULL) {
+static HandshakeCodec MakeTestCodec(std::string* calls = nullptr) {
     HandshakeCodec codec{};
     codec.protocol_version = 7;
     codec.hello_frame = FixedSpec("HS", 2, 4);
-    codec.ack_frame = FixedSpec(NULL, 0, 1);
+    codec.ack_frame = FixedSpec(nullptr, 0, 1);
     codec.build_hello = [calls](bool enabled, std::string* payload) {
         if (calls) *calls += "build ";
         *payload = enabled ? "LO" : "NO";
@@ -394,7 +394,7 @@ TEST(TransportHandshakeTest,
     butil::IOBuf source;
     source.append(hello.data(), 1);
     ParseResult result = policy::ParseTransportHandshake(
-        &source, socket.get(), false, NULL);
+        &source, socket.get(), false, nullptr);
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
     ASSERT_EQ(1UL, source.size());
@@ -403,11 +403,11 @@ TEST(TransportHandshakeTest,
 
     source.append(hello.data() + 1, hello.size() - 1);
     result = policy::ParseTransportHandshake(
-        &source, socket.get(), false, NULL);
+        &source, socket.get(), false, nullptr);
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error());
     ASSERT_TRUE(source.empty());
-    ASSERT_NE(NULL, socket->parsing_context());
+    ASSERT_NE(nullptr, socket->parsing_context());
 
     char reply[64];
     ASSERT_EQ(sizeof(reply), read(peer_fd, reply, sizeof(reply)));
@@ -423,13 +423,13 @@ TEST(TransportHandshakeTest,
     const uint32_t ack = 0;
     source.append(&ack, sizeof(ack));
     result = policy::ParseTransportHandshake(
-        &source, socket.get(), false, NULL);
+        &source, socket.get(), false, nullptr);
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
     ASSERT_TRUE(source.empty());
     ASSERT_EQ(FALLBACK_TCP,
               AdapterTransport::Get(socket.get())->handshake_phase());
-    ASSERT_EQ(NULL, socket->parsing_context());
+    ASSERT_EQ(nullptr, socket->parsing_context());
     socket->SetFailed();
 }
 
@@ -449,13 +449,13 @@ TEST(TransportHandshakeTest, plain_tcp_server_consumes_coalesced_ubshm_ack) {
     const uint32_t ack = 0;
     source.append(&ack, sizeof(ack));
     const ParseResult result = policy::ParseTransportHandshake(
-        &source, socket.get(), false, NULL);
+        &source, socket.get(), false, nullptr);
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
     ASSERT_TRUE(source.empty());
     ASSERT_EQ(FALLBACK_TCP,
               AdapterTransport::Get(socket.get())->handshake_phase());
-    ASSERT_EQ(NULL, socket->parsing_context());
+    ASSERT_EQ(nullptr, socket->parsing_context());
     socket->SetFailed();
 }
 

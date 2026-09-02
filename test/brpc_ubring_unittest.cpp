@@ -168,7 +168,7 @@ TEST(UBShmHandshakeAdapterTest, disabled_hello_requests_tcp_fallback) {
     brpc::ubring::UBShmHandshakeAdapter adapter;
     std::string payload;
     ASSERT_EQ(brpc::handshake::STEP_OK,
-              adapter.BuildHello(false, 0, NULL, &payload));
+              adapter.BuildHello(false, 0, nullptr, &payload));
     brpc::ubring::HelloMessage decoded{};
     EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
               adapter.ParseHello(payload, &decoded));

@@ -50,7 +50,7 @@ static const size_t MIN_ONCE_READ = 4096;
 static const size_t MAX_ONCE_READ = 524288;
 static const size_t IOBUF_IOV_MAX = 256;
 
-static butil::Mutex *g_ubring_resource_mutex = NULL;
+static butil::Mutex *g_ubring_resource_mutex = nullptr;
 
 UBShmEndpoint::UBShmEndpoint(Socket *s)
     : _socket(s), _socket_id(s ? s->id() : INVALID_SOCKET_ID),
@@ -146,7 +146,7 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM *local_trx_shm,
     const int saved_errno = errno;
     PLOG(WARNING) << "Fail to create socket for cq";
     delete _ub_ring;
-    _ub_ring = NULL;
+    _ub_ring = nullptr;
     _cq_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return -1;
@@ -156,7 +156,7 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM *local_trx_shm,
     const int saved_errno = errno;
     DeallocateResources();
     delete _ub_ring;
-    _ub_ring = NULL;
+    _ub_ring = nullptr;
     _cq_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return ret;
@@ -183,7 +183,7 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM *remote_trx_shm,
     const int saved_errno = errno;
     PLOG(WARNING) << "Fail to create socket for cq";
     delete _ub_ring;
-    _ub_ring = NULL;
+    _ub_ring = nullptr;
     _cq_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return -1;
@@ -193,7 +193,7 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM *remote_trx_shm,
     const int saved_errno = errno;
     DeallocateResources();
     delete _ub_ring;
-    _ub_ring = NULL;
+    _ub_ring = nullptr;
     _cq_sid = INVALID_SOCKET_ID;
     errno = saved_errno;
     return ret;

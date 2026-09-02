@@ -1444,7 +1444,7 @@ TEST_F(RdmaTest, v2_server_preserves_coalesced_ack_after_extension) {
   ASSERT_EQ(0, connect(sockfd, (sockaddr *)&addr, sizeof(sockaddr)));
   usleep(100000);
   Socket *s = GetSocketFromServer(0);
-  ASSERT_TRUE(s != NULL);
+  ASSERT_TRUE(s != nullptr);
   ASSERT_EQ(handshake::UNINITIALIZED,
             AdapterTransport::Get(s)->handshake_phase());
 

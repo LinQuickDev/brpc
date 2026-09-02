@@ -60,7 +60,7 @@ static const FrameSpec& HelloFrameSpec() {
 
 static const FrameSpec& AckFrameSpec() {
     static const FrameSpec spec(
-        NULL, 0, ACK_LEN, ACK_LEN, FrameSpec::FIXED);
+        nullptr, 0, ACK_LEN, ACK_LEN, FrameSpec::FIXED);
     return spec;
 }
 
@@ -297,7 +297,7 @@ StepResult UBShmServerHandshakeAdapter::RunFallbackServerHandshake(
 StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     UBShmTransport* transport = UBShmTransport::Get(socket);
-    CHECK(transport->GetUBShmEp() != NULL);
+    CHECK(transport->GetUBShmEp() != nullptr);
 
     ubring::HelloMessage remote{};
     ubring::UBShmHandshakeAdapter wire;
@@ -324,7 +324,7 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
                   MB_TO_BYTE
             : 0;
         return wire.BuildHello(
-            enabled, len, enabled ? remote.shm_name : NULL, payload);
+            enabled, len, enabled ? remote.shm_name : nullptr, payload);
     };
     callbacks.codecs.push_back(codec);
     callbacks.transport.prepare_resources = [&]() {
@@ -333,7 +333,7 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
             return STEP_FALLBACK;
         }
         ubring::SHM remote_trx_shm = {
-            NULL, remote.len, 0, {0},
+            nullptr, remote.len, 0, {0},
             static_cast<uint32_t>(socket->fd())};
         strncpy(remote_trx_shm.name, remote.shm_name,
                 SHM_MAX_NAME_BUFF_LEN);
@@ -341,13 +341,13 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
         const size_t local_shm_len =
             static_cast<size_t>(ubring::FLAGS_data_queue_size) * MB_TO_BYTE;
         ubring::SHM local_trx_shm = {
-            NULL, local_shm_len, 0, {0},
+            nullptr, local_shm_len, 0, {0},
             static_cast<uint32_t>(socket->fd())};
         char client_name[SHM_MAX_NAME_BUFF_LEN + 1];
         memcpy(client_name, remote.shm_name, SHM_MAX_NAME_BUFF_LEN);
         client_name[SHM_MAX_NAME_BUFF_LEN] = '\0';
         char* client_ip_port = strrchr(client_name, '_');
-        if (client_ip_port != NULL) {
+        if (client_ip_port != nullptr) {
             *client_ip_port = '\0';
         }
         const int result = snprintf(

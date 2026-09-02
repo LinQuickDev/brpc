@@ -508,7 +508,7 @@ StepResult RdmaServerHandshakeAdapter::RunFallbackServerHandshake(
 StepResult RdmaServerHandshakeAdapter::RunRdmaServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     RdmaTransport* transport = RdmaTransport::Get(socket);
-    CHECK(transport->GetRdmaEp() != NULL);
+    CHECK(transport->GetRdmaEp() != nullptr);
 
     rdma::ParsedHello remote{};
     std::vector<std::unique_ptr<rdma::RdmaHandshakeAdapter> > protocols =

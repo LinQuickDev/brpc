@@ -29,14 +29,14 @@ ServerHandshakeContext* ServerHandshakeContext::Create(
     HandshakeAdapter* adapter) {
     ServerHandshakeContext* context =
         butil::get_object<ServerHandshakeContext>();
-    if (context != NULL) {
+    if (context != nullptr) {
         context->_adapter = adapter;
     }
     return context;
 }
 
 void ServerHandshakeContext::Destroy() {
-    _adapter = NULL;
+    _adapter = nullptr;
     butil::return_object(this);
 }
 
@@ -91,7 +91,7 @@ StepResult HandshakeSession::ReceiveHello(const HandshakeCodec& codec,
                                           bool* magic_matched) {
     CHECK(codec.parse_hello);
     std::string payload;
-    const FrameResult frame_result = input != NULL
+    const FrameResult frame_result = input != nullptr
         ? FrameCodec::ParseBufferedFrame(
               input, codec.hello_frame, &payload, magic_matched)
         : FrameCodec::ReadFrame(
@@ -121,7 +121,7 @@ StepResult HandshakeSession::ReceiveAck(const HandshakeCodec& codec,
                                         bool* enabled) {
     CHECK(codec.parse_ack);
     std::string payload;
-    const FrameResult frame_result = input != NULL
+    const FrameResult frame_result = input != nullptr
         ? FrameCodec::ParseBufferedFrame(input, codec.ack_frame, &payload)
         : FrameCodec::ReadFrame(_io, codec.ack_frame, false, &payload);
     const StepResult result = ConvertFrameResult(frame_result);
@@ -135,14 +135,14 @@ StepResult HandshakeSession::SelectAndReceiveHello(
     const std::vector<HandshakeCodec>& codecs, HandshakeInput* input,
     bool push_back_on_not_mine, const HandshakeCodec** selected) {
     CHECK(!codecs.empty());
-    CHECK(selected != NULL);
-    if (input == NULL) {
+    CHECK(selected != nullptr);
+    if (input == nullptr) {
         // A blocking byte stream cannot try a second codec after consuming
         // bytes from the fd. Such protocols must select a single codec before
         // entering the common session.
         CHECK_EQ(1UL, codecs.size());
         *selected = &codecs.front();
-        return ReceiveHello(**selected, NULL, push_back_on_not_mine);
+        return ReceiveHello(**selected, nullptr, push_back_on_not_mine);
     }
 
     bool need_more = false;
@@ -190,7 +190,7 @@ StepResult HandshakeSession::RunClient(
     }
 
     SetPhase(HELLO_WAIT);
-    result = ReceiveHello(callbacks.codec, NULL, false);
+    result = ReceiveHello(callbacks.codec, nullptr, false);
     if (result == STEP_ERROR || result == STEP_NOT_MINE ||
         result == STEP_NEED_MORE) {
         return FinishWithFailure(this, callbacks.transport.on_failed);
@@ -234,7 +234,7 @@ StepResult HandshakeSession::RunServer(
         return STEP_NOT_MINE;
     }
 
-    const HandshakeCodec* selected = NULL;
+    const HandshakeCodec* selected = nullptr;
     if (phase() != ACK_WAIT) {
         const int previous_phase = phase();
         _local_enabled = false;
@@ -250,7 +250,7 @@ StepResult HandshakeSession::RunServer(
             return STEP_NOT_MINE;
         }
         if (result == STEP_NEED_MORE) {
-            if (selected == NULL) {
+            if (selected == nullptr) {
                 SetPhase(previous_phase);
             }
             return STEP_NEED_MORE;
@@ -279,7 +279,7 @@ StepResult HandshakeSession::RunServer(
         }
 
         SetPhase(HELLO_SEND);
-        CHECK(selected != NULL);
+        CHECK(selected != nullptr);
         _local_enabled = enabled;
         if (SendHello(*selected, enabled) != STEP_OK) {
             return FinishWithFailure(this, callbacks.transport.on_failed);
@@ -292,7 +292,7 @@ StepResult HandshakeSession::RunServer(
                 break;
             }
         }
-        CHECK(selected != NULL);
+    CHECK(selected != nullptr);
     }
 
     // Always try the ACK callback once. For a non-blocking server it returns

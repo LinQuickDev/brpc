@@ -37,7 +37,7 @@ extern SocketVarsCollector *g_vars;
 UBShmTransport *UBShmTransport::Get(const Socket *socket) {
   const AdapterTransport *adapter = AdapterTransport::Get(socket);
   Transport *transport = adapter->high_speed_transport();
-  CHECK(transport != NULL);
+  CHECK(transport != nullptr);
   return static_cast<UBShmTransport *>(transport);
 }
 
@@ -100,7 +100,7 @@ void UBShmTransport::ActivateUpgrade() { SetHighSpeedAvailable(true); }
 void UBShmTransport::DeactivateUpgrade() { SetHighSpeedAvailable(false); }
 
 void UBShmTransport::FinishUpgrade() {
-  if (_ub_ep != NULL && _ub_ep->_ub_ring != NULL) {
+  if (_ub_ep != nullptr && _ub_ep->_ub_ring != nullptr) {
     _ub_ep->_ub_ring->UbrUnlinkLocalShm();
   }
 }
@@ -111,7 +111,7 @@ int UBShmTransport::CutFromIOBuf(butil::IOBuf *buf) {
 }
 
 ssize_t UBShmTransport::CutFromIOBufList(butil::IOBuf **buf, size_t ndata) {
-  CHECK(_ub_ep != NULL);
+  CHECK(_ub_ep != nullptr);
   return _ub_ep->CutFromIOBufList(buf, ndata);
 }
 
@@ -126,6 +126,7 @@ int UBShmTransport::WaitEpollOut(butil::atomic<int> *_epollout_butex,
     if (!_ub_ep->IsWritable()) {
       g_vars->nwaitepollout << 1;
       _ub_ep->PollerRegisterEpollOut(pollin);
+      int result = 0;
       auto mwj_ret =
           bthread::butex_wait(_epollout_butex, expected_val, &duetime);
       // LOG(INFO) << "mwj pollin2=" << pollin << " mwj_ret=" << mwj_ret;
@@ -142,11 +143,12 @@ int UBShmTransport::WaitEpollOut(butil::atomic<int> *_epollout_butex,
           // Different from TCP, we cannot find the UB channel
           // failed by writing to it. Thus we must check if it
           // is already failed here.
-          return 1;
+          result = 1;
         }
       }
+      _ub_ep->PollerUnRegisterEpollOut(pollin);
+      return result;
     }
-    _ub_ep->PollerUnRegisterEpollOut(pollin);
   }
   return 0;
 }

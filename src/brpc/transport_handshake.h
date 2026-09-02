@@ -40,7 +40,7 @@ class HandshakeAdapter;
 // Remembering the selected stateless adapter is necessary because ACK frames
 // have no magic and cannot be dispatched from their bytes alone.
 struct ServerHandshakeContext : public Destroyable {
-    ServerHandshakeContext() : _adapter(NULL) {}
+    ServerHandshakeContext() : _adapter(nullptr) {}
     static ServerHandshakeContext* Create(HandshakeAdapter* adapter);
     HandshakeAdapter* adapter() const { return _adapter; }
     void Destroy() override;
@@ -119,7 +119,7 @@ struct ServerHandshakeCallbacks {
 // lifecycle and publication ordering.
 class HandshakeSession {
 public:
-    explicit HandshakeSession(Socket* socket = NULL)
+    explicit HandshakeSession(Socket* socket = nullptr)
         : _socket_io(socket), _io(&_socket_io), _phase(UNINITIALIZED),
           _protocol_version(0), _local_enabled(false) {}
 
@@ -174,7 +174,7 @@ private:
     StepResult ReceiveHello(const HandshakeCodec& codec,
                             HandshakeInput* input,
                             bool push_back_on_not_mine,
-                            bool* magic_matched = NULL);
+                            bool* magic_matched = nullptr);
     StepResult SendAck(const HandshakeCodec& codec, bool enabled);
     StepResult ReceiveAck(const HandshakeCodec& codec,
                           HandshakeInput* input, bool* enabled);

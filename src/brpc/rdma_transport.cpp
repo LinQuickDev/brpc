@@ -32,7 +32,7 @@ extern SocketVarsCollector *g_vars;
 RdmaTransport *RdmaTransport::Get(const Socket *socket) {
   const AdapterTransport *adapter = AdapterTransport::Get(socket);
   Transport *transport = adapter->high_speed_transport();
-  CHECK(transport != NULL);
+    CHECK(transport != nullptr);
   return static_cast<RdmaTransport *>(transport);
 }
 

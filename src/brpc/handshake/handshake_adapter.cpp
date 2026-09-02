@@ -32,10 +32,10 @@ ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
     const StepResult result = RunServerStep(source, socket);
     if (result == STEP_NEED_MORE) {
         if (GetSession(socket)->phase() == ACK_WAIT &&
-            socket->parsing_context() == NULL) {
+            socket->parsing_context() == nullptr) {
             ServerHandshakeContext* context =
                 ServerHandshakeContext::Create(this);
-            if (context == NULL) {
+            if (context == nullptr) {
                 GetSession(socket)->MarkFailed();
                 return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
             }
@@ -44,7 +44,7 @@ ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
         return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
 
-    socket->reset_parsing_context(NULL);
+    socket->reset_parsing_context(nullptr);
     if (result == STEP_ERROR) {
         return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
     }
