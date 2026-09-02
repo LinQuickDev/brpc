@@ -234,24 +234,18 @@ void UBShmEndpoint::PollIn(UBShmEndpoint *ep, uint32_t ep_event) {
       return;
     }
 
+    InputMessengerProcessor& processor = s->fd_input_processor();
     bool read_eof = false;
     while (!read_eof) {
       const int64_t received_us = butil::cpuwide_time_us();
       const int64_t base_realtime = butil::gettimeofday_us() - received_us;
 
-      size_t once_read = s->_avg_msg_size * 16;
-      if (once_read < MIN_ONCE_READ) {
-        once_read = MIN_ONCE_READ;
-      } else if (once_read > MAX_ONCE_READ) {
-        once_read = MAX_ONCE_READ;
-      }
-
-      const ssize_t nr =
-          s->_read_buf.append_from_reader(ep->_ub_ring, once_read);
+      const ssize_t nr = processor.read_buf().append_from_reader(
+          ep->_ub_ring, processor.OnceReadSize());
       if (nr <= 0) {
         if (0 == nr) {
           // Set `read_eof' flag and proceed to feed EOF into `Protocol'
-          // (implied by m->_read_buf.empty), which may produce a new
+          // (implied by an empty processor.read_buf()), which may produce a new
           // `InputMessageBase' under some protocols such as HTTP
           LOG_IF(WARNING, FLAGS_log_connection_close)
               << *s << " was closed by remote side";
@@ -270,8 +264,7 @@ void UBShmEndpoint::PollIn(UBShmEndpoint *ep, uint32_t ep_event) {
         }
       }
 
-      InputMessenger *messenger = static_cast<InputMessenger *>(s->user());
-      if (messenger->ProcessNewMessage(s.get(), nr, read_eof, received_us,
+      if (processor.ProcessNewMessage(nr, read_eof, received_us,
                                        base_realtime, last_msg) < 0) {
         return;
       }

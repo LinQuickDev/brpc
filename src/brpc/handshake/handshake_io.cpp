@@ -141,7 +141,7 @@ int SocketHandshakeIO::WriteAll(const void* data, size_t len) {
 int SocketHandshakeIO::PushBack(const void* data, size_t len) {
     CHECK(_socket != NULL);
     if (len != 0) {
-        return _socket->_read_buf.append(data, len) == 0 ? 0 : -1;
+        return _socket->fd_input_processor().read_buf().append(data, len) == 0 ? 0 : -1;
     }
     return 0;
 }

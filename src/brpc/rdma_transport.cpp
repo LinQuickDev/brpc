@@ -85,6 +85,10 @@ int RdmaTransport::NegotiateUpgradeResources(
   return _rdma_ep->BringUpQp(remote, server);
 }
 
+int RdmaTransport::StartUpgradeEvents() {
+  return _rdma_ep->StartCqEvents();
+}
+
 std::unique_ptr<rdma::RdmaHandshakeAdapter>
 RdmaTransport::CreateClientHandshakeAdapter() {
   return rdma::CreateClientHandshakeAdapter(_rdma_ep);

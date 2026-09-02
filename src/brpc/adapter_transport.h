@@ -86,6 +86,7 @@ private:
     void TryReadOnTcp();
     void ProcessTcpEvent();
     void CheckUnexpectedTcpData();
+    static void OnNewMessagesAfterUpgrade(Socket* socket);
     static void* ProcessClientHandshake(void* arg);
 
     SocketMode _mode;

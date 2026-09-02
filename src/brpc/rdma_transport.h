@@ -55,6 +55,7 @@ public:
 
     // Resource operations consumed by the upper-level handshake coordinator.
     int PrepareUpgradeResources();
+    int StartUpgradeEvents();
     int NegotiateUpgradeResources(const rdma::RdmaConnectionInfo& remote,
                                   bool server);
     std::unique_ptr<rdma::RdmaHandshakeAdapter>

@@ -17,6 +17,7 @@
 
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <functional>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -82,12 +83,97 @@ extern bool g_fail_resource_alloc_for_test;
 static std::string g_ip = "127.0.0.1";
 static butil::EndPoint g_ep;
 
+// Number of Echo requests the server has actually served. The churn tests below
+// cut the connection while requests are in flight, and from the client side
+// "the server never saw this request" is indistinguishable from "the server
+// answered it and the reply died with the connection" -- both just look like a
+// failed RPC. Only this counter tells the two apart, and it is the server having
+// real work in flight that makes the race those tests hunt reachable at all.
+static butil::atomic<int> g_echo_served(0);
+
+// The server side runs in its own threads, so the only thing a test can rely on
+// is that an expected transition happens *eventually*. Polling with a generous
+// upper bound keeps the common case as fast as the machine allows and does not
+// turn into a flake when CI is loaded, which a fixed sleep does.
+static const int64_t WAIT_TIMEOUT_US = 5000000;
+static const int64_t WAIT_INTERVAL_US = 1000;
+
+// Returns true if `pred` turned true before the timeout expired.
+static bool WaitUntil(const std::function<bool()>& pred,
+                      int64_t timeout_us = WAIT_TIMEOUT_US) {
+    const int64_t deadline = butil::gettimeofday_us() + timeout_us;
+    while (!pred()) {
+        if (butil::gettimeofday_us() >= deadline) {
+            return false;
+        }
+        usleep((useconds_t)WAIT_INTERVAL_US);
+    }
+    return true;
+}
+
+// write(2) may transfer less than asked for, so a test that cares about the
+// whole buffer reaching the peer has to loop.
+static bool WriteAll(int fd, const void* buf, size_t len) {
+    const uint8_t* p = (const uint8_t*)buf;
+    for (size_t done = 0; done < len; ) {
+        ssize_t n = write(fd, p + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        done += n;
+    }
+    return true;
+}
+
+// Same for read(2). Returns false on error, on timeout (see ConnectToServer)
+// and on EOF before the whole buffer arrived.
+static bool ReadAll(int fd, void* buf, size_t len) {
+    uint8_t* p = (uint8_t*)buf;
+    for (size_t done = 0; done < len; ) {
+        ssize_t n = read(fd, p + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        done += n;
+    }
+    return true;
+}
+
+// Connect a raw socket to the test server. Note that sin_addr is taken from
+// `g_ep`: a zeroed one means 0.0.0.0, which only happens to reach the local
+// server on some systems. The receive timeout keeps a missing server reply from
+// hanging the test forever.
+static void ConnectToServer(butil::fd_guard* sockfd) {
+    sockaddr_in addr;
+    bzero((char*)&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(g_ep.port);
+    addr.sin_addr = g_ep.ip;
+    sockfd->reset(socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_TRUE(*sockfd >= 0);
+    timeval tv;
+    tv.tv_sec = WAIT_TIMEOUT_US / 1000000;
+    tv.tv_usec = WAIT_TIMEOUT_US % 1000000;
+    ASSERT_EQ(0, setsockopt(*sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)));
+    ASSERT_EQ(0, connect(*sockfd, (sockaddr*)&addr, sizeof(addr)));
+}
+
 class MyEchoService : public ::test::EchoService {
   void Echo(google::protobuf::RpcController *cntl_base,
             const ::test::EchoRequest *req, ::test::EchoResponse *res,
             google::protobuf::Closure *done) {
     Controller *cntl = static_cast<Controller *>(cntl_base);
     ClosureGuard done_guard(done);
+    g_echo_served.fetch_add(1, butil::memory_order_relaxed);
     if (req->server_fail()) {
       cntl->SetFailed(req->server_fail(), "Server fail1");
       cntl->SetFailed(req->server_fail(), "Server fail2");
@@ -157,12 +243,60 @@ protected:
     return nullptr;
   }
 
+  // Server-side connection creation and teardown are asynchronous.
+  Socket *WaitForServerSocket() {
+    Socket *s = nullptr;
+    WaitUntil([this, &s] { return (s = GetSocketFromServer(0)) != nullptr; });
+    return s;
+  }
+
+  bool WaitForServerSocketGone() {
+    return WaitUntil([this] { return GetSocketFromServer(0) == nullptr; });
+  }
+
   butil::TempFile _server_list;
   std::string _naming_url;
 
   Server _server;
   MyEchoService _svc;
 };
+
+// Shorthand for the RDMA transport behind a Socket.
+static RdmaTransport *RdmaTransportOf(Socket *s) {
+  return RdmaTransport::Get(s);
+}
+
+static int WaitForHandshakePhase(Socket *s, handshake::Phase expected) {
+  int phase = AdapterTransport::Get(s)->handshake_phase();
+  WaitUntil([s, expected, &phase] {
+    phase = AdapterTransport::Get(s)->handshake_phase();
+    return phase == expected;
+  });
+  return phase;
+}
+
+#define ASSERT_HANDSHAKE_PHASE(expected, socket) \
+  ASSERT_EQ(expected, WaitForHandshakePhase(socket, expected))
+
+static bool WaitForFdReadBuf(Socket *s, size_t size) {
+  return WaitUntil([s, size] {
+    return s->fd_input_processor().read_buf().size() == size;
+  });
+}
+
+static void MakeV2ClientHello(uint8_t (&data)[rdma::HELLO_V2_MSG_LEN_MIN]) {
+    rdma::v2_wire::HelloMessage msg{};
+    msg.msg_len = rdma::HELLO_V2_MSG_LEN_MIN;
+    msg.hello_ver = rdma::HELLO_V2_VERSION;
+    msg.impl_ver = rdma::IMPL_V2_VERSION;
+    msg.sq_size = 16;
+    msg.rq_size = 16;
+    msg.block_size = 8192;
+    msg.qp_num = 0;
+    msg.gid = rdma::GetRdmaGid();
+    memcpy(data, "RDMA", 4);
+    msg.Serialize(data + 4);
+}
 
 // Parameterized fixture used by upper-layer RPC tests that have no
 // dependency on the handshake wire format. The parameter is the
@@ -747,6 +881,189 @@ TEST_F(RdmaTest, client_send_data_on_tcp_after_ack_send) {
   ASSERT_EQ(nullptr, GetSocketFromServer(0));
 
   StopServer();
+}
+
+static void HandshakeUntilAckWait(butil::fd_guard* sockfd) {
+    ASSERT_NO_FATAL_FAILURE(ConnectToServer(sockfd));
+
+    uint8_t hello[rdma::HELLO_V2_MSG_LEN_MIN];
+    MakeV2ClientHello(hello);
+    ASSERT_TRUE(WriteAll(*sockfd, hello, sizeof(hello)));
+    // The server answers only once it has consumed our hello, so reading the
+    // whole reply is a synchronization point: no sleeping needed here.
+    uint8_t reply[rdma::HELLO_V2_MSG_LEN_MIN];
+    ASSERT_TRUE(ReadAll(*sockfd, reply, sizeof(reply)));
+}
+
+TEST_F(RdmaTest, server_accepts_data_pipelined_behind_fallback_ack) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+    auto* transport = RdmaTransportOf(s);
+    ASSERT_HANDSHAKE_PHASE(handshake::ACK_WAIT, s);
+
+    // An ACK asking for TCP, plus the first 4 bytes of a baidu_std request. One
+    // write, so that both end up in the same read on the server.
+    uint8_t ack_and_data[rdma::HELLO_ACK_LEN + 4];
+    const uint32_t flags = butil::HostToNet32(0);
+    memcpy(ack_and_data, &flags, rdma::HELLO_ACK_LEN);
+    memcpy(ack_and_data + rdma::HELLO_ACK_LEN, "PRPC", 4);
+    ASSERT_TRUE(WriteAll(sockfd, ack_and_data, sizeof(ack_and_data)));
+
+    // The handshake took the ACK only and left "PRPC" to baidu_std, which is
+    // now waiting for the rest of its 12B header. So the connection lives on
+    // with those 4 bytes still buffered. Note that baidu_std gets them a moment
+    // after the handshake gave up the stream, hence the wait.
+    ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
+    ASSERT_EQ(RdmaTransport::RDMA_OFF, transport->_rdma_state);
+    ASSERT_TRUE(GetSocketFromServer(0) != nullptr);
+    ASSERT_TRUE(WaitForFdReadBuf(s, 4));
+
+    sockfd.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
+
+    StopServer();
+}
+
+TEST_F(RdmaTest, server_rejects_data_pipelined_behind_rdma_ack) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+    ASSERT_HANDSHAKE_PHASE(handshake::ACK_WAIT, s);
+
+    uint8_t ack_and_data[rdma::HELLO_ACK_LEN + 4];
+    const uint32_t flags = butil::HostToNet32(rdma::HELLO_ACK_RDMA_OK);
+    memcpy(ack_and_data, &flags, rdma::HELLO_ACK_LEN);
+    memcpy(ack_and_data + rdma::HELLO_ACK_LEN, "PRPC", 4);
+    ASSERT_TRUE(WriteAll(sockfd, ack_and_data, sizeof(ack_and_data)));
+
+    // Note that `transport->_rdma_ep` is gone by now: dropping the connection
+    // recycles the Socket, and RdmaTransport::Release() deletes the endpoint.
+    ASSERT_TRUE(WaitForServerSocketGone());
+
+    StopServer();
+}
+
+TEST_F(RdmaTest, server_stops_parsing_tcp_fd_once_rdma_is_on) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+    auto* transport = RdmaTransportOf(s);
+    ASSERT_HANDSHAKE_PHASE(handshake::ACK_WAIT, s);
+
+    // A bare ACK asking for RDMA. Nothing trails it, so the handshake ends in
+    // ESTABLISHED instead of being rejected (see the test above).
+    const uint32_t flags = butil::HostToNet32(rdma::HELLO_ACK_RDMA_OK);
+    ASSERT_TRUE(WriteAll(sockfd, &flags, sizeof(flags)));
+    ASSERT_HANDSHAKE_PHASE(handshake::ESTABLISHED, s);
+    ASSERT_EQ(RdmaTransport::RDMA_ON, transport->_rdma_state);
+    ASSERT_TRUE(GetSocketFromServer(0) != nullptr);
+
+    ASSERT_TRUE(WriteAll(sockfd, "PRPC", 4));
+    ASSERT_TRUE(WaitForServerSocketGone());
+
+    StopServer();
+}
+
+TEST_F(RdmaTest, server_parses_qp_stream_after_rdma_is_on) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+    auto* transport = RdmaTransportOf(s);
+    ASSERT_HANDSHAKE_PHASE(handshake::ACK_WAIT, s);
+
+    const uint32_t flags = butil::HostToNet32(rdma::HELLO_ACK_RDMA_OK);
+    ASSERT_TRUE(WriteAll(sockfd, &flags, sizeof(flags)));
+    ASSERT_HANDSHAKE_PHASE(handshake::ESTABLISHED, s);
+
+    InputMessengerProcessor& qp_stream = transport->_rdma_ep->_input_processor;
+    ASSERT_TRUE(qp_stream.read_buf().empty());
+    qp_stream.read_buf().append("PRPC");
+    InputMessageClosure last_msg;
+    // The real caller stamps messages with cpuwide_time_us() and derives
+    // base_realtime from it, so feed ProcessNewMessage() the same time domain:
+    // received_us also ends up in Socket::_last_readtime_us.
+    const uint64_t received_us = butil::cpuwide_time_us();
+    const uint64_t base_realtime = butil::gettimeofday_us() - received_us;
+    ASSERT_EQ(0, qp_stream.ProcessNewMessage(
+                     4, false, received_us, base_realtime, last_msg));
+    // baidu_std claimed the stream and is waiting for the rest of its header.
+    ASSERT_EQ((int)PROTOCOL_BAIDU_STD, s->preferred_index());
+    ASSERT_EQ(4u, qp_stream.read_buf().size());
+    ASSERT_TRUE(s->fd_input_processor().read_buf().empty());
+    ASSERT_EQ(handshake::ESTABLISHED, AdapterTransport::Get(s)->handshake_phase());
+    ASSERT_FALSE(s->Failed());
+
+    StopServer();
+}
+
+TEST_F(RdmaTest, server_declines_handshake_bytes_after_fallback) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+
+    const uint32_t flags = butil::HostToNet32(0);
+    ASSERT_TRUE(WriteAll(sockfd, &flags, sizeof(flags)));
+    ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
+
+    // Replay a valid hello. baidu_std rejects it and no other protocol claims
+    // it, so the connection is dropped. What must NOT happen is a second
+    // handshake: that would answer with another server hello.
+    uint8_t hello[rdma::HELLO_V2_MSG_LEN_MIN];
+    MakeV2ClientHello(hello);
+    ASSERT_TRUE(WriteAll(sockfd, hello, sizeof(hello)));
+
+    // Note that `transport->_rdma_ep` is gone by now: dropping the connection
+    // recycles the Socket, and RdmaTransport::Release() deletes the endpoint.
+    ASSERT_TRUE(WaitForServerSocketGone());
+    uint8_t reply[rdma::HELLO_V2_MSG_LEN_MIN];
+    ASSERT_LE(recv(sockfd, reply, sizeof(reply), MSG_DONTWAIT), 0);
+
+    StopServer();
+}
+
+TEST_F(RdmaTest, fd_and_qp_input_streams_are_separate) {
+    StartServer();
+
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(ConnectToServer(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_TRUE(s != nullptr);
+    auto* transport = RdmaTransportOf(s);
+
+    // The fd stream belongs to the Socket, the QP stream to the endpoint.
+    InputMessengerProcessor& fd_stream = s->fd_input_processor();
+    InputMessengerProcessor& qp_stream = transport->_rdma_ep->_input_processor;
+    ASSERT_NE(&fd_stream, &qp_stream);
+    ASSERT_NE(&fd_stream.read_buf(), &qp_stream.read_buf());
+
+    // Two magic bytes are too few to dispatch on, so they stay buffered. In the
+    // fd stream, and only there.
+    ASSERT_TRUE(WriteAll(sockfd, "RD", 2));
+    ASSERT_TRUE(WaitForFdReadBuf(s, 2));
+    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(2u, fd_stream.read_buf().size());
+    ASSERT_TRUE(qp_stream.read_buf().empty());
+
+    sockfd.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
+
+    StopServer();
 }
 
 TEST_F(RdmaTest, server_miss_before_hello_send) {
@@ -2207,6 +2524,57 @@ TEST_F(RdmaTest, channel_option_invalid) {
   ASSERT_EQ(-1, channel.Init(g_ep, &chan_options));
 }
 
+static const int E2E_RPC_NUM = 32;
+
+static void ShutdownClientConnection(Controller& cntl) {
+    SocketUniquePtr s;
+    if (Socket::Address(cntl._single_server_id, &s) == 0) {
+        ::shutdown(s->fd(), SHUT_WR);
+    }
+}
+
+// Returns the number of RPCs that succeeded. A test that severs the connection
+// cannot predict which ones make it, but the ones that do must still be right,
+// so failures are tolerated here and the caller decides how many it demands.
+static int SendEchoRpcs(Channel& channel, int rpc_num, size_t attach_size,
+                        const std::function<void(Controller&)>& disturb = nullptr,
+                        int disturb_at = 0) {
+    std::vector<Controller> cntl(rpc_num);
+    std::vector<test::EchoRequest> req(rpc_num);
+    std::vector<test::EchoResponse> res(rpc_num);
+    std::vector<butil::IOBuf> attach(rpc_num);
+    for (int i = 0; i < rpc_num; ++i) {
+        req[i].set_message("hello");
+        req[i].set_code(i + 1);
+        if (attach_size > 0) {
+            EXPECT_EQ(0, attach[i].resize(
+                attach_size, static_cast<char>('a' + i % 26)));
+            cntl[i].request_attachment().append(attach[i]);
+        }
+        ::test::EchoService::Stub(&channel).Echo(&cntl[i], &req[i], &res[i], DoNothing());
+        if (disturb && i == disturb_at) {
+            disturb(cntl[i]);
+        }
+    }
+    int succeeded = 0;
+    for (int i = 0; i < rpc_num; ++i) {
+        bthread_id_join(cntl[i].call_id());
+        if (cntl[i].Failed()) {
+            continue;
+        }
+        ++succeeded;
+        EXPECT_EQ("MyEchoService", res[i].message()) << "rpc[" << i << "]";
+        EXPECT_EQ(1, res[i].code_list_size()) << "rpc[" << i << "]";
+        if (res[i].code_list_size() == 1) {
+            EXPECT_EQ(i + 1, res[i].code_list(0)) << "rpc[" << i << "]";
+        }
+        EXPECT_EQ(attach_size, cntl[i].response_attachment().size()) << "rpc[" << i << "]";
+        EXPECT_TRUE(attach[i].equals(cntl[i].response_attachment())) << "rpc[" << i << "]";
+    }
+    return succeeded;
+}
+
+
 TEST_P(RdmaRpcTest, rdma_client_to_rdma_server) {
   if (!FLAGS_rdma_test_enable) {
     return;
@@ -2299,6 +2667,68 @@ TEST_P(RdmaRpcTest, rdma_client_to_tcp_server) {
   ASSERT_FALSE(cntl.Failed());
 
   StopServer();
+}
+
+TEST_P(RdmaRpcTest, tcp_client_to_rdma_server_short_connection) {
+    StartServer();
+
+    Channel channel;
+    ChannelOptions chan_options;
+    chan_options.connect_timeout_ms = 1000;
+    chan_options.timeout_ms = 10000;
+    chan_options.max_retry = 0;
+    chan_options.connection_type = "short";
+    ASSERT_EQ(0, channel.Init(g_ep, &chan_options));
+    for (int round = 0; round < 8; ++round) {
+        ASSERT_EQ(E2E_RPC_NUM, SendEchoRpcs(channel, E2E_RPC_NUM, 4096))
+                << "round=" << round;
+    }
+
+    StopServer();
+}
+
+static const int CHURN_ROUND_NUM = 16;
+static const int CHURN_RPC_NUM = 64;
+static const size_t CHURN_ATTACH_SIZE = 32 * 1024;
+
+TEST_P(RdmaRpcTest, rdma_server_survives_connection_churn) {
+    StartServer();
+
+    ChannelOptions chan_options;
+    chan_options.connect_timeout_ms = 1000;
+    chan_options.timeout_ms = 3000;
+    chan_options.max_retry = 0;
+    const int served_before = g_echo_served.load(butil::memory_order_relaxed);
+    int succeeded = 0;
+    for (int round = 0; round < CHURN_ROUND_NUM; ++round) {
+        // A fresh Channel per round so the Socket is dropped from the socket
+        // map when the Channel dies, instead of the next round inheriting it.
+        Channel channel;
+        ASSERT_EQ(0, channel.Init(g_ep, &chan_options));
+        // Warm up before cutting. Without this the cut of round 0 lands on a
+        // connection that has not finished connecting yet, where fd() is still
+        // -1 and shutdown() is a silent no-op.
+        ASSERT_EQ(1, SendEchoRpcs(channel, 1, 0)) << "round=" << round;
+        succeeded += SendEchoRpcs(channel, CHURN_RPC_NUM, CHURN_ATTACH_SIZE,
+                                  ShutdownClientConnection,
+                                  round * CHURN_RPC_NUM / CHURN_ROUND_NUM);
+        ASSERT_FALSE(HasFailure()) << "round=" << round;
+    }
+
+    const int served = g_echo_served.load(butil::memory_order_relaxed) -
+                       served_before - CHURN_ROUND_NUM;
+    LOG(INFO) << "server served " << served << " of "
+              << CHURN_ROUND_NUM * CHURN_RPC_NUM << " requests during the churn, "
+              << succeeded << " replies made it back";
+    ASSERT_GT(served, 0);
+
+    // The churn must leave the server able to serve a fresh connection, and
+    // serve it correctly.
+    Channel channel;
+    ASSERT_EQ(0, channel.Init(g_ep, &chan_options));
+    ASSERT_EQ(CHURN_RPC_NUM, SendEchoRpcs(channel, CHURN_RPC_NUM, CHURN_ATTACH_SIZE));
+
+    StopServer();
 }
 
 static const int RPC_NUM = 1024;
@@ -2662,6 +3092,46 @@ TEST_P(RdmaRpcTest, client_close_during_rpc) {
   }
 
   StopServer();
+}
+
+TEST_P(RdmaRpcTest, rdma_client_close_during_rpc_repeatedly) {
+    if (!FLAGS_rdma_test_enable) {
+        return;
+    }
+
+    StartServer();
+
+    ChannelOptions chan_options;
+    chan_options.socket_mode = SOCKET_MODE_RDMA;
+    chan_options.connect_timeout_ms = 1000;
+    chan_options.timeout_ms = 3000;
+    chan_options.max_retry = 0;
+    const int served_before = g_echo_served.load(butil::memory_order_relaxed);
+    int succeeded = 0;
+    for (int round = 0; round < CHURN_ROUND_NUM; ++round) {
+        Channel channel;
+        ASSERT_EQ(0, channel.Init(g_ep, &chan_options));
+        // Warm up so the cut lands on an established RDMA connection.
+        ASSERT_EQ(1, SendEchoRpcs(channel, 1, 0)) << "round=" << round;
+        succeeded += SendEchoRpcs(channel, CHURN_RPC_NUM, CHURN_ATTACH_SIZE,
+                                  ShutdownClientConnection,
+                                  round * CHURN_RPC_NUM / CHURN_ROUND_NUM);
+        ASSERT_FALSE(HasFailure()) << "round=" << round;
+    }
+
+
+    const int served = g_echo_served.load(butil::memory_order_relaxed) -
+                       served_before - CHURN_ROUND_NUM;
+    LOG(INFO) << "server served " << served << " of "
+              << CHURN_ROUND_NUM * CHURN_RPC_NUM << " requests during the churn, "
+              << succeeded << " replies made it back";
+    ASSERT_GT(served, 0);
+
+    Channel channel;
+    ASSERT_EQ(0, channel.Init(g_ep, &chan_options));
+    ASSERT_EQ(CHURN_RPC_NUM, SendEchoRpcs(channel, CHURN_RPC_NUM, CHURN_ATTACH_SIZE));
+
+    StopServer();
 }
 
 TEST_P(RdmaRpcTest, verbs_error_handling) {

@@ -223,6 +223,17 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
                               berror(saved_errno));
         };
         const handshake::StepResult result = adapter->_handshake.RunClient(callbacks);
+        if (result == handshake::STEP_OK &&
+            transport->StartUpgradeEvents() < 0) {
+            const int saved_errno = errno != 0 ? errno : ERDMA;
+            transport->DeactivateUpgrade();
+            adapter->_handshake.MarkFailed();
+            socket->SetFailed(
+                saved_errno,
+                "Fail to start RDMA CQ events from %s: %s",
+                socket->description().c_str(), berror(saved_errno));
+            connect_error = saved_errno;
+        }
         if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
@@ -319,7 +330,7 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
                    options.user != static_cast<SocketUser*>(
                        get_client_side_messenger())) {
             // RDMA server handshake is parsed by InputMessenger.
-            _on_edge_trigger = InputMessenger::OnNewMessages;
+            _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
 #if BRPC_WITH_UBRING
         } else if (_mode == SOCKET_MODE_UBRING &&
@@ -461,6 +472,37 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
     default:
         break;
     }
+}
+
+void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
+#if BRPC_WITH_RDMA
+    AdapterTransport* adapter = Get(socket);
+    if (adapter->_mode == SOCKET_MODE_RDMA &&
+        adapter->_handshake.phase() == handshake::ESTABLISHED) {
+        adapter->CheckUnexpectedTcpData();
+        return;
+    }
+#endif
+
+    InputMessenger::OnNewMessages(socket);
+
+#if BRPC_WITH_RDMA
+    if (adapter->_mode == SOCKET_MODE_RDMA &&
+        adapter->_handshake.phase() == handshake::ESTABLISHED) {
+        RdmaTransport* transport = static_cast<RdmaTransport*>(
+            adapter->_high_speed_transport.get());
+        if (transport->StartUpgradeEvents() < 0) {
+            const int saved_errno = errno != 0 ? errno : ERDMA;
+            transport->DeactivateUpgrade();
+            adapter->_handshake.MarkFailed();
+            adapter->CompleteConnection(handshake::FAILED);
+            socket->SetFailed(
+                saved_errno,
+                "Fail to start RDMA CQ events from %s: %s",
+                socket->description().c_str(), berror(saved_errno));
+        }
+    }
+#endif
 }
 
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {

@@ -119,6 +119,8 @@ private:
     // in the middle with resources partially allocated.
     // Return 0 if success, -1 if failed and errno set
     int DoAllocateResources();
+    // Start consuming CQ events only after handshake parsing has finished.
+    int StartCqEvents();
 
     // Release resources
     void DeallocateResources();
@@ -190,6 +192,8 @@ private:
 
     // Not owner
     Socket* _socket;
+    // Input state dedicated to the stream carried by the RDMA QP.
+    InputMessengerProcessor _input_processor;
 
     // ECE payload prepared by resource setup and consumed by the RDMA adapter.
     butil::optional<ibv_ece> _outgoing_ece;

@@ -131,6 +131,7 @@ RdmaEndpoint::RdmaEndpoint(Socket *s)
   if (_rq_size > MAX_QP_SIZE) {
     _rq_size = MAX_QP_SIZE;
   }
+  _input_processor.Init(s, InputMessengerProcessor::STREAM_RDMA_QP);
 }
 
 RdmaEndpoint::~RdmaEndpoint() { Reset(); }
@@ -145,6 +146,7 @@ void RdmaEndpoint::Reset() {
   _cq_sid = INVALID_SOCKET_ID;
   _sbuf.clear();
   _rbuf.clear();
+  _input_processor.Reset();
   _rbuf_data.clear();
   _remote_recv_block_size = 0;
   _accumulated_ack = 0;
@@ -479,10 +481,10 @@ ssize_t RdmaEndpoint::HandleCompletion(ibv_wc &wc) {
         zerocopy = false;
       }
       if (zerocopy) {
-        _rbuf[_rq_received].cutn(&_socket->_read_buf, wc.byte_len);
+        _rbuf[_rq_received].cutn(&_input_processor.read_buf(), wc.byte_len);
       } else {
         // Copy data when the receive data is really small
-        _socket->_read_buf.append(_rbuf_data[_rq_received], wc.byte_len);
+        _input_processor.read_buf().append(_rbuf_data[_rq_received], wc.byte_len);
       }
     }
     if (0 != (wc.wc_flags & IBV_WC_WITH_IMM) && wc.imm_data > 0) {
@@ -688,25 +690,6 @@ int RdmaEndpoint::DoAllocateResources() {
     if (0 != ReqNotifyCq(false, false)) {
       return -1;
     }
-
-    SocketOptions options;
-    options.user = this;
-    options.keytable_pool = _socket->_keytable_pool;
-    options.fd = _resource->comp_channel->fd;
-    options.on_edge_triggered_events = PollCq;
-    if (Socket::Create(options, &_cq_sid) < 0) {
-      PLOG(WARNING) << "Fail to create socket for cq";
-      return -1;
-    }
-  } else {
-    SocketOptions options;
-    options.user = this;
-    options.keytable_pool = _socket->_keytable_pool;
-    if (Socket::Create(options, &_cq_sid) < 0) {
-      PLOG(WARNING) << "Fail to create socket for cq";
-      return -1;
-    }
-    PollerAddCqSid();
   }
 
   _sbuf.resize(_sq_size - RESERVED_WR_NUM);
@@ -722,6 +705,45 @@ int RdmaEndpoint::DoAllocateResources() {
     return -1;
   }
 
+  return 0;
+}
+
+int RdmaEndpoint::StartCqEvents() {
+  if (InputMessengerProcessor::STREAM_NONE !=
+      _socket->parsing_stream_type()) {
+    LOG(WARNING) << "StartCqEvents() called while " << *_socket
+                 << " is parsing";
+    errno = ERDMA;
+    return -1;
+  }
+
+  if (_cq_sid != INVALID_SOCKET_ID) {
+    return 0;
+  }
+  if (_resource == nullptr) {
+    if (BAIDU_UNLIKELY(g_skip_rdma_init)) {
+      return 0;
+    }
+    LOG(WARNING) << "No RDMA resource to start CQ events on, "
+                 << *_socket;
+    errno = ERDMA;
+    return -1;
+  }
+
+  SocketOptions options;
+  options.user = this;
+  options.keytable_pool = _socket->_keytable_pool;
+  if (!FLAGS_rdma_use_polling) {
+    options.fd = _resource->comp_channel->fd;
+    options.on_edge_triggered_events = PollCq;
+  }
+  if (Socket::Create(options, &_cq_sid) < 0) {
+    PLOG(WARNING) << "Fail to create socket for cq";
+    return -1;
+  }
+  if (FLAGS_rdma_use_polling) {
+    PollerAddCqSid();
+  }
   return 0;
 }
 
@@ -1151,9 +1173,8 @@ void RdmaEndpoint::PollCq(Socket *m) {
     // Otherwise it may call too many bthread_flush to affect performance.
     const int64_t received_us = butil::cpuwide_time_us();
     const int64_t base_realtime = butil::gettimeofday_us() - received_us;
-    InputMessenger *messenger = static_cast<InputMessenger *>(s->user());
-    if (messenger->ProcessNewMessage(s.get(), bytes, false, received_us,
-                                     base_realtime, last_msg) < 0) {
+    if (ep->_input_processor.ProcessNewMessage(
+            bytes, false, received_us, base_realtime, last_msg) < 0) {
       return;
     }
   }
