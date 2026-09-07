@@ -10,22 +10,22 @@
 namespace test {
 
 class BenchmarkServiceStub;
-class BenchmarkService : public brpc::details::flatbuffers::Service {
+class BenchmarkService : public brpc::flatbuffers::Service {
 protected:
     inline BenchmarkService() {};
 public:
     virtual ~BenchmarkService();
-    static const brpc::details::flatbuffers::ServiceDescriptor* descriptor();
+    static const brpc::flatbuffers::ServiceDescriptor* descriptor();
     virtual void Test(google::protobuf::RpcController* controller,
-        const brpc::details::flatbuffers::Message* request,
-        brpc::details::flatbuffers::Message* response,
+        const brpc::flatbuffers::Message* request,
+        brpc::flatbuffers::Message* response,
         google::protobuf::Closure* done);
 
-    const brpc::details::flatbuffers::ServiceDescriptor* GetDescriptor();
-    void FBCallMethod(const brpc::details::flatbuffers::MethodDescriptor* method,
+    const brpc::flatbuffers::ServiceDescriptor* GetDescriptor();
+    void FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
         google::protobuf::RpcController* controller,
-        const brpc::details::flatbuffers::Message* request,
-        brpc::details::flatbuffers::Message* response,
+        const brpc::flatbuffers::Message* request,
+        brpc::flatbuffers::Message* response,
         google::protobuf::Closure* done);
 private:
     FB_BRPC_DISALLOW_EVIL_CONSTRUCTORS(BenchmarkService);
@@ -33,18 +33,18 @@ private:
 
 class BenchmarkServiceStub : public BenchmarkService {
 public:
-    BenchmarkServiceStub(brpc::details::flatbuffers::RpcChannel* channel);
-    BenchmarkServiceStub(brpc::details::flatbuffers::RpcChannel* channel,
-    brpc::details::flatbuffers::Service::ChannelOwnership ownership);
+    BenchmarkServiceStub(brpc::flatbuffers::RpcChannel* channel);
+    BenchmarkServiceStub(brpc::flatbuffers::RpcChannel* channel,
+    brpc::flatbuffers::Service::ChannelOwnership ownership);
     ~BenchmarkServiceStub();
-    inline brpc::details::flatbuffers::RpcChannel* channel() { return channel_; }
+    inline brpc::flatbuffers::RpcChannel* channel() { return channel_; }
     void Test(google::protobuf::RpcController* controller,
-        const brpc::details::flatbuffers::Message* request,
-        brpc::details::flatbuffers::Message* response,
+        const brpc::flatbuffers::Message* request,
+        brpc::flatbuffers::Message* response,
         google::protobuf::Closure* done);
 
 private:
-    brpc::details::flatbuffers::RpcChannel* channel_;
+    brpc::flatbuffers::RpcChannel* channel_;
     bool owns_channel_;
     FB_BRPC_DISALLOW_EVIL_CONSTRUCTORS(BenchmarkServiceStub);
 };

@@ -501,6 +501,7 @@ void Controller::ResetPods() {
     _inheritable.Reset();
     _pchan_sub_count = 0;
     _response = nullptr;
+    _fb_response = nullptr;
     _done = nullptr;
     _sender = nullptr;
     _request_code = 0;
@@ -510,6 +511,7 @@ void Controller::ResetPods() {
     _accessed = nullptr;
     _pack_request = nullptr;
     _method = nullptr;
+    _fb_method = nullptr;
     _auth = nullptr;
     _idl_names = idl_single_req_single_res;
     _idl_result = IDL_VOID_RESULT;
@@ -1481,7 +1483,15 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // Make request
     butil::IOBuf packet;
     SocketMessage* user_packet = nullptr;
-    _pack_request(&packet, &user_packet, cid.value, _method, this,
+    // Compatibility shim for the FlatBuffers prototype. The FlatBuffers
+    // packer converts this opaque value back without dereferencing it as a
+    // protobuf descriptor.
+    const google::protobuf::MethodDescriptor* method_desc =
+        is_use_flatbuffer()
+            ? reinterpret_cast<const google::protobuf::MethodDescriptor*>(
+                  _fb_method)
+            : _method;
+    _pack_request(&packet, &user_packet, cid.value, method_desc, this,
                   _request_buf, using_auth);
     // TODO: PackRequest may accept SocketMessagePtr<>?
     SocketMessagePtr<> user_packet_guard(user_packet);

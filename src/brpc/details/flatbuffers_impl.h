@@ -29,7 +29,6 @@
 #include "brpc/pb_compat.h"
 
 namespace brpc {
-namespace details {
 namespace flatbuffers {
 
 class MessageBuilder;
@@ -138,8 +137,33 @@ public:
     Message(const Message &other) = delete;
     Message &operator=(const Message &other) = delete;
 
-    Message(Message &&other) = default;
-    Message &operator=(Message &&other) = default;
+    Message(Message&& other) noexcept
+        : NonreflectableMessage<Message>(),
+          _iobuf(),
+          _meta_size(0),
+          _msg_size(0) {
+        swap(other);
+    }
+
+    Message& operator=(Message&& other) noexcept {
+        if (this != &other) {
+            Clear();
+            swap(other);
+        }
+        return *this;
+    }
+
+    void swap(Message& other) noexcept {
+        _iobuf.swap(other._iobuf);
+
+        const uint32_t meta_size = _meta_size;
+        _meta_size = other._meta_size;
+        other._meta_size = meta_size;
+
+        const uint32_t msg_size = _msg_size;
+        _msg_size = other._msg_size;
+        other._msg_size = msg_size;
+    }
 
     void *mutable_data() {
         return (void *)const_cast<uint8_t *>(data());
@@ -334,7 +358,6 @@ bool ParseFbFromIOBUF(Message* msg, size_t msg_size, const butil::IOBuf& buf, si
 bool SerializeFbToIOBUF(Message* msg, butil::IOBuf& buf);
 
 }  // namespace flatbuffers
-}  // namespace details
 }  // namespace brpc
 
 #endif  // BRPC_FLATBUFFERS_IMPL_H_

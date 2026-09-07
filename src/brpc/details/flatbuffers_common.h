@@ -32,7 +32,6 @@ namespace protobuf {
 }  // namespace google
 
 namespace brpc {
-namespace details {
 namespace flatbuffers {
 
 class Message;
@@ -113,7 +112,6 @@ public:
 };
 
 }  // namespace flatbuffers
-}  // namespace details
 }  // namespace brpc
 
 #endif  // BRPC_FLATBUFFERS_COMMON_H_

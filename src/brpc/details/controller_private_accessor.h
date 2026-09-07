@@ -85,7 +85,7 @@ public:
         _cntl->_local_side = pt;
         return *this;
     }
- 
+
     ControllerPrivateAccessor &set_auth_context(const AuthContext* ctx) {
         _cntl->set_auth_context(ctx);
         return *this;
@@ -94,12 +94,12 @@ public:
     // Overloaded set_span methods to support both shared_ptr and raw pointer
     ControllerPrivateAccessor &set_span(const std::shared_ptr<Span>& span);
     ControllerPrivateAccessor &set_span(Span* span);
-    
+
     ControllerPrivateAccessor &set_request_protocol(ProtocolType protocol) {
         _cntl->_request_protocol = protocol;
         return *this;
     }
-    
+
     std::shared_ptr<Span> span() const;
 
     uint32_t pipelined_count() const { return _cntl->_pipelined_count; }
@@ -126,8 +126,11 @@ public:
     StreamIds request_streams() { return _cntl->_request_streams; }
     StreamIds response_streams() { return _cntl->_response_streams; }
 
-    void set_method(const google::protobuf::MethodDescriptor* method) 
+    void set_method(const google::protobuf::MethodDescriptor* method)
     { _cntl->_method = method; }
+
+    void set_fb_method(const brpc::flatbuffers::MethodDescriptor* method)
+    { _cntl->_fb_method = method; }
 
     void set_readable_progressive_attachment(ReadableProgressiveAttachment* s)
     { _cntl->_rpa.reset(s); }

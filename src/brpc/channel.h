@@ -38,6 +38,7 @@
 #include "brpc/naming_service_filter.h"
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
+#include "brpc/details/flatbuffers_impl.h"  // Flatbuffers Protocol
 
 namespace brpc {
 
@@ -50,7 +51,7 @@ struct ChannelOptions {
     // Default: 200 (milliseconds)
     // Maximum: 0x7fffffff (roughly 30 days)
     int32_t connect_timeout_ms;
-    
+
     // Max duration of RPC over this Channel. -1 means wait indefinitely.
     // Overridable by Controller.set_timeout_ms().
     // Default: 500 (milliseconds)
@@ -73,9 +74,9 @@ struct ChannelOptions {
     // Default: 3
     // Maximum: INT_MAX
     int max_retry;
-    
-    // When the error rate of a server node is too high, isolate the node. 
-    // Note that this isolation is GLOBAL, the node will become unavailable 
+
+    // When the error rate of a server node is too high, isolate the node.
+    // Note that this isolation is GLOBAL, the node will become unavailable
     // for all channels running in this process during the isolation.
     // Default: false
     bool enable_circuit_breaker;
@@ -92,7 +93,7 @@ struct ChannelOptions {
     // Possible values: "single", "pooled", "short".
     AdaptiveConnectionType connection_type;
 
-    // Channel.Init() succeeds even if there's no server in the NamingService. 
+    // Channel.Init() succeeds even if there's no server in the NamingService.
     // E.g. the BNS directory is empty. All RPC over the channel will fail before
     // new nodes being added to the NamingService.
     // Default: true (false before r32470)
@@ -146,7 +147,7 @@ struct ChannelOptions {
     // Default: ""
     std::string connection_group;
 
-    // Set the health check param according to the channel granularity. 
+    // Set the health check param according to the channel granularity.
     // Its priority is higher than FLAGS_health_check_path and FLAGS_health_check_timeout_ms.
     // When it is not set, FLAGS_health_check_path and FLAGS_health_check_timeout_ms will take effect.
     HealthCheckOption hc_option;
@@ -175,7 +176,8 @@ private:
 //   channel.Init("bns://rdev.matrix.all", "rr", nullptr/*default options*/);
 //   MyService_Stub stub(&channel);
 //   stub.MyMethod(&controller, &request, &response, nullptr);
-class Channel : public ChannelBase {
+class Channel : public ChannelBase,
+                public brpc::flatbuffers::RpcChannel {
 friend class Controller;
 friend class SelectiveChannel;
 public:
@@ -195,7 +197,7 @@ public:
 
     // Connect this channel to a group of servers whose addresses can be
     // accessed via `naming_service_url' according to its protocol. Use the
-    // method specified by `load_balancer_name' to distribute traffic to 
+    // method specified by `load_balancer_name' to distribute traffic to
     // servers. Use default options if `options' is nullptr.
     // Supported naming service("protocol://service_name"):
     //   bns://<node-name>            # Baidu Naming Service
@@ -212,11 +214,11 @@ public:
     //   "" or nullptr                   # treat `naming_service_url' as `server_addr_and_port'
     //                                # Init(xxx, "", options) and Init(xxx, nullptr, options)
     //                                # are exactly same with Init(xxx, options)
-    int Init(const char* naming_service_url, 
+    int Init(const char* naming_service_url,
              const char* load_balancer_name,
              const ChannelOptions* options);
 
-    // Call `method' of the remote service with `request' as input, and 
+    // Call `method' of the remote service with `request' as input, and
     // `response' as output. `controller' contains options and extra data.
     // If `done' is not nullptr, this method returns after request was sent
     // and `done->Run()' will be called when the call finishes, otherwise
@@ -228,6 +230,12 @@ public:
                     google::protobuf::Closure* done);
 
     // Get current options.
+    void FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
+                    google::protobuf::RpcController* controller_base,
+                    const brpc::flatbuffers::Message* request,
+                    brpc::flatbuffers::Message* response,
+                    google::protobuf::Closure* done);
+
     const ChannelOptions& options() const { return _options; }
 
     void Describe(std::ostream&, const DescribeOptions&) const;
@@ -240,7 +248,7 @@ public:
 protected:
     bool SingleServer() const { return _lb.get() == nullptr; }
 
-    // Pick a server using `lb' and then send RPC. Wait for response when 
+    // Pick a server using `lb' and then send RPC. Wait for response when
     // sending synchronous RPC.
     // NOTE: DO NOT directly use `controller' after this call when
     // sending asynchronous RPC (controller->_done != nullptr) since
@@ -253,6 +261,19 @@ protected:
                    const char* raw_server_address,
                    const ChannelOptions* options,
                    int raw_port = -1);
+
+    template <bool is_pb>
+    inline void CallMethodInternal(const typename std::conditional<is_pb,
+                        google::protobuf::MethodDescriptor,
+                        brpc::flatbuffers::MethodDescriptor>::type* method,
+                    google::protobuf::RpcController* controller_base,
+                    const typename std::conditional<is_pb,
+                        google::protobuf::Message,
+                        brpc::flatbuffers::Message>::type* request,
+                    typename std::conditional<is_pb,
+                        google::protobuf::Message,
+                        brpc::flatbuffers::Message>::type* response,
+                    google::protobuf::Closure* done);
 
     std::string _service_name;
     std::string _scheme;

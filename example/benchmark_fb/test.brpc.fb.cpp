@@ -7,7 +7,7 @@
 
 namespace test {
 
-static brpc::details::flatbuffers::ServiceDescriptor* file_level_service_descriptors_my_2eproto[1] = {NULL};
+static brpc::flatbuffers::ServiceDescriptor* file_level_service_descriptors_my_2eproto[1] = {NULL};
 struct FileLevelServiceDescriptorsCleanup_my_2eproto {
   ~FileLevelServiceDescriptorsCleanup_my_2eproto() {
     for (int i = 0; i < 1; ++i) {
@@ -22,33 +22,33 @@ static std::once_flag file_level_service_descriptors_BenchmarkService_my_2eproto
 
 BenchmarkService::~BenchmarkService() {}
 
-const brpc::details::flatbuffers::ServiceDescriptor* BenchmarkService::descriptor() {
+const brpc::flatbuffers::ServiceDescriptor* BenchmarkService::descriptor() {
     std::call_once(file_level_service_descriptors_BenchmarkService_my_2eproto_once_flag, []() {
-        const brpc::details::flatbuffers::BrpcDescriptorTable desc_table = {
+        const brpc::flatbuffers::BrpcDescriptorTable desc_table = {
         "test.", "BenchmarkService", "Test"};
-        if (brpc::details::flatbuffers::parse_service_descriptors(desc_table, &file_level_service_descriptors_my_2eproto[0])) {
+        if (brpc::flatbuffers::parse_service_descriptors(desc_table, &file_level_service_descriptors_my_2eproto[0])) {
             std::cout << "ERROR: " << "Fail to parse_service_descriptors" << std::endl;
         }
     });
     return file_level_service_descriptors_my_2eproto[0];
 }
 
-const brpc::details::flatbuffers::ServiceDescriptor* BenchmarkService::GetDescriptor() {
+const brpc::flatbuffers::ServiceDescriptor* BenchmarkService::GetDescriptor() {
     return descriptor();
 }
 
 void BenchmarkService::Test(google::protobuf::RpcController* controller,
-    const brpc::details::flatbuffers::Message* request,
-    brpc::details::flatbuffers::Message* response,
+    const brpc::flatbuffers::Message* request,
+    brpc::flatbuffers::Message* response,
     google::protobuf::Closure* done) {
     controller->SetFailed("method Test() not implemented.");
     std::cout << "ERROR: " << "method Test() not implemented." << std::endl;
 }
 
-void BenchmarkService::FBCallMethod(const brpc::details::flatbuffers::MethodDescriptor* method,
+void BenchmarkService::FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
     google::protobuf::RpcController* controller,
-    const brpc::details::flatbuffers::Message* request,
-    brpc::details::flatbuffers::Message* response,
+    const brpc::flatbuffers::Message* request,
+    brpc::flatbuffers::Message* response,
     google::protobuf::Closure* done) {
     FLATBUFFERS_ASSERT(method->service() == file_level_service_descriptors_my_2eproto[0]);
     switch(method->index()) {
@@ -60,22 +60,22 @@ void BenchmarkService::FBCallMethod(const brpc::details::flatbuffers::MethodDesc
             break;
     }
 }
-BenchmarkServiceStub::BenchmarkServiceStub(brpc::details::flatbuffers::RpcChannel* channel)
+BenchmarkServiceStub::BenchmarkServiceStub(brpc::flatbuffers::RpcChannel* channel)
     : channel_(channel), owns_channel_(false) {}
 
 BenchmarkServiceStub::BenchmarkServiceStub(
-    brpc::details::flatbuffers::RpcChannel* channel,
-    brpc::details::flatbuffers::Service::ChannelOwnership ownership)
+    brpc::flatbuffers::RpcChannel* channel,
+    brpc::flatbuffers::Service::ChannelOwnership ownership)
     : channel_(channel),
-    owns_channel_(ownership == brpc::details::flatbuffers::Service::STUB_OWNS_CHANNEL) {}
+    owns_channel_(ownership == brpc::flatbuffers::Service::STUB_OWNS_CHANNEL) {}
 
 BenchmarkServiceStub::~BenchmarkServiceStub(){
     if (owns_channel_) {delete channel_;}
 }
 
 void BenchmarkServiceStub::Test(google::protobuf::RpcController* controller,
-    const brpc::details::flatbuffers::Message* request,
-    brpc::details::flatbuffers::Message* response,
+    const brpc::flatbuffers::Message* request,
+    brpc::flatbuffers::Message* response,
     google::protobuf::Closure* done) {
     channel_->FBCallMethod(descriptor()->method(0),
         controller, request, response, done);

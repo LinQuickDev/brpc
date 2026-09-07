@@ -23,7 +23,15 @@ public:
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl =
             static_cast<brpc::Controller*>(controller);
-        const test::BenchmarkRequest* request = request_base->GetRoot<test::BenchmarkRequest>();
+        if (request_base == nullptr ||
+            !request_base->Verify<test::BenchmarkRequest>()) {
+            controller->SetFailed(
+                "Invalid FlatBuffers BenchmarkRequest");
+            return;
+        }
+
+        const test::BenchmarkRequest* request =
+            request_base->GetRoot<test::BenchmarkRequest>();
         // Set Response Message
         brpc::flatbuffers::MessageBuilder mb_;
         const auto* msg = request->message();

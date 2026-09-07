@@ -28,7 +28,6 @@
 #include "brpc/details/flatbuffers_impl.h"
 
 namespace brpc {
-namespace details {
 namespace flatbuffers {
 
 #define METHOD_SPLIT " "
@@ -270,5 +269,4 @@ bool SerializeFbToIOBUF(Message* msg, butil::IOBuf& buf) {
 }
 
 }  // namespace flatbuffers
-}  // namespace details
 }  // namespace brpc

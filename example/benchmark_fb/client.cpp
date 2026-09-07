@@ -14,6 +14,10 @@ DEFINE_int32(request_size, 16, "Bytes of each request");
 DEFINE_string(servers, "0.0.0.0:8002", "IP Address of server");
 DEFINE_int32(timeout_ms, 100, "RPC timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)");
+DEFINE_bool(verify_response, true,
+            "Verify FlatBuffers response and compare all fields");
+DEFINE_bool(corrupt_request, false,
+            "Corrupt the FlatBuffers root offset for negative testing");
 DEFINE_int32(dummy_port, -1, "Launch dummy server at this port");
 
 std::string g_request;
@@ -40,10 +44,52 @@ static void* sender(void* arg) {
         mb.Finish(req);
         brpc::flatbuffers::Message request = mb.ReleaseMessage();
 
+        if (FLAGS_corrupt_request) {
+            CHECK_GE(request.size(), sizeof(uint32_t));
+            uint8_t* data =
+                static_cast<uint8_t*>(request.mutable_data());
+
+            // Destroy the FlatBuffers root-table offset.
+            data[0] = 0xff;
+            data[1] = 0xff;
+            data[2] = 0xff;
+            data[3] = 0xff;
+        }
+
         uint64_t msg_end_ns = butil::cpuwide_time_ns();
         stub.Test(&cntl, &request, &response, NULL);
 
+        if (FLAGS_corrupt_request) {
+            if (cntl.Failed()) {
+                LOG(INFO)
+                    << "Corrupt FlatBuffers request rejected: "
+                    << cntl.ErrorText();
+                bthread_usleep(50000);
+                continue;
+            }
+
+            LOG(FATAL)
+                << "Corrupt FlatBuffers request was unexpectedly accepted";
+        }
+
         if (!cntl.Failed()) {
+            if (FLAGS_verify_response) {
+                CHECK(response.Verify<test::BenchmarkResponse>())
+                    << "Invalid FlatBuffers response";
+
+                const test::BenchmarkResponse* response_root =
+                    response.GetRoot<test::BenchmarkResponse>();
+
+                CHECK(response_root != nullptr);
+                CHECK_EQ(123, response_root->opcode());
+                CHECK_EQ(333, response_root->echo_attachment());
+                CHECK_EQ(1111, response_root->attachment_size());
+                CHECK_EQ(2222, response_root->request_id());
+                CHECK_EQ(0, response_root->reserved());
+                CHECK(response_root->message() != nullptr);
+                CHECK_EQ(g_request, response_root->message()->str());
+            }
+
             g_latency_recorder << cntl.latency_us();
             g_msg_recorder << (msg_end_ns - msg_begin_ns);
         } else {
