@@ -22,6 +22,7 @@
 // To brpc developers: This is a header included by user, don't depend
 // on internal structures, use opaque pointers instead.
 
+#include "butil/config.h"
 #include <ostream>                          // std::ostream
 #include "bthread/errno.h"                  // Redefine errno
 #include "butil/intrusive_ptr.hpp"          // butil::intrusive_ptr
@@ -38,7 +39,16 @@
 #include "brpc/naming_service_filter.h"
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
-#include "brpc/details/flatbuffers_impl.h"  // Flatbuffers Protocol
+#if BRPC_WITH_FLATBUFFERS
+#include "brpc/details/flatbuffers_impl.h"
+#else
+namespace brpc {
+namespace flatbuffers {
+class Message;
+class MethodDescriptor;
+}  // namespace flatbuffers
+}  // namespace brpc
+#endif
 
 namespace brpc {
 
@@ -176,8 +186,11 @@ private:
 //   channel.Init("bns://rdev.matrix.all", "rr", nullptr/*default options*/);
 //   MyService_Stub stub(&channel);
 //   stub.MyMethod(&controller, &request, &response, nullptr);
-class Channel : public ChannelBase,
-                public brpc::flatbuffers::RpcChannel {
+class Channel : public ChannelBase
+#if BRPC_WITH_FLATBUFFERS
+              , public brpc::flatbuffers::RpcChannel
+#endif
+{
 friend class Controller;
 friend class SelectiveChannel;
 public:
@@ -230,11 +243,13 @@ public:
                     google::protobuf::Closure* done);
 
     // Get current options.
-    void FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
+#if BRPC_WITH_FLATBUFFERS
+void FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
                     google::protobuf::RpcController* controller_base,
                     const brpc::flatbuffers::Message* request,
                     brpc::flatbuffers::Message* response,
                     google::protobuf::Closure* done);
+#endif
 
     const ChannelOptions& options() const { return _options; }
 

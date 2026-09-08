@@ -560,9 +560,11 @@ void Channel::CallMethodInternal(const typename std::conditional<is_pb,
             if (is_pb) {
                 auto pb_method = reinterpret_cast<const google::protobuf::MethodDescriptor*>(method);
                 method_name = butil::EnsureString(pb_method->full_name());
+#if BRPC_WITH_FLATBUFFERS
             } else {
                 auto fb_method = reinterpret_cast<const brpc::flatbuffers::MethodDescriptor*>(method);
                 method_name = butil::EnsureString(fb_method->full_name());
+#endif
             }
 
         } else {
@@ -607,10 +609,12 @@ void Channel::CallMethodInternal(const typename std::conditional<is_pb,
     if (is_pb) {
         cntl->_method = reinterpret_cast<const google::protobuf::MethodDescriptor*>(method);
         cntl->_response = reinterpret_cast<google::protobuf::Message*>(response);
+#if BRPC_WITH_FLATBUFFERS
     } else {
         cntl->_fb_method = reinterpret_cast<const brpc::flatbuffers::MethodDescriptor*>(method);
         cntl->_fb_response = reinterpret_cast<brpc::flatbuffers::Message*>(response);
         cntl->set_use_flatbuffer();
+#endif
     }
 
     if (SingleServer()) {
@@ -703,6 +707,7 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     CallMethodInternal<true>(method, controller_base, request, response, done);
 }
 
+#if BRPC_WITH_FLATBUFFERS
 void Channel::FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
                     google::protobuf::RpcController* controller_base,
                     const brpc::flatbuffers::Message* request,
@@ -710,6 +715,7 @@ void Channel::FBCallMethod(const brpc::flatbuffers::MethodDescriptor* method,
                     google::protobuf::Closure* done) {
     CallMethodInternal<false>(method, controller_base, request, response, done);
 }
+#endif
 
 void Channel::Describe(std::ostream& os, const DescribeOptions& opt) const {
     os << "Channel[";
@@ -750,6 +756,7 @@ void Channel::CallMethodInternal<true>(
     google::protobuf::Closure* done
 );
 
+#if BRPC_WITH_FLATBUFFERS
 // CallMethodInternal instance for pb and fb
 template
 void Channel::CallMethodInternal<false>(
@@ -759,5 +766,6 @@ void Channel::CallMethodInternal<false>(
     brpc::flatbuffers::Message* response,
     google::protobuf::Closure* done
 );
+#endif
 
 } // namespace brpc

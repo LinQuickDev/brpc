@@ -22,6 +22,7 @@
 // To brpc developers: This is a header included by user, don't depend
 // on internal structures, use opaque pointers instead.
 
+#include "butil/config.h"
 #include "bthread/errno.h"        // Redefine errno
 #include "bthread/bthread.h"      // Server may need some bthread functions,
                                   // e.g. bthread_usleep
@@ -46,7 +47,9 @@
 #include "brpc/baidu_master_service.h"
 #include "brpc/rpc_pb_message_factory.h"
 #include "brpc/socket_mode.h"
+#if BRPC_WITH_FLATBUFFERS
 #include "brpc/details/flatbuffers_impl.h"
+#endif
 
 namespace brpc {
 
@@ -430,6 +433,7 @@ public:
     };
     typedef butil::FlatMap<std::string, MethodProperty> MethodMap;
 
+#if BRPC_WITH_FLATBUFFERS
     struct FlatBuffersMethodProperty {
         brpc::flatbuffers::Service* service;
         const brpc::flatbuffers::MethodDescriptor* method;
@@ -441,16 +445,20 @@ public:
         brpc::flatbuffers::Service* service;
         int method_count;
         FlatBuffersMethodProperty** methods_list;
-        bool is_user_service() const {return false;}
+        bool is_user_service() const { return false; }
 
         const std::string& service_name() const;
         FlatBuffersServiceProperty();
         ~FlatBuffersServiceProperty();
-        FlatBuffersServiceProperty(const FlatBuffersServiceProperty&) = delete;
-        FlatBuffersServiceProperty& operator=(const FlatBuffersServiceProperty&) = delete;
+        FlatBuffersServiceProperty(
+            const FlatBuffersServiceProperty&) = delete;
+        FlatBuffersServiceProperty& operator=(
+            const FlatBuffersServiceProperty&) = delete;
         FlatBuffersServiceProperty(FlatBuffersServiceProperty&& other);
-        FlatBuffersServiceProperty& operator=(FlatBuffersServiceProperty&& other);
+        FlatBuffersServiceProperty& operator=(
+            FlatBuffersServiceProperty&& other);
     };
+#endif
 
     struct ThreadLocalOptions {
         bthread_key_t tls_key;
@@ -517,10 +525,12 @@ public:
                    bool allow_default_url = false);
     int AddService(google::protobuf::Service* service,
                    const ServiceOptions& options);
+#if BRPC_WITH_FLATBUFFERS
     int AddService(brpc::flatbuffers::Service* service,
                    ServiceOwnership ownership);
     int AddService(brpc::flatbuffers::Service* service,
                    const ServiceOptions& options);
+#endif
     // Remove a service from this server.
     // NOTE: removing a service while server is running is forbidden.
     // Returns 0 on success, -1 otherwise.
@@ -655,9 +665,11 @@ friend class Controller;
                            bool is_builtin_service,
                            const ServiceOptions& options);
 
+#if BRPC_WITH_FLATBUFFERS
     int AddServiceInternal(brpc::flatbuffers::Service* service,
                            bool is_builtin_service,
                            const ServiceOptions& options);
+#endif
 
     int AddBuiltinService(google::protobuf::Service* service);
 
@@ -711,11 +723,13 @@ friend class Controller;
     const ServiceProperty*
     FindServicePropertyByName(const butil::StringPiece& name) const;
 
+#if BRPC_WITH_FLATBUFFERS
     const FlatBuffersServiceProperty*
     FindFlatBuffersServicePropertyByIndex(uint32_t service_index) const;
 
     const FlatBuffersMethodProperty*
     FindFlatBuffersMethodPropertyByIndex(uint32_t service_index, int method_index) const;
+#endif
 
     std::string ServerPrefix() const;
 
@@ -791,10 +805,12 @@ friend class Controller;
     // uses service->name() to designate an RPC service
     ServiceMap _service_map;
 
+#if BRPC_WITH_FLATBUFFERS
     // Used by FlatBuffers services.
     typedef butil::FlatMap<uint32_t, FlatBuffersServiceProperty>
         FlatBuffersServiceIDMap;
     FlatBuffersServiceIDMap _fb_server_index_map;
+#endif
 
     // The only non-builtin service in _service_map, otherwise nullptr.
     google::protobuf::Service* _first_service;
