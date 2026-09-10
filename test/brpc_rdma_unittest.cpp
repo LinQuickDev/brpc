@@ -320,6 +320,41 @@ private:
   int _saved_handshake_version = 2;
 };
 
+TEST_F(RdmaTest, stale_cq_callback_does_not_poll_new_generation) {
+    SocketOptions main_options;
+    main_options.socket_mode = SOCKET_MODE_RDMA;
+    SocketId main_sid;
+    ASSERT_EQ(0, Socket::Create(main_options, &main_sid));
+
+    SocketUniquePtr main_socket;
+    ASSERT_EQ(0, Socket::Address(main_sid, &main_socket));
+    RdmaTransport* transport = RdmaTransportOf(main_socket.get());
+    ASSERT_NE(nullptr, transport);
+    rdma::RdmaEndpoint* ep = transport->_rdma_ep;
+    ASSERT_NE(nullptr, ep);
+
+    SocketOptions cq_options;
+    cq_options.user = ep;
+    SocketId stale_cq_sid;
+    SocketId current_cq_sid;
+    ASSERT_EQ(0, Socket::Create(cq_options, &stale_cq_sid));
+    ASSERT_EQ(0, Socket::Create(cq_options, &current_cq_sid));
+
+    SocketUniquePtr stale_cq_socket;
+    SocketUniquePtr current_cq_socket;
+    ASSERT_EQ(0, Socket::Address(stale_cq_sid, &stale_cq_socket));
+    ASSERT_EQ(0, Socket::Address(current_cq_sid, &current_cq_socket));
+    ep->_cq_sid = current_cq_sid;
+
+    rdma::RdmaEndpoint::PollCq(stale_cq_socket.get());
+
+    stale_cq_socket->_user = NULL;
+    current_cq_socket->_user = NULL;
+    stale_cq_socket->SetFailed();
+    current_cq_socket->SetFailed();
+    main_socket->SetFailed();
+}
+
 TEST_F(RdmaTest, client_close_before_hello_send) {
   StartServer();
 

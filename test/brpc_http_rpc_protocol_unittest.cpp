@@ -563,6 +563,35 @@ TEST_F(HttpTest, builtin_auth_policy_on_public_and_internal_port) {
         ASSERT_TRUE(protected_cntl.Failed());
     }
 
+    {
+        // A builtin request is exempted from authentication on internal_port
+        // and its verdict latches the whole connection, so the exemption would
+        // carry over to whatever is sent next on that very connection. Only
+        // builtin services are served there, which keeps the latch harmless.
+        const std::string connection_group = "builtin-auth-policy-internal";
+        brpc::Channel builtin_channel;
+        brpc::Channel protected_channel;
+        brpc::ChannelOptions copt;
+        copt.protocol = brpc::PROTOCOL_HTTP;
+        copt.connection_type = brpc::CONNECTION_TYPE_POOLED;
+        copt.connection_group = connection_group;
+        copt.max_retry = 0;
+        ASSERT_EQ(0, builtin_channel.Init(internal_ep, &copt));
+        ASSERT_EQ(0, protected_channel.Init(internal_ep, &copt));
+
+        brpc::Controller builtin_cntl;
+        CallVersion(&builtin_channel, &builtin_cntl);
+        ASSERT_FALSE(builtin_cntl.Failed()) << builtin_cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_OK, builtin_cntl.http_response().status_code());
+
+        brpc::Controller protected_cntl;
+        CallHttpEcho(&protected_channel, &protected_cntl);
+        ASSERT_TRUE(protected_cntl.Failed());
+        ASSERT_EQ(brpc::EHTTP, protected_cntl.ErrorCode()) << protected_cntl.ErrorText();
+        ASSERT_EQ(brpc::HTTP_STATUS_FORBIDDEN,
+                  protected_cntl.http_response().status_code());
+    }
+
     ASSERT_EQ(0, server.Stop(0));
     ASSERT_EQ(0, server.Join());
     brpc::FLAGS_max_connection_pool_size = saved_max_connection_pool_size;
@@ -2356,6 +2385,56 @@ TEST_F(HttpTest, http2_handle_goaway_streams) {
     }
 }
 
+// RFC 9113 8.3.1: :path MUST NOT be empty and MUST begin with '/', the only
+// exception being the asterisk-form that OPTIONS uses.
+TEST_F(HttpTest, http2_reject_path_not_starting_with_slash) {
+    brpc::policy::H2Context* h2_ctx =
+        new brpc::policy::H2Context(_socket.get(), &_server);
+    ASSERT_EQ(0, h2_ctx->Init());
+    _socket->initialize_parsing_context(&h2_ctx);
+
+    // Encoding and decoding go through the same HPacker here, which is fine:
+    // it keeps the encoding and decoding tables apart and the header below is
+    // indexed into neither.
+    brpc::HPackOptions options;
+    options.index_policy = brpc::HPACK_NOT_INDEX_HEADER;
+
+    struct PathCase {
+        const char* path;
+        bool accepted;
+    };
+    const PathCase kCases[] = {
+        { "/flags", true },
+        { "/", true },
+        { "/flags?setvalue=1", true },
+        // Asterisk-form. Only OPTIONS may use it, but it is taken from any
+        // method here, see the comment on the check.
+        { "*", true },
+        { "flags", false },
+        { "", false },
+        { "flags/port", false },
+        { "*/flags", false },
+        { "http://somewhere/flags", false },  // absolute-form
+    };
+    int stream_id = 1;
+    for (const PathCase& c : kCases) {
+        butil::IOBufAppender appender;
+        brpc::HPacker::Header header(":path", c.path);
+        h2_ctx->hpacker().Encode(&appender, header, options);
+        butil::IOBuf buf;
+        appender.move_to(buf);
+        butil::IOBufBytesIterator it(buf);
+
+        brpc::policy::H2StreamContext* h2_msg =
+            new brpc::policy::H2StreamContext(false);
+        h2_msg->Init(h2_ctx, stream_id);
+        stream_id += 2;
+        ASSERT_EQ(c.accepted ? 0 : -1, h2_msg->ConsumeHeaders(it))
+            << "path=`" << c.path << '\'';
+        h2_msg->Destroy();
+    }
+}
+
 TEST_F(HttpTest, spring_protobuf_content_type) {
     const int port = 8923;
     brpc::Server server;
@@ -2717,14 +2796,12 @@ void ReadOneResponse(brpc::SocketUniquePtr& sock,
 }
 
 TEST_F(HttpTest, http_expect) {
-    const int port = 8923;
     brpc::Server server;
     HttpServiceImpl svc;
     EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
-    EXPECT_EQ(0, server.Start(port, nullptr));
+    EXPECT_EQ(0, server.Start(0, nullptr));
 
-    butil::EndPoint ep;
-    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8923", &ep));
+    const butil::EndPoint ep = server.listen_address();
     brpc::SocketOptions options;
     options.remote_side = ep;
     brpc::SocketId id;

@@ -202,6 +202,9 @@ struct ServerOptions {
     // hiding them from public. Setting this option also enables security
     // protection code which we may add constantly.
     // Update: this option affects Tabbed services as well.
+    // Update: this port carries builtin and Tabbed services only, requests
+    // for ordinary services are rejected with EPERM and must be sent to the
+    // port passed to Start().
     // Default: -1
     int internal_port;
 
@@ -260,6 +263,10 @@ struct ServerOptions {
 
     // Only enable these protocols, separated by spaces.
     // All names inside must be valid, check protocols name in global.cpp
+    // http/h2 and rdma_handshake are served whatever this field says:
+    // the builtin services are only reachable over http/h2, and
+    // rdma_handshake is a transport level handshake dispatching no request.
+    // Naming them here is allowed and changes nothing.
     // Default: empty (all protocols)
     std::string enabled_protocols;
 
