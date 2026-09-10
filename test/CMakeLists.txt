@@ -269,6 +269,9 @@ endforeach()
 
 # brpc tests
 file(GLOB BRPC_UNITTESTS "brpc_*_unittest.cpp")
+if(NOT WITH_FLATBUFFERS)
+    list(FILTER BRPC_UNITTESTS EXCLUDE REGEX "brpc_flatbuffers_.*_unittest\\.cpp$")
+endif()
 foreach(BRPC_UT ${BRPC_UNITTESTS})
     get_filename_component(BRPC_UT_WE ${BRPC_UT} NAME_WE)
     add_executable(${BRPC_UT_WE} ${BRPC_UT} $<TARGET_OBJECTS:TEST_PROTO_LIB>)
