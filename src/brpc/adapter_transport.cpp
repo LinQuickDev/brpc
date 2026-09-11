@@ -24,11 +24,17 @@
 #include "brpc/input_messenger.h"
 #include "brpc/destroyable.h"
 #include "brpc/handshake/rdma_handshake.h"
+#include "brpc/handshake/ubshm_handshake.h"
 #if BRPC_WITH_RDMA
 #include "brpc/rdma/rdma_helper.h"
 #endif
+#if BRPC_WITH_UBRING
+#include "brpc/ubshm/ub_helper.h"
+#include "brpc/ubshm/ubr_trx.h"
+#endif
 #include "brpc/rdma_transport.h"
 #include "brpc/tcp_transport.h"
+#include "brpc/ubshm_transport.h"
 
 namespace brpc {
 
@@ -136,8 +142,11 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
         CHECK(context->adapter() != NULL);
         result = context->adapter()->ExecuteServerHandshake(source, _socket);
     } else {
+        const char* first = static_cast<const char*>(source->fetch1());
         handshake::HandshakeAdapter* adapter =
-            handshake::GetRdmaServerHandshakeAdapter();
+            first != NULL && *first == 'U'
+            ? handshake::GetUBShmServerHandshakeAdapter()
+            : handshake::GetRdmaServerHandshakeAdapter();
         result = adapter->ExecuteServerHandshake(source, _socket);
     }
     const int phase = _handshake.phase();
@@ -235,6 +244,72 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
     }
 #endif
 
+#if BRPC_WITH_UBRING
+    if (adapter->_mode == SOCKET_MODE_UBRING) {
+        UBShmTransport* transport = static_cast<UBShmTransport*>(
+            adapter->_high_speed_transport.get());
+        if (!ubring::IsUBAvailable()) {
+            adapter->FallbackToTcp();
+            adapter->CompleteConnection(handshake::FALLBACK_TCP);
+            task->done(0, task->data);
+            return NULL;
+        }
+
+        const size_t local_shm_len =
+            static_cast<size_t>(ubring::FLAGS_data_queue_size) * MB_TO_BYTE;
+        ubring::SHM local_trx_shm = {
+            NULL, local_shm_len, 0, {0}, static_cast<uint32_t>(socket->fd())};
+        const auto shm_name_str =
+            butil::endpoint2str(socket->local_side());
+        ubring::HelloMessage remote{};
+        ubring::UBShmHandshakeAdapter wire;
+        handshake::ClientHandshakeCallbacks callbacks{};
+        callbacks.codec = wire.MakeCodec();
+        callbacks.codec.build_hello = [&](bool enabled, std::string* payload) {
+            CHECK(enabled);
+            return wire.BuildHello(true, local_shm_len, shm_name_str.c_str(),
+                                   payload);
+        };
+        callbacks.codec.parse_hello = [&](const std::string& payload) {
+            return wire.ParseHello(payload, &remote);
+        };
+        callbacks.transport.prepare_resources = [&]() {
+            return transport->PrepareUpgradeResources(
+                       &local_trx_shm, shm_name_str.c_str()) == 0
+                ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+        };
+        callbacks.transport.negotiate_resources = [&]() {
+            return transport->NegotiateUpgradeResources(
+                       &local_trx_shm, shm_name_str.c_str()) == 0
+                ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+        };
+        callbacks.transport.set_high_speed_active = [transport]() {
+            transport->ActivateUpgrade();
+        };
+        callbacks.transport.set_tcp_active = [transport]() {
+            transport->DeactivateUpgrade();
+        };
+        callbacks.transport.on_failed = [&]() {
+            const int saved_errno = errno != 0 ? errno : EPROTO;
+            connect_error = saved_errno;
+            socket->SetFailed(saved_errno,
+                              "Fail to complete ubring handshake from %s: %s",
+                              socket->description().c_str(),
+                              berror(saved_errno));
+        };
+        const handshake::StepResult result = adapter->_handshake.RunClient(callbacks);
+        if (result == handshake::STEP_OK) {
+            transport->FinishUpgrade();
+        }
+        if (result == handshake::STEP_ERROR && connect_error == 0) {
+            connect_error = errno != 0 ? errno : EPROTO;
+        }
+        adapter->CompleteConnection(static_cast<handshake::Phase>(
+            adapter->_handshake.phase()));
+        task->done(connect_error, task->data);
+        return NULL;
+    }
+#endif
 
     socket->SetFailed(EPROTO, "Unsupported client transport handshake");
     adapter->CompleteConnection(handshake::FAILED);
@@ -257,6 +332,13 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
             // RDMA server handshake is parsed by InputMessenger.
             _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
+#if BRPC_WITH_UBRING
+        } else if (_mode == SOCKET_MODE_UBRING &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            // UBSHM server handshake is parsed by InputMessenger.
+            _on_edge_trigger = InputMessenger::OnNewMessages;
+#endif
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
         }
@@ -270,6 +352,11 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
 #if BRPC_WITH_RDMA
     case SOCKET_MODE_RDMA:
         _high_speed_transport.reset(new RdmaTransport);
+        break;
+#endif
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        _high_speed_transport.reset(new UBShmTransport);
         break;
 #endif
     default:
@@ -373,6 +460,12 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
 #if BRPC_WITH_RDMA
     case SOCKET_MODE_RDMA:
         static_cast<RdmaTransport*>(_high_speed_transport.get())
+            ->SetHighSpeedAvailable(available);
+        break;
+#endif
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        static_cast<UBShmTransport*>(_high_speed_transport.get())
             ->SetHighSpeedAvailable(available);
         break;
 #endif

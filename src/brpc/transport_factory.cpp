@@ -52,7 +52,7 @@ std::unique_ptr<Transport> TransportFactory::CreateTransport(SocketMode mode) {
 #endif
 #if BRPC_WITH_UBRING
     else if (mode == SOCKET_MODE_UBRING) {
-        return std::unique_ptr<Transport>(new UBShmTransport());
+        return std::unique_ptr<Transport>(new AdapterTransport(mode));
     }
 #endif
     else {
