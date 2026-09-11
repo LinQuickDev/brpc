@@ -43,7 +43,7 @@ void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
   _on_edge_trigger = nullptr;
   _rdma_ep = new (std::nothrow) rdma::RdmaEndpoint(socket);
   if (!_rdma_ep) {
-    const int saved_errno = errno;
+    const int saved_errno = errno != 0 ? errno : ENOMEM;
     PLOG(ERROR) << "Fail to create RdmaEndpoint";
     socket->SetFailed(saved_errno, "Fail to create RdmaEndpoint: %s",
                       berror(saved_errno));
