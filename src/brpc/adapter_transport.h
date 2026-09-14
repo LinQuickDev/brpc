@@ -58,7 +58,9 @@ public:
     Transport* high_speed_transport() const {
         return _high_speed_transport.get();
     }
-    bool upgrade_capable() const { return _high_speed_transport != NULL; }
+    bool upgrade_capable(SocketMode mode) const {
+        return _mode == mode && _high_speed_transport != NULL;
+    }
 
     static AdapterTransport* Get(Socket* socket);
     static const AdapterTransport* Get(const Socket* socket);

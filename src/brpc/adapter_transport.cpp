@@ -337,7 +337,7 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
                    options.user != static_cast<SocketUser*>(
                        get_client_side_messenger())) {
             // UBSHM server handshake is parsed by InputMessenger.
-            _on_edge_trigger = InputMessenger::OnNewMessages;
+            _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
@@ -475,14 +475,11 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
 }
 
 void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
-#if BRPC_WITH_RDMA
     AdapterTransport* adapter = Get(socket);
-    if (adapter->_mode == SOCKET_MODE_RDMA &&
-        adapter->_handshake.phase() == handshake::ESTABLISHED) {
+    if (adapter->_handshake.phase() == handshake::ESTABLISHED) {
         adapter->CheckUnexpectedTcpData();
         return;
     }
-#endif
 
     InputMessenger::OnNewMessages(socket);
 
