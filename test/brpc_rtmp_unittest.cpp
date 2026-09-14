@@ -355,6 +355,14 @@ private:
     int64_t _sleep_ms;
 };
 
+class RejectingRtmpService : public brpc::RtmpService {
+private:
+    brpc::RtmpServerStream* NewStream(
+        const brpc::RtmpConnectRequest&) override {
+        return nullptr;
+    }
+};
+
 class PublishStream : public brpc::RtmpServerStream {
 public:
     PublishStream(int64_t sleep_ms)
@@ -910,11 +918,9 @@ TEST(RtmpTest, flv_reader_rejects_zero_datasize_audio_tag) {
     ASSERT_EQ(before, buf.size());
 }
 
-// A crafted Abort message that names the chunk stream currently being parsed
-// (itself) used to make ClearChunkStream delete the RtmpChunkStream while its
-// Feed() is still running, which caused a heap-use-after-free right after
-// OnMessage() returned.
-TEST(RtmpTest, abort_message_naming_own_chunk_stream) {
+// Abort discards an incomplete message without deleting the chunk stream,
+// whether it names the stream carrying the Abort or a different stream.
+TEST(RtmpTest, abort_message_preserves_chunk_stream_state) {
     int pipe_fds[2];
     ASSERT_EQ(0, pipe(pipe_fds));
     butil::fd_guard guard0(pipe_fds[0]);   // read end, closed by this guard
@@ -965,6 +971,98 @@ TEST(RtmpTest, abort_message_naming_own_chunk_stream) {
     butil::IOBuf buf2;
     buf2.append(cont);
     ASSERT_EQ(brpc::PARSE_OK, ctx.Feed(&buf2, sock.get()).error());
+
+    // Reduce the inbound chunk size to split four-byte control messages.
+    std::string set_chunk_size;
+    set_chunk_size.push_back((char)0x02);  // fmt=0, cs_id=2
+    set_chunk_size.append(3, '\0');        // timestamp = 0
+    AppendBigEndian3Bytes(&set_chunk_size, 4);
+    set_chunk_size.push_back((char)0x01);  // message_type = SetChunkSize
+    set_chunk_size.append(4, '\0');        // stream_id = 0
+    set_chunk_size.append(3, '\0');
+    set_chunk_size.push_back((char)0x02);  // new chunk size = 2
+    butil::IOBuf set_chunk_size_buf;
+    set_chunk_size_buf.append(set_chunk_size);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&set_chunk_size_buf, sock.get()).error());
+
+    // Start an Ack on chunk stream 3, leaving half of its body incomplete.
+    std::string partial_ack;
+    partial_ack.push_back((char)0x03);     // fmt=0, cs_id=3
+    partial_ack.append(3, '\0');           // timestamp = 0
+    AppendBigEndian3Bytes(&partial_ack, 4);
+    partial_ack.push_back((char)0x03);     // message_type = Ack
+    partial_ack.append(4, '\0');           // stream_id = 0
+    partial_ack.append(2, '\0');           // first two body bytes
+    butil::IOBuf partial_ack_buf;
+    partial_ack_buf.append(partial_ack);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&partial_ack_buf, sock.get()).error());
+
+    // Abort chunk stream 3. The Abort itself is split over two chunks because
+    // the inbound chunk size is now two bytes.
+    std::string abort_first;
+    abort_first.push_back((char)0x02);     // fmt=0, cs_id=2
+    abort_first.append(3, '\0');           // timestamp = 0
+    AppendBigEndian3Bytes(&abort_first, 4);
+    abort_first.push_back((char)0x02);     // message_type = Abort
+    abort_first.append(4, '\0');           // stream_id = 0
+    abort_first.append(2, '\0');           // first two bytes of cs_id
+    butil::IOBuf abort_first_buf;
+    abort_first_buf.append(abort_first);
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&abort_first_buf, sock.get()).error());
+
+    const char abort_last[] = { (char)0xC2, 0, 3 };  // fmt=3, cs_id=2
+    butil::IOBuf abort_last_buf;
+    abort_last_buf.append(abort_last, sizeof(abort_last));
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&abort_last_buf, sock.get()).error());
+
+    // A type-3 chunk starts a new message using stream 3's previous header.
+    // Deleting the stream on Abort would lose that header and reject this.
+    const char ack_part[] = { (char)0xC3, 0, 0 };  // fmt=3, cs_id=3
+    butil::IOBuf ack_part1_buf;
+    ack_part1_buf.append(ack_part, sizeof(ack_part));
+    ASSERT_EQ(brpc::PARSE_OK,
+              ctx.Feed(&ack_part1_buf, sock.get()).error());
+}
+
+TEST(RtmpTest, rejected_create_stream_with_response_write_failure) {
+    RejectingRtmpService rtmp_service;
+    brpc::Server server;
+    brpc::ServerOptions server_options;
+    server_options.rtmp_service = &rtmp_service;
+    ASSERT_EQ(0, server.Start(0, &server_options));
+
+    brpc::SocketId socket_id;
+    brpc::SocketOptions socket_options;
+    ASSERT_EQ(0, brpc::Socket::Create(socket_options, &socket_id));
+    brpc::SocketUniquePtr socket;
+    ASSERT_EQ(0, brpc::Socket::Address(socket_id, &socket));
+    ASSERT_EQ(0, socket->SetFailed());
+
+    brpc::policy::RtmpContext ctx(nullptr, &server);
+    brpc::policy::RtmpChunkStream chunk_stream(
+        &ctx, brpc::policy::RTMP_CONTROL_CHUNK_STREAM_ID);
+
+    std::string request;
+    google::protobuf::io::StringOutputStream zc_stream(&request);
+    brpc::AMFOutputStream ostream(&zc_stream);
+    brpc::WriteAMFNumber(1, &ostream);
+    brpc::AMFObject command;
+    brpc::WriteAMFObject(command, &ostream);
+    ASSERT_TRUE(ostream.good());
+
+    google::protobuf::io::ArrayInputStream input(
+        request.data(), request.size());
+    brpc::AMFInputStream istream(&input);
+    brpc::policy::RtmpMessageHeader message_header;
+    ASSERT_FALSE(chunk_stream.OnCreateStream(
+        message_header, &istream, socket.get()));
+
+    server.Stop(0);
+    server.Join();
 }
 
 TEST(RtmpTest, successfully_play_streams) {
