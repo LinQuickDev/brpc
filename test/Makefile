@@ -180,6 +180,11 @@ TEST_BTHREAD_SOURCES = $(wildcard bthread_*unittest.cpp)
 TEST_BTHREAD_OBJS = $(addsuffix .o, $(basename $(TEST_BTHREAD_SOURCES))) 
 
 TEST_BRPC_SOURCES = $(wildcard brpc_*unittest.cpp)
+ifneq (BRPC_WITH_FLATBUFFERS=1,$(findstring BRPC_WITH_FLATBUFFERS=1,$(CPPFLAGS)))
+    TEST_BRPC_SOURCES := $(filter-out \
+        brpc_flatbuffers_message_unittest.cpp \
+        brpc_flatbuffers_rpc_unittest.cpp,$(TEST_BRPC_SOURCES))
+endif
 TEST_BRPC_OBJS = $(addsuffix .o, $(basename $(TEST_BRPC_SOURCES))) 
 
 TEST_PROTO_SOURCES = $(wildcard *.proto)
