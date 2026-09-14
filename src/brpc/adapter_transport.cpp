@@ -113,6 +113,26 @@ const AdapterTransport* AdapterTransport::Get(const Socket* socket) {
     return static_cast<const AdapterTransport*>(socket->_transport.get());
 }
 
+bool AdapterTransport::upgrade_capable(SocketMode mode) const {
+    if (_mode != mode || _high_speed_transport == NULL) {
+        return false;
+    }
+    switch (mode) {
+#if BRPC_WITH_RDMA
+    case SOCKET_MODE_RDMA:
+        return static_cast<RdmaTransport*>(
+            _high_speed_transport.get())->UpgradeReady();
+#endif
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        return static_cast<UBShmTransport*>(
+            _high_speed_transport.get())->UpgradeReady();
+#endif
+    default:
+        return false;
+    }
+}
+
 int AdapterTransport::StartClientUpgrade(const Socket* socket,
                                          void (*done)(int, void*),
                                          void* data) {
@@ -385,7 +405,7 @@ int AdapterTransport::Reset(int32_t expected_nref) {
 }
 
 std::shared_ptr<AppConnect> AdapterTransport::Connect() {
-    if (_high_speed_transport) {
+    if (upgrade_capable(_mode)) {
         return std::make_shared<AdapterConnect>(_default_connect);
     }
     return _tcp_transport->Connect();
