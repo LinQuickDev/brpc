@@ -205,7 +205,12 @@ JSON2PB_OBJS = $(addsuffix .o, $(basename $(JSON2PB_SOURCES)))
 
 BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/policy/mysql src/brpc/rdma
 THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
+FLATBUFFERS_SOURCES = src/brpc/details/flatbuffers_impl.cpp \
+    src/brpc/policy/flatbuffers_protocol.cpp
 EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
+ifneq (BRPC_WITH_FLATBUFFERS=1,$(findstring BRPC_WITH_FLATBUFFERS=1,$(CPPFLAGS)))
+    EXCLUDE_SOURCES += $(FLATBUFFERS_SOURCES)
+endif
 BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 BRPC_SOURCES = $(filter-out $(THRIFT_SOURCES) $(EXCLUDE_SOURCES), $(BRPC_SOURCES_ALL))
 BRPC_PROTOS = $(filter %.proto,$(BRPC_SOURCES))

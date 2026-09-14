@@ -36,6 +36,7 @@ DEFINES = [
     "__STDC_FORMAT_MACROS",
     "__STDC_LIMIT_MACROS",
     "__STDC_CONSTANT_MACROS",
+    "BRPC_WITH_FLATBUFFERS=0",
 ] + select({
      "//bazel/config:brpc_with_glog": ["BRPC_WITH_GLOG=1"],
      "//conditions:default": ["BRPC_WITH_GLOG=0"],
@@ -547,6 +548,8 @@ cc_library(
         "src/brpc/policy/thrift_protocol.cpp",
         "src/brpc/event_dispatcher_epoll.cpp",
         "src/brpc/event_dispatcher_kqueue.cpp",
+        "src/brpc/details/flatbuffers_impl.cpp",
+        "src/brpc/policy/flatbuffers_protocol.cpp",
     ]) + select({
         "//bazel/config:brpc_with_thrift": glob([
             "src/brpc/thrift*.cpp",
