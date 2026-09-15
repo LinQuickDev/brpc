@@ -48,8 +48,10 @@ public:
 
     SlabAllocator &operator=(const SlabAllocator &other) = delete;
 
-    SlabAllocator(SlabAllocator &&other) {
-        // default-construct and swap idiom
+    SlabAllocator(SlabAllocator&& other)
+        : _full_buf_head(nullptr)
+        , _fb_begin_head(nullptr)
+        , _old_size_param(0) {
         swap(other);
     }
 

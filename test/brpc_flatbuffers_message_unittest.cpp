@@ -35,6 +35,43 @@ Message BuildRequest(const char* value) {
     return builder.ReleaseMessage();
 }
 
+TEST(FlatBuffersMessageTest, BuilderMoveConstructorPreservesBuffer) {
+    MessageBuilder source;
+    const auto text = source.CreateString("builder move constructor");
+    const auto root = test::CreateBenchmarkRequest(
+        source, 7, 1, 64, 123, 9, text);
+    source.Finish(root);
+
+    MessageBuilder target(std::move(source));
+    Message message = target.ReleaseMessage();
+
+    ASSERT_TRUE(message.Verify<test::BenchmarkRequest>());
+    ASSERT_NE(nullptr, message.GetRoot<test::BenchmarkRequest>()->message());
+    EXPECT_EQ("builder move constructor",
+              message.GetRoot<test::BenchmarkRequest>()->message()->str());
+}
+
+TEST(FlatBuffersMessageTest, BuilderMoveAssignmentReplacesBuffer) {
+    MessageBuilder target;
+    const auto old_text = target.CreateString("old builder");
+    target.Finish(test::CreateBenchmarkRequest(
+        target, 1, 0, 8, 10, 0, old_text));
+
+    MessageBuilder source;
+    const auto new_text = source.CreateString("replacement builder");
+    source.Finish(test::CreateBenchmarkRequest(
+        source, 7, 1, 64, 123, 9, new_text));
+
+    target = std::move(source);
+    Message message = target.ReleaseMessage();
+
+    ASSERT_TRUE(message.Verify<test::BenchmarkRequest>());
+    const auto* result = message.GetRoot<test::BenchmarkRequest>();
+    EXPECT_EQ(7, result->opcode());
+    ASSERT_NE(nullptr, result->message());
+    EXPECT_EQ("replacement builder", result->message()->str());
+}
+
 TEST(FlatBuffersMessageTest, ReleasedMessageSurvivesBuilderDestruction) {
     Message message = BuildRequest("hello");
     ASSERT_TRUE(message.Verify<test::BenchmarkRequest>());
