@@ -23,9 +23,11 @@
 #include <cstring>
 #include <string>
 
+#include "bthread/bthread.h"
 #include "butil/fd_guard.h"
 #include "butil/sys_byteorder.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/handshake/handshake_io.h"
 #include "brpc/policy/transport_handshake_protocol.h"
 #include "brpc/socket.h"
 #include "brpc/transport_handshake.h"
@@ -67,6 +69,21 @@ private:
     std::string _output;
     std::string _pushed_back;
 };
+
+struct BlockingHandshakeRead {
+    SocketHandshakeIO* io;
+    int result;
+    int error;
+};
+
+static void* RunBlockingHandshakeRead(void* arg) {
+    BlockingHandshakeRead* read =
+        static_cast<BlockingHandshakeRead*>(arg);
+    char byte = 0;
+    read->result = read->io->ReadExact(&byte, sizeof(byte));
+    read->error = errno;
+    return NULL;
+}
 
 static FrameSpec FixedSpec(const char* magic, size_t magic_len,
                            size_t total_len) {
@@ -111,6 +128,35 @@ static std::string MakeUBShmHello() {
     memcpy(&frame[4], &hello_ver, sizeof(hello_ver));
     memcpy(&frame[6], &impl_ver, sizeof(impl_ver));
     return frame;
+}
+
+TEST(TransportHandshakeTest, blocked_read_stops_after_socket_failure) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    SocketHandshakeIO io(socket.get());
+    BlockingHandshakeRead read = {&io, 0, 0};
+    bthread_t tid;
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    ASSERT_EQ(0, bthread_start_background(
+        &tid, &attr, RunBlockingHandshakeRead, &read));
+
+    bthread_usleep(10000);
+    ASSERT_EQ(0, socket->SetFailed(
+        EFAILEDSOCKET, "cancel blocked handshake read"));
+    ASSERT_EQ(0, bthread_join(tid, NULL));
+
+    EXPECT_EQ(-1, read.result);
+    EXPECT_EQ(EFAILEDSOCKET, read.error);
 }
 
 TEST(HandshakeFrameTest, supports_two_byte_fixed_magic) {
@@ -524,7 +570,8 @@ TEST(TransportHandshakeTest,
     socket->SetFailed();
 }
 
-TEST(TransportHandshakeTest, plain_tcp_server_consumes_coalesced_ubshm_ack) {
+TEST(TransportHandshakeTest,
+     plain_tcp_server_preserves_data_coalesced_behind_ubshm_ack) {
     int fds[2];
     ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
     butil::fd_guard peer_fd(fds[1]);
@@ -539,11 +586,19 @@ TEST(TransportHandshakeTest, plain_tcp_server_consumes_coalesced_ubshm_ack) {
     source.append(MakeUBShmHello());
     const uint32_t ack = 0;
     source.append(&ack, sizeof(ack));
+    const char application_data[] = "application-data";
+    source.append(application_data, sizeof(application_data) - 1);
+
     const ParseResult result = policy::ParseTransportHandshake(
         &source, socket.get(), false, NULL);
     ASSERT_FALSE(result.is_ok());
     ASSERT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
-    ASSERT_TRUE(source.empty());
+    ASSERT_EQ(sizeof(application_data) - 1, source.size());
+
+    char remaining[sizeof(application_data) - 1] = {};
+    ASSERT_EQ(sizeof(remaining),
+              source.copy_to(remaining, sizeof(remaining)));
+    EXPECT_EQ(0, memcmp(application_data, remaining, sizeof(remaining)));
     ASSERT_EQ(FALLBACK_TCP,
               AdapterTransport::Get(socket.get())->handshake_phase());
     ASSERT_EQ(nullptr, socket->parsing_context());

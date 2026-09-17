@@ -581,6 +581,9 @@ void AdapterTransport::CheckUnexpectedTcpData() {
                                _socket->description().c_str());
             return;
         }
+        if (errno == EINTR) {
+            continue;
+        }
         if (errno != EAGAIN) {
             const int saved_errno = errno;
             _socket->SetFailed(saved_errno, "Fail to read from %s: %s",
