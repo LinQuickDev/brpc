@@ -915,13 +915,15 @@ _reclaim:
         DeallocateCq(_resource->send_cq);
         DeallocateCq(_resource->recv_cq);
 
-    if (nullptr != _resource->comp_channel) {
+        if (_resource->comp_channel != nullptr) {
+            if (_cq_sid != INVALID_SOCKET_ID) {
                 // Destroy send_comp_channel will destroy this fd,
                 // so that we should remove it from epoll fd first
                 int fd = _resource->comp_channel->fd;
-      GetGlobalEventDispatcher(fd, _socket->_io_event.bthread_tag())
-          .RemoveConsumer(fd);
+                GetGlobalEventDispatcher(
+                    fd, _socket->_io_event.bthread_tag()).RemoveConsumer(fd);
                 remove_consumer = false;
+            }
             int err = IbvDestroyCompChannel(_resource->comp_channel);
       LOG_IF(WARNING, 0 != err)
           << "Fail to destroy CQ channel: " << berror(err);
