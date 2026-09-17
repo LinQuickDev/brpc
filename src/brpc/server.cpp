@@ -170,6 +170,57 @@ ServerSSLOptions* ServerOptions::mutable_ssl_options() {
     return _ssl_options.get();
 }
 
+#if BRPC_WITH_FLATBUFFERS
+Server::FlatBuffersMethodProperty::FlatBuffersMethodProperty()
+    : service(NULL)
+    , method(NULL)
+    , status(NULL) {
+}
+
+Server::FlatBuffersServiceProperty::FlatBuffersServiceProperty()
+    :service(NULL)
+    ,method_count(0)
+    ,methods_list(NULL){
+}
+
+Server::FlatBuffersServiceProperty::~FlatBuffersServiceProperty() {
+    if (methods_list) {
+        for (int i = 0; i < method_count; ++i) {
+            if (methods_list[i]) {
+                delete methods_list[i]->status;
+                delete methods_list[i];
+            }
+        }
+        delete[] methods_list;
+        methods_list = NULL;
+    }
+}
+
+Server::FlatBuffersServiceProperty::FlatBuffersServiceProperty(
+        FlatBuffersServiceProperty&& other)
+    : service(other.service)
+    , method_count(other.method_count)
+    , methods_list(other.methods_list) {
+    other.service = NULL;
+    other.method_count = 0;
+    other.methods_list = NULL;
+}
+
+Server::FlatBuffersServiceProperty&
+Server::FlatBuffersServiceProperty::operator=(FlatBuffersServiceProperty&& other) {
+    if (this != &other) {
+        this->~FlatBuffersServiceProperty();
+        service = other.service;
+        method_count = other.method_count;
+        methods_list = other.methods_list;
+        other.service = NULL;
+        other.method_count = 0;
+        other.methods_list = NULL;
+    }
+    return *this;
+}
+#endif
+
 Server::MethodProperty::OpaqueParams::OpaqueParams()
     : is_tabbed(false)
     , allow_default_url(false)
@@ -424,6 +475,16 @@ const std::string Server::ServiceProperty::service_name() const {
     const static std::string s_unknown_name = "";
     return s_unknown_name;
 }
+
+#if BRPC_WITH_FLATBUFFERS
+const std::string& Server::FlatBuffersServiceProperty::service_name() const {
+    if (service) {
+        return service->GetDescriptor()->full_name();
+    }
+    const static std::string s_unknown_name = "";
+    return s_unknown_name;
+}
+#endif
 
 Server::Server(ProfilerLinker)
     : _session_local_data_pool(nullptr)
@@ -692,7 +753,7 @@ int Server::InitALPNOptions(const ServerSSLOptions* options) {
     if (options == nullptr) {
         LOG(ERROR) << "Fail to init alpn options, ssl options is nullptr.";
         return -1;
-    }   
+    }
 
     std::string raw_protocol;
     const std::string& alpns = options->alpns;
@@ -1602,6 +1663,74 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
     return 0;
 }
 
+#if BRPC_WITH_FLATBUFFERS
+int Server::AddServiceInternal(brpc::flatbuffers::Service* service,
+                           bool is_builtin_service,
+                           const ServiceOptions& options) {
+    if (is_builtin_service) {
+        LOG(ERROR) << "builtin_service of flatbuffers rpc is not supported";
+        return -1;
+    }
+    if (NULL == service) {
+        LOG(ERROR) << "Parameter[service] is NULL!";
+        return -1;
+    }
+    const brpc::flatbuffers::ServiceDescriptor* sd = service->GetDescriptor();
+    int method_count = sd->method_count();
+    if (method_count <= 0) {
+        LOG(ERROR) << "service=" << sd->full_name()
+                   << " does not have any method.";
+        return -1;
+    }
+    if (InitializeOnce() != 0) {
+        LOG(ERROR) << "Fail to initialize Server[" << version() << ']';
+        return -1;
+    }
+    if (status() != READY) {
+        LOG(ERROR) << "Can't add service=" << sd->full_name() << " to Server["
+                   << version() << "] which is " << status_str(status());
+        return -1;
+    }
+    // Check service conflict using service's index
+    FlatBuffersServiceProperty* c_ss = _fb_server_index_map.seek(sd->index());
+    if (c_ss != NULL) {
+        LOG(ERROR) << "service:" << sd->full_name()
+            << " with index:"<< sd->index()
+            << " conflicts with registed service:" << c_ss->service->GetDescriptor()->full_name()
+            << " Try to change your service name.";
+        return -1;
+    }
+
+    // Register ServiceProperty
+    FlatBuffersServiceProperty ss;
+    ss.service = service;
+    ss.method_count = method_count;
+    ss.methods_list = new FlatBuffersMethodProperty*[method_count];
+    if (!ss.methods_list) {
+        LOG(ERROR) << "Fail to alloc methods_list";
+        return -1;
+    }
+    memset(ss.methods_list, 0, method_count * sizeof(FlatBuffersMethodProperty*));
+
+    // Register MethodProperty
+    for (int i = 0; i < method_count; ++i) {
+        const brpc::flatbuffers::MethodDescriptor* md = sd->method(i);
+        FlatBuffersMethodProperty* mp = new FlatBuffersMethodProperty();
+        if (!mp) {
+            LOG(ERROR) << "Fail to alloc FlatBuffersMethodProperty";
+            return -1;
+        }
+        mp->service = service;
+        mp->method = md;
+        mp->status = new MethodStatus;
+        ss.methods_list[i] = mp;
+    }
+    _fb_server_index_map[sd->index()] = std::move(ss);
+
+    return 0;
+}
+#endif
+
 ServiceOptions::ServiceOptions()
     : ownership(SERVER_DOESNT_OWN_SERVICE)
     , allow_default_url(false)
@@ -1638,6 +1767,22 @@ int Server::AddService(google::protobuf::Service* service,
                        const ServiceOptions& options) {
     return AddServiceInternal(service, false, options);
 }
+
+#if BRPC_WITH_FLATBUFFERS
+int Server::AddService(brpc::flatbuffers::Service* service,
+                   ServiceOwnership ownership) {
+    ServiceOptions options;
+    options.ownership = ownership;
+    return AddServiceInternal(service, false, options);
+}
+#endif
+
+#if BRPC_WITH_FLATBUFFERS
+int Server::AddService(brpc::flatbuffers::Service* service,
+                       const ServiceOptions& options) {
+    return AddServiceInternal(service, false, options);
+}
+#endif
 
 int Server::AddBuiltinService(google::protobuf::Service* service) {
     ServiceOptions options;
@@ -1772,6 +1917,9 @@ void Server::ClearServices() {
         }
         delete it->second.http_url;
     }
+#if BRPC_WITH_FLATBUFFERS
+    _fb_server_index_map.clear();
+#endif
     _fullname_service_map.clear();
     _service_map.clear();
     _method_map.clear();
@@ -2049,6 +2197,28 @@ const Server::ServiceProperty*
 Server::FindServicePropertyByName(const butil::StringPiece& name) const {
     return _service_map.seek(name);
 }
+
+#if BRPC_WITH_FLATBUFFERS
+const Server::FlatBuffersServiceProperty*
+Server::FindFlatBuffersServicePropertyByIndex(uint32_t service_index) const {
+    return _fb_server_index_map.seek(service_index);
+}
+#endif
+
+#if BRPC_WITH_FLATBUFFERS
+const Server::FlatBuffersMethodProperty*
+Server::FindFlatBuffersMethodPropertyByIndex(uint32_t service_index, int method_index) const {
+    const Server::FlatBuffersServiceProperty* sp =
+                        FindFlatBuffersServicePropertyByIndex(service_index);
+    if (NULL == sp || NULL == sp->methods_list) {
+        return NULL;
+    }
+    if (method_index < 0 || method_index >= sp->method_count) {
+        return NULL;
+    }
+    return sp->methods_list[method_index];
+}
+#endif
 
 int Server::AddCertificate(const CertInfo& cert) {
     if (!_options.has_ssl_options()) {

@@ -87,6 +87,9 @@
 #include "brpc/policy/rtmp_protocol.h"
 #include "brpc/policy/esp_protocol.h"
 #include "brpc/policy/mysql/mysql_protocol.h"
+#if BRPC_WITH_FLATBUFFERS
+#include "brpc/policy/flatbuffers_protocol.h"
+#endif
 #ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
 # include "brpc/policy/thrift_protocol.h"
 #endif
@@ -455,6 +458,25 @@ static void GlobalInitializeOrDieImpl() {
     if (RegisterProtocol(PROTOCOL_BAIDU_STD, baidu_protocol) != 0) {
         exit(1);
     }
+
+#if BRPC_WITH_FLATBUFFERS
+    Protocol fb_protocol = {
+        ParseFlatBuffersMessage,
+        SerializeFlatBuffersRequest,
+        PackFlatBuffersRequest,
+        ProcessFlatBuffersRequest,
+        ProcessFlatBuffersResponse,
+        nullptr,
+        nullptr,
+        nullptr,
+        CONNECTION_TYPE_SINGLE,
+        "fb_rpc"
+    };
+    if (RegisterProtocol(
+            PROTOCOL_FLATBUFFERS_RPC, fb_protocol) != 0) {
+        exit(1);
+    }
+#endif
 
     Protocol streaming_protocol = { ParseStreamingMessage,
                                     nullptr, nullptr, ProcessStreamingMessage,

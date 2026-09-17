@@ -35,6 +35,8 @@ header:
     - 'example/*/*.pem'
     - 'example/*/*.port'
     - 'example/build_with_bazel_module/.bazelversion'
+    - 'example/benchmark_fb/test.fbs'
+    - 'example/benchmark_fb/test_generated.h'
     - 'src/bthread/offset_inl.list'
     - 'test/*.crt'
     - 'test/*.key'

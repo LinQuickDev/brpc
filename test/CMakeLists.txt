@@ -270,9 +270,16 @@ endforeach()
 
 # brpc tests
 file(GLOB BRPC_UNITTESTS "brpc_*_unittest.cpp")
+if(NOT WITH_FLATBUFFERS)
+    list(FILTER BRPC_UNITTESTS EXCLUDE REGEX "brpc_flatbuffers_.*_unittest\\.cpp$")
+endif()
 foreach(BRPC_UT ${BRPC_UNITTESTS})
     get_filename_component(BRPC_UT_WE ${BRPC_UT} NAME_WE)
     add_executable(${BRPC_UT_WE} ${BRPC_UT} $<TARGET_OBJECTS:TEST_PROTO_LIB>)
+    if(BRPC_UT_WE STREQUAL "brpc_flatbuffers_rpc_unittest")
+        target_sources(${BRPC_UT_WE} PRIVATE
+            ${PROJECT_SOURCE_DIR}/example/benchmark_fb/test.brpc.fb.cpp)
+    endif()
     target_link_libraries(${BRPC_UT_WE} PRIVATE
         brpc-shared-debug
         gtest_main

@@ -48,6 +48,7 @@
 #include "brpc/grpc.h"
 #include "brpc/kvmap.h"
 #include "brpc/rpc_dump.h"
+#include "brpc/details/flatbuffers_common.h"
 
 // EAUTH is defined in MAC
 #ifndef EAUTH
@@ -119,7 +120,7 @@ enum BindSockAction {
 typedef butil::FlatMap<std::string, std::string> UserFieldsMap;
 
 // A Controller mediates a single method call. The primary purpose of
-// the controller is to provide a way to manipulate settings per RPC-call 
+// the controller is to provide a way to manipulate settings per RPC-call
 // and to find out about RPC-level errors.
 class Controller : public google::protobuf::RpcController/*non-copyable*/ {
 friend class Channel;
@@ -173,6 +174,7 @@ friend void policy::ProcessThriftRequest(InputMessageBase*);
     // Whether set_response_checksum_type()'s checksum also covers the
     // attachment. See set_response_checksum_attachment().
     static const uint32_t FLAGS_RESPONSE_CHECKSUM_WITH_ATTACHMENT = (1 << 24);
+    static const uint32_t FLAGS_USE_FLATBUFFER = (1 << 25);
 
 public:
     struct Inheritable {
@@ -190,7 +192,7 @@ public:
     Controller();
     Controller(const Inheritable& parent_ctx);
     ~Controller();
-    
+
     // ------------------------------------------------------------------
     //                      Client-side methods
     // These calls shall be made from the client side only.  Their results
@@ -249,6 +251,8 @@ public:
     // Response of the RPC call (passed to CallMethod)
     google::protobuf::Message* response() const { return _response; }
 
+    brpc::flatbuffers::Message* fb_response() const { return _fb_response; }
+
     // An identifier to send to server along with request. This is widely used
     // throughout baidu's servers to tag a searching session (a series of
     // queries following the topology of servers) with a same log_id.
@@ -296,7 +300,7 @@ public:
     }
     bool has_request_code() const { return has_flag(FLAGS_REQUEST_CODE); }
     uint64_t request_code() const { return _request_code; }
-    
+
     // Mutable header of http request.
     HttpHeader& http_request() {
         if (_http_request == nullptr) {
@@ -337,14 +341,16 @@ public:
     // Get the called method. May-be nullptr for non-pb services.
     const google::protobuf::MethodDescriptor* method() const { return _method; }
 
+    const brpc::flatbuffers::MethodDescriptor* fb_method() const { return _fb_method; }
+
     // Get the controllers for accessing sub channels in combo channels.
     // Ordinary channel:
     //   sub_count() is 0 and sub() is always nullptr.
     // ParallelChannel/PartitionChannel:
-    //   sub_count() is #sub-channels and sub(i) is the controller for 
+    //   sub_count() is #sub-channels and sub(i) is the controller for
     //   accessing i-th sub channel inside ParallelChannel, if i is outside
     //    [0, sub_count() - 1], sub(i) is nullptr.
-    //   NOTE: You must test sub() against nullptr, ALWAYS. Even if i is inside 
+    //   NOTE: You must test sub() against nullptr, ALWAYS. Even if i is inside
     //   range, sub(i) can still be nullptr:
     //   * the rpc call may fail and terminate before accessing the sub channel
     //   * the sub channel was skipped
@@ -385,16 +391,16 @@ public:
     // - Any error occurred will destroy the reader by calling r->Destroy().
     // - r->Destroy() is guaranteed to be called once and only once.
     void ReadProgressiveAttachmentBy(ProgressiveReader* r);
-    
+
     // True if ReadProgressiveAttachmentBy() was ever called successfully.
     bool has_progressive_reader() const { return has_flag(FLAGS_PROGRESSIVE_READER); }
-    
+
     // RPC may fail with EOVERCROWDED if the socket to write is too full
     // (limited by -socket_max_unwritten_bytes). In some scenarios, user
     // may wish to suppress the error completely. To do this, call this
     // method before doing the RPC.
     void ignore_eovercrowded() { add_flag(FLAGS_IGNORE_EOVERCROWDED); }
-    
+
     // Set if the field of bytes in protobuf message should be encoded
     // to base64 string in HTTP request.
     void set_pb_bytes_to_base64(bool f) { set_flag(FLAGS_PB_BYTES_TO_BASE64, f); }
@@ -409,14 +415,14 @@ public:
     // of json in HTTP response.
     void set_pb_jsonify_empty_array(bool f) { set_flag(FLAGS_PB_JSONIFY_EMPTY_ARRAY, f); }
     bool has_pb_jsonify_empty_array() const { return has_flag(FLAGS_PB_JSONIFY_EMPTY_ARRAY); }
-    
+
     // Whether to always print primitive fields. By default proto3 primitive
     // fields with default values will be omitted in JSON output. For example, an
     // int32 field set to 0 will be omitted. Set this flag to true will override
     // the default behavior and print primitive fields regardless of their values.
     void set_always_print_primitive_fields(bool f) { set_flag(FLAGS_ALWAYS_PRINT_PRIMITIVE_FIELDS, f); }
     bool has_always_print_primitive_fields() const { return has_flag(FLAGS_ALWAYS_PRINT_PRIMITIVE_FIELDS); }
-    
+
 
     // Tell RPC that done of the RPC can be run in the same thread where
     // the RPC is issued, otherwise done is always run in a different thread.
@@ -486,7 +492,7 @@ public:
         _http_response = nullptr;
         return tmp;
     }
-    
+
     // User attached data or body of http response, which is wired to network
     // directly instead of being serialized into protobuf messages.
     butil::IOBuf& response_attachment() { return _response_attachment; }
@@ -497,7 +503,7 @@ public:
     // replaced by ErrorText() and should be managed by user self.
     void manage_http_body_on_error(bool manage_or_not)
     { set_flag(FLAGS_MANAGE_HTTP_BODY_ON_ERROR, manage_or_not); }
-    
+
     bool does_manage_http_body_on_error() const
     { return has_flag(FLAGS_MANAGE_HTTP_BODY_ON_ERROR); }
 
@@ -523,7 +529,7 @@ public:
     void set_response_checksum_attachment(bool with_attachment) {
         set_flag(FLAGS_RESPONSE_CHECKSUM_WITH_ATTACHMENT, with_attachment);
     }
-    
+
     // Non-zero when this RPC call is traced (by rpcz or rig).
     // NOTE: Only valid at server-side, always zero at client-side.
     uint64_t trace_id() const;
@@ -546,27 +552,27 @@ public:
     // Always nullptr at client-side.
     const Server* server() const { return _server; }
 
-    // Get the data attached to current RPC session. The data is created by 
+    // Get the data attached to current RPC session. The data is created by
     // ServerOptions.session_local_data_factory and reused between different
     // RPC. If factory is nullptr, this method returns nullptr.
     void* session_local_data();
 
     // Get the data attached to a mongo session(practically a socket).
     MongoContext* mongo_session_data() { return _mongo_session_data.get(); }
-    
+
     // -------------------------------------------------------------------
     //                      Both-side methods.
     // Following methods can be called from both client and server. But they
     // may have different or opposite semantics.
     // -------------------------------------------------------------------
 
-    // Client-side: successful or last server called. Accessible from 
+    // Client-side: successful or last server called. Accessible from
     // PackXXXRequest() in protocols.
     // Server-side: returns the client sending the request
     butil::EndPoint remote_side() const { return _remote_side; }
-    
+
     // Client-side: the local address for talking with server, undefined until
-    // this RPC succeeds (because the connection may not be established 
+    // this RPC succeeds (because the connection may not be established
     // before RPC).
     // Server-side: the address that clients access.
     butil::EndPoint local_side() const { return _local_side; }
@@ -580,24 +586,24 @@ public:
         ResetNonPods();
         ResetPods();
     }
-    
+
     // Causes Failed() to return true on the client side.  "reason" will be
     // incorporated into the message returned by ErrorText().
     // NOTE: Change http_response().status_code() according to `error_code'
-    // as well if the protocol is HTTP. If you want to overwrite the 
+    // as well if the protocol is HTTP. If you want to overwrite the
     // status_code, call http_response().set_status_code() after SetFailed()
     // (rather than before SetFailed)
     void SetFailed(const std::string& reason) override;
     void SetFailed(int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));
-    
+
     // After a call has finished, returns true if the RPC call failed.
     // The response to Channel is undefined when Failed() is true.
     // Calling Failed() before a call has finished is undefined.
     bool Failed() const override;
 
     // If Failed() is true, return description of the errors.
-    // NOTE: ErrorText() != berror(ErrorCode()). 
+    // NOTE: ErrorText() != berror(ErrorCode()).
     std::string ErrorText() const override;
 
     // Last error code. Equals 0 iff Failed() is false.
@@ -615,9 +621,9 @@ public:
     ChecksumType response_checksum_type() const { return _response_checksum_type; }
     bool request_checksum_attachment() const { return has_flag(FLAGS_REQUEST_CHECKSUM_WITH_ATTACHMENT); }
     bool response_checksum_attachment() const { return has_flag(FLAGS_RESPONSE_CHECKSUM_WITH_ATTACHMENT); }
-    const HttpHeader& http_request() const 
+    const HttpHeader& http_request() const
     { return _http_request != nullptr ? *_http_request : DefaultHttpHeader(); }
-    
+
     const HttpHeader& http_response() const
     { return _http_response != nullptr ? *_http_response : DefaultHttpHeader(); }
 
@@ -627,7 +633,7 @@ public:
     // Get the object to write key/value which will be flushed into
     // LOG(INFO) when this controller is deleted.
     KVMap& SessionKV();
-    
+
     // Flush SessionKV() into `os'
     void FlushSessionKV(std::ostream& os);
 
@@ -704,6 +710,9 @@ public:
     // the received time of RPC is not recorded in the controller.
     int64_t get_rpc_received_us() const { return _rpc_received_us; }
 
+    void set_use_flatbuffer() { add_flag(FLAGS_USE_FLATBUFFER); }
+    bool is_use_flatbuffer() const { return has_flag(FLAGS_USE_FLATBUFFER); }
+
 private:
     struct CompletionInfo {
         CallId id;           // call_id of the corresponding request
@@ -737,7 +746,7 @@ private:
     void HandleSendFailed();
 
     static int RunOnCancel(bthread_id_t, void* data, int error_code);
-    
+
     void set_auth_context(const AuthContext* ctx);
 
     // MongoContext is created by ParseMongoRequest when the first msg comes
@@ -765,7 +774,7 @@ private:
         BackupRequestPolicy* backup_request_policy;
         int max_retry;
         int32_t tos;
-        ConnectionType connection_type;         
+        ConnectionType connection_type;
         CompressType request_compress_type;
         ChecksumType request_checksum_type;
         bool request_checksum_with_attachment;
@@ -776,7 +785,7 @@ private:
 
     void SaveClientSettings(ClientSettings*) const;
     void ApplyClientSettings(const ClientSettings&);
- 
+
     bool FailedInline() const { return _error_code; }
 
     CallId get_id(int nretry) const {
@@ -793,7 +802,7 @@ public:
         return id;
     }
 private:
-    
+
     // Append server information to `_error_text'
     void AppendServerIdentiy();
 
@@ -809,7 +818,7 @@ private:
         int nretry;                     // sent in nretry-th retry.
         bool need_feedback;             // The LB needs feedback.
         bool enable_circuit_breaker;    // The channel enabled circuit_breaker
-        bool touched_by_stream_creator; 
+        bool touched_by_stream_creator;
         SocketId peer_id;               // main server id
         int64_t begin_time_us;          // sent real time.
         // The actual `Socket' for sending RPC. It's socket id will be
@@ -870,8 +879,8 @@ private:
     void set_used_by_rpc() { add_flag(FLAGS_USED_BY_RPC); }
     bool is_used_by_rpc() const { return has_flag(FLAGS_USED_BY_RPC); }
 
-    bool has_enabled_circuit_breaker() const { 
-        return has_flag(FLAGS_ENABLED_CIRCUIT_BREAKER); 
+    bool has_enabled_circuit_breaker() const {
+        return has_flag(FLAGS_ENABLED_CIRCUIT_BREAKER);
     }
 
     bool is_ending_rpc() const { return has_flag(FLAGS_ENDING_RPC); }
@@ -890,7 +899,7 @@ private:
     std::string _error_text;
     butil::EndPoint _remote_side;
     butil::EndPoint _local_side;
-    
+
     void* _session_local_data;
     const Server* _server;
     bthread_id_t _oncancel_id;
@@ -911,7 +920,7 @@ private:
 
     // Used by ParallelChannel
     int _fail_limit;
-    
+
     uint32_t _pipelined_count;
 
     // [Timeout related]
@@ -943,6 +952,7 @@ private:
     Inheritable _inheritable;
     int _pchan_sub_count;
     google::protobuf::Message* _response;
+    brpc::flatbuffers::Message* _fb_response;
     google::protobuf::Closure* _done;
     RPCSender* _sender;
     uint64_t _request_code;
@@ -951,16 +961,17 @@ private:
 
     // for passing parameters to created bthread, don't modify it otherwhere.
     CompletionInfo _tmp_completion_info;
-    
+
     Call _current_call;
     Call* _unfinished_call;
     ExcludedServers* _accessed;
-    
+
     StreamCreator* _stream_creator;
 
     // Fields will be used when making requests
     Protocol::PackRequest _pack_request;
     const google::protobuf::MethodDescriptor* _method;
+    const brpc::flatbuffers::MethodDescriptor* _fb_method;
     const Authenticator* _auth;
     butil::IOBuf _request_buf;
     IdlNames _idl_names;
@@ -975,7 +986,7 @@ private:
 
     std::unique_ptr<KVMap> _session_kv;
 
-    // Fields with large size but low access frequency 
+    // Fields with large size but low access frequency
     butil::IOBuf _request_attachment;
     butil::IOBuf _response_attachment;
 
@@ -1051,13 +1062,13 @@ std::ostream& operator<<(std::ostream& os, const Controller::LogPrefixDummy& p);
 } // namespace brpc
 
 // Print contextual logs prefixed with "@rid=REQUEST_ID" which marks a session
-// and eases debugging. The REQUEST_ID is carried in http/rpc request or 
+// and eases debugging. The REQUEST_ID is carried in http/rpc request or
 // inherited from another controller.
 // As a server:
 //   Call CLOG*(cntl) << ... to log instead of LOG(*) << ..
 // As a client:
 //   Inside a service:
-//     Use Controller(service_cntl->inheritable()) to create controllers which 
+//     Use Controller(service_cntl->inheritable()) to create controllers which
 //     inherit session info from the service's requests
 //   Standalone brpc client:
 //     Set cntl->set_request_id(REQUEST_ID);

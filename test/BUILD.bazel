@@ -233,6 +233,9 @@ generate_unittests(
     name = "brpc_unittests",
     srcs = glob([
         "brpc_*_unittest.cpp",
+    ], exclude = [
+        "brpc_flatbuffers_message_unittest.cpp",
+        "brpc_flatbuffers_rpc_unittest.cpp",
     ]),
     deps = [
         ":gperftools_helper",

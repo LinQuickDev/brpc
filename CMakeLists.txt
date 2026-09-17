@@ -27,6 +27,7 @@ option(WITH_THRIFT "With thrift framed protocol supported" OFF)
 option(WITH_BTHREAD_TRACER "With bthread tracer supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
+option(WITH_FLATBUFFERS "With FlatBuffers RPC support" OFF)
 option(WITH_UBRING "With UB" OFF)
 option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
 option(WITH_DEBUG_LOCK "With debugging lock" OFF)
@@ -115,6 +116,11 @@ if (WITH_BTHREAD_TRACER)
     list(APPEND BRPC_COMMON_INCLUDE_DIRS ${LIBUNWIND_INCLUDE_PATH})
 endif ()
 
+set(WITH_FLATBUFFERS_VAL "0")
+if(WITH_FLATBUFFERS)
+    set(WITH_FLATBUFFERS_VAL "1")
+endif()
+
 set(WITH_RDMA_VAL "0")
 if(WITH_RDMA)
     set(WITH_RDMA_VAL "1")
@@ -159,6 +165,7 @@ endif()
 list(APPEND BRPC_COMMON_DEFINITIONS
     BRPC_WITH_GLOG=${WITH_GLOG_VAL}
     BRPC_WITH_RDMA=${WITH_RDMA_VAL}
+    BRPC_WITH_FLATBUFFERS=${WITH_FLATBUFFERS_VAL}
     BRPC_WITH_UBRING=${WITH_UBRING_VAL}
     BRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL}
     BRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}
@@ -226,6 +233,28 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 find_package(Protobuf REQUIRED)
+
+if(WITH_FLATBUFFERS)
+    find_path(
+        FLATBUFFERS_INCLUDE_PATH
+        NAMES flatbuffers/flatbuffers.h
+    )
+    if(NOT FLATBUFFERS_INCLUDE_PATH)
+        message(
+            FATAL_ERROR
+            "WITH_FLATBUFFERS=ON but flatbuffers/flatbuffers.h was not found"
+        )
+    endif()
+    list(
+        APPEND
+        BRPC_COMMON_INCLUDE_DIRS
+        ${FLATBUFFERS_INCLUDE_PATH}
+    )
+    message(
+        STATUS
+        "FlatBuffers include path: ${FLATBUFFERS_INCLUDE_PATH}"
+    )
+endif()
 find_package(ZLIB REQUIRED)
 if(Protobuf_VERSION VERSION_GREATER 4.21)
     # required by absl
@@ -576,6 +605,15 @@ file(GLOB_RECURSE BVAR_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/bvar
 file(GLOB_RECURSE BTHREAD_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/bthread/*.cpp")
 file(GLOB_RECURSE JSON2PB_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/json2pb/*.cpp")
 file(GLOB_RECURSE BRPC_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/*.cpp")
+
+if(NOT WITH_FLATBUFFERS)
+    list(
+        FILTER
+        BRPC_SOURCES
+        EXCLUDE
+        REGEX "/flatbuffers_(impl|protocol)\\.cpp$"
+    )
+endif()
 file(GLOB_RECURSE THRIFT_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/thrift*.cpp")
 file(GLOB_RECURSE EXCLUDE_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/src/brpc/event_dispatcher_*.cpp")
 
