@@ -41,14 +41,14 @@ void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
     _socket = socket;
     _default_connect = options.app_connect;
     _on_edge_trigger = nullptr;
+    _rdma_state = RDMA_UNKNOWN;
     _rdma_ep = new (std::nothrow) rdma::RdmaEndpoint(socket);
     if (!_rdma_ep) {
         const int saved_errno = errno != 0 ? errno : ENOMEM;
-        PLOG(ERROR) << "Fail to create RdmaEndpoint";
-        socket->SetFailed(saved_errno, "Fail to create RdmaEndpoint: %s",
-                          berror(saved_errno));
+        errno = saved_errno;
+        PLOG(WARNING) << "Fail to create RdmaEndpoint, disable RDMA upgrade";
+        _rdma_state = RDMA_OFF;
     }
-    _rdma_state = RDMA_UNKNOWN;
 }
 
 void RdmaTransport::Release() {

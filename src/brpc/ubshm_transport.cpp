@@ -46,15 +46,14 @@ void UBShmTransport::Init(Socket *socket, const SocketOptions &options) {
     _socket = socket;
     _default_connect = options.app_connect;
   _on_edge_trigger = nullptr;
+  _ub_state = UB_UNKNOWN;
   _ub_ep = new (std::nothrow) ubring::UBShmEndpoint(socket);
   if (!_ub_ep) {
     const int saved_errno = errno != 0 ? errno : ENOMEM;
     errno = saved_errno;
-    PLOG(ERROR) << "Fail to create UBShmEndpoint";
-    socket->SetFailed(saved_errno, "Fail to create UBShmEndpoint: %s",
-                      berror(saved_errno));
-    }
-  _ub_state = UB_UNKNOWN;
+    PLOG(WARNING) << "Fail to create UBShmEndpoint, disable UBSHM upgrade";
+    _ub_state = UB_OFF;
+  }
 }
 
 void UBShmTransport::Release() {

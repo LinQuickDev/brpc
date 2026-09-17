@@ -404,6 +404,72 @@ TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
 }
 
 TEST(TransportHandshakeTest,
+     impossible_magic_prefixes_try_other_protocols_without_consuming) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    const char* const invalid_prefixes[] = {
+        "X", "UX", "RX", "RDN", "RDMB",
+    };
+    for (size_t i = 0; i < arraysize(invalid_prefixes); ++i) {
+        butil::IOBuf source;
+        source.append(invalid_prefixes[i]);
+        const size_t original_size = source.size();
+        const ParseResult result = policy::ParseTransportHandshake(
+            &source, socket.get(), false, NULL);
+        ASSERT_FALSE(result.is_ok());
+        EXPECT_EQ(PARSE_ERROR_TRY_OTHERS, result.error())
+            << invalid_prefixes[i];
+        EXPECT_EQ(original_size, source.size())
+            << invalid_prefixes[i];
+        EXPECT_EQ(UNINITIALIZED,
+                  AdapterTransport::Get(socket.get())->handshake_phase());
+        EXPECT_EQ(nullptr, socket->parsing_context());
+    }
+    socket->SetFailed();
+}
+
+TEST(TransportHandshakeTest,
+     partial_rdma_magic_waits_for_more_data_without_consuming) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    const char* const partial_prefixes[] = {
+        "R", "RD", "RDM",
+    };
+    for (size_t i = 0; i < arraysize(partial_prefixes); ++i) {
+        butil::IOBuf source;
+        source.append(partial_prefixes[i]);
+        const size_t original_size = source.size();
+        const ParseResult result = policy::ParseTransportHandshake(
+            &source, socket.get(), false, NULL);
+        ASSERT_FALSE(result.is_ok());
+        EXPECT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA, result.error())
+            << partial_prefixes[i];
+        EXPECT_EQ(original_size, source.size())
+            << partial_prefixes[i];
+        EXPECT_EQ(UNINITIALIZED,
+                  AdapterTransport::Get(socket.get())->handshake_phase());
+        EXPECT_EQ(nullptr, socket->parsing_context());
+    }
+    socket->SetFailed();
+}
+
+TEST(TransportHandshakeTest,
      plain_tcp_server_incrementally_rejects_ubshm_upgrade) {
     int fds[2];
     ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));

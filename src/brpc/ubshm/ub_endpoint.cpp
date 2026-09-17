@@ -41,9 +41,9 @@ namespace ubring {
 
 extern bool g_skip_ub_init;
 DEFINE_int32(ub_poller_num, 1, "Poller number in ub polling mode.");
-DEFINE_bool(ub_poller_yield, false, "Yield thread in RDMA polling mode.");
+DEFINE_bool(ub_poller_yield, false, "Yield thread in UBRing polling mode.");
 DEFINE_bool(ub_edisp_unsched, false, "Disable event dispatcher schedule");
-DEFINE_bool(ub_disable_bthread, false, "Disable bthread in RDMA");
+DEFINE_bool(ub_disable_bthread, false, "Disable bthread in UBRing polling mode.");
 
 static const size_t MIN_ONCE_READ = 4096;
 static const size_t MAX_ONCE_READ = 524288;
