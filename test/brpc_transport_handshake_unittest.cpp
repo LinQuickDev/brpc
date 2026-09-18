@@ -632,7 +632,7 @@ TEST(TransportHandshakeTest,
     SocketOptions first_options;
     first_options.fd = first_fds[0];
     first_options.user =
-        static_cast<SocketUser*>(get_client_side_messenger());
+        static_cast<SocketUser*>(get_or_new_client_side_messenger());
     first_options.need_on_edge_trigger = true;
     first_options.socket_mode = SOCKET_MODE_RDMA;
     first_options.app_connect = original;
@@ -680,7 +680,7 @@ TEST(TransportHandshakeTest,
     SocketOptions options;
     options.fd = fds[0];
     options.user =
-        static_cast<SocketUser*>(get_client_side_messenger());
+        static_cast<SocketUser*>(get_or_new_client_side_messenger());
     options.need_on_edge_trigger = true;
     options.socket_mode = SOCKET_MODE_RDMA;
     options.app_connect = original;
