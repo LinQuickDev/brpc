@@ -444,8 +444,10 @@ std::shared_ptr<AppConnect> AdapterTransport::Connect() {
     if (upgrade_capable(_mode)) {
         return AdapterConnect::Wrap(_default_connect);
     }
-    if (_socket->user() ==
-        static_cast<SocketUser*>(get_client_side_messenger())) {
+    SocketUser* const client_messenger =
+        static_cast<SocketUser*>(get_client_side_messenger());
+    if (client_messenger != NULL &&
+        _socket->user() == client_messenger) {
         FallbackToTcp();
         return AdapterConnect::Unwrap(_tcp_transport->Connect());
     }
