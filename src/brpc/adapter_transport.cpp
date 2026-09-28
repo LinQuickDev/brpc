@@ -27,6 +27,7 @@
 #include "brpc/destroyable.h"
 #include "brpc/handshake/rdma_handshake.h"
 #include "brpc/handshake/ubshm_handshake.h"
+#include "brpc/urma/urma_handshake.h"
 #if BRPC_WITH_RDMA
 #include "brpc/rdma/rdma_helper.h"
 #endif
@@ -35,9 +36,13 @@
 #include "brpc/ubshm/ub_helper.h"
 #include "brpc/ubshm/ubr_trx.h"
 #endif
+#if BRPC_WITH_URMA
+#include "brpc/urma/urma_helper.h"
+#endif
 #include "brpc/rdma_transport.h"
 #include "brpc/tcp_transport.h"
 #include "brpc/ubshm_transport.h"
+#include "brpc/urma_transport.h"
 
 namespace brpc {
 
@@ -166,6 +171,44 @@ private:
 };
 #endif
 
+#if BRPC_WITH_URMA
+class UrmaClientHandshakeTransport : public handshake::HandshakeTransport {
+public:
+    UrmaClientHandshakeTransport(
+        UrmaTransport* transport, urma::UrmaHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
+        : _transport(transport), _protocol(protocol), _socket(socket),
+          _connect_error(connect_error) {}
+
+    handshake::StepResult PrepareResources() override {
+        return _transport->PrepareUpgradeResources(false) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+    handshake::StepResult NegotiateResources() override {
+        return _transport->NegotiateUpgradeResources(
+                   _protocol->remote(), false) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+    void OnEstablished() override { _transport->ActivateUpgrade(); }
+    void OnFallback() override { _transport->DeactivateUpgrade(); }
+    void OnFailed() override {
+        _transport->DeactivateUpgrade();
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        *_connect_error = saved_errno;
+        _socket->SetFailed(saved_errno,
+                           "Fail to complete URMA handshake from %s: %s",
+                           _socket->description().c_str(),
+                           berror(saved_errno));
+    }
+
+private:
+    UrmaTransport* _transport;
+    urma::UrmaHandshakeAdapter* _protocol;
+    Socket* _socket;
+    int* _connect_error;
+};
+#endif
+
 #if BRPC_WITH_UBRING
 class UBShmClientHandshakeTransport : public handshake::HandshakeTransport {
 public:
@@ -236,6 +279,11 @@ bool AdapterTransport::upgrade_capable(SocketMode mode) const {
         return static_cast<RdmaTransport*>(
             _high_speed_transport.get())->UpgradeReady();
 #endif
+#if BRPC_WITH_URMA
+    case SOCKET_MODE_URMA:
+        return static_cast<UrmaTransport*>(
+            _high_speed_transport.get())->UpgradeReady();
+#endif
 #if BRPC_WITH_UBRING
     case SOCKET_MODE_UBRING:
         return static_cast<UBShmTransport*>(
@@ -285,13 +333,28 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
         const bool matches_rdma =
             MatchesMagicPrefix(prefix, prefix_len, "RDMA", 4) ||
             MatchesMagicPrefix(prefix, prefix_len, "RDM3", 4);
-        if (!matches_ub && !matches_rdma) {
+        const bool matches_urma =
+#if BRPC_WITH_URMA
+            MatchesMagicPrefix(prefix, prefix_len, "URMA", 4) ||
+            MatchesMagicPrefix(prefix, prefix_len, "URM3", 4);
+#else
+            false;
+#endif
+        if (!matches_ub && !matches_rdma && !matches_urma) {
             result = ParseResult(PARSE_ERROR_TRY_OTHERS);
         } else {
-            handshake::HandshakeAdapter* adapter =
-                matches_ub
-                ? handshake::GetUBShmServerHandshakeAdapter()
-                : handshake::GetRdmaServerHandshakeAdapter();
+            handshake::HandshakeAdapter* adapter = NULL;
+            if (matches_ub) {
+                adapter = handshake::GetUBShmServerHandshakeAdapter();
+            } else if (matches_rdma) {
+                adapter = handshake::GetRdmaServerHandshakeAdapter();
+            }
+#if BRPC_WITH_URMA
+            else {
+                adapter = handshake::GetUrmaServerHandshakeAdapter();
+            }
+#endif
+            CHECK(adapter != NULL);
             result = adapter->ExecuteServerHandshake(source, _socket);
         }
     }
@@ -355,6 +418,32 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
                 socket->description().c_str(), berror(saved_errno));
             connect_error = saved_errno;
         }
+        if (result == handshake::STEP_ERROR && connect_error == 0) {
+            connect_error = errno != 0 ? errno : EPROTO;
+        }
+        adapter->CompleteConnection(static_cast<handshake::Phase>(
+            adapter->_handshake.phase()));
+        task->done(connect_error, task->data);
+        return NULL;
+    }
+#endif
+
+#if BRPC_WITH_URMA
+    if (adapter->_mode == SOCKET_MODE_URMA) {
+        UrmaTransport* transport = static_cast<UrmaTransport*>(
+            adapter->_high_speed_transport.get());
+        if (!urma::IsUrmaAvailable()) {
+            adapter->FallbackToTcp();
+            adapter->CompleteConnection(handshake::FALLBACK_TCP);
+            task->done(0, task->data);
+            return NULL;
+        }
+        std::unique_ptr<urma::UrmaHandshakeAdapter> protocol =
+            urma::CreateClientHandshakeAdapter(transport->GetUrmaEp());
+        UrmaClientHandshakeTransport participant(
+            transport, protocol.get(), socket, &connect_error);
+        const handshake::StepResult result = adapter->_handshake.RunClient(
+            protocol.get(), &participant);
         if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
@@ -432,6 +521,12 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
             // UBSHM server handshake is parsed by InputMessenger.
             _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
+#if BRPC_WITH_URMA
+        } else if (_mode == SOCKET_MODE_URMA &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            _on_edge_trigger = OnNewMessagesAfterUpgrade;
+#endif
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
         }
@@ -450,6 +545,11 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
 #if BRPC_WITH_UBRING
     case SOCKET_MODE_UBRING:
         _high_speed_transport.reset(new UBShmTransport);
+        break;
+#endif
+#if BRPC_WITH_URMA
+    case SOCKET_MODE_URMA:
+        _high_speed_transport.reset(new UrmaTransport);
         break;
 #endif
     default:
@@ -568,6 +668,12 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
 #if BRPC_WITH_UBRING
     case SOCKET_MODE_UBRING:
         static_cast<UBShmTransport*>(_high_speed_transport.get())
+            ->SetHighSpeedAvailable(available);
+        break;
+#endif
+#if BRPC_WITH_URMA
+    case SOCKET_MODE_URMA:
+        static_cast<UrmaTransport*>(_high_speed_transport.get())
             ->SetHighSpeedAvailable(available);
         break;
 #endif

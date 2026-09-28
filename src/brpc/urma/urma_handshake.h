@@ -20,10 +20,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "brpc/handshake/handshake_adapter.h"
+
+namespace brpc {
+namespace handshake {
+
+HandshakeAdapter* GetUrmaServerHandshakeAdapter();
+
+}  // namespace handshake
+}  // namespace brpc
 
 #if BRPC_WITH_URMA
 
 #include "urma_types.h"
+#include "brpc/transport_handshake.h"
 
 namespace brpc {
 namespace urma {
@@ -108,6 +122,33 @@ public:
     // Returns -1 on IO error (errno set).
     virtual int ReceiveAndParseRemoteHello(ParsedHello* out, bool* negotiated) = 0;
 };
+
+// Stateless wire participant used by the common transport handshake. The
+// endpoint still owns local and imported URMA resources; this class owns only
+// the selected wire version and the parsed peer hello.
+class UrmaHandshakeAdapter : public handshake::HandshakeProtocol {
+public:
+    UrmaHandshakeAdapter(UrmaEndpoint* ep, int version)
+        : _ep(ep), _version(version), _remote() {}
+
+    int ProtocolVersion() const override { return _version; }
+    const handshake::FrameSpec& HelloFrameSpec() const override;
+    const handshake::FrameSpec& AckFrameSpec() const override;
+    handshake::StepResult BuildHello(bool enabled,
+                                     std::string* payload) override;
+    handshake::StepResult ParseHello(const std::string& payload) override;
+    const ParsedHello& remote() const { return _remote; }
+
+private:
+    UrmaEndpoint* _ep;
+    int _version;
+    ParsedHello _remote;
+};
+
+std::unique_ptr<UrmaHandshakeAdapter> CreateClientHandshakeAdapter(
+    UrmaEndpoint* ep);
+std::vector<std::unique_ptr<UrmaHandshakeAdapter> >
+CreateServerHandshakeAdapters(UrmaEndpoint* ep);
 
 // v2 binary handshake (magic "URMA").
 class UrmaHandshakeClientV2 : public UrmaHandshake {

@@ -139,6 +139,51 @@ TEST(UrmaHandshakeTest, v3_protobuf_roundtrip) {
     EXPECT_EQ(msg.seg_token_id(), msg2.seg_token_id());
 }
 
+TEST(UrmaHandshakeTest, common_adapter_parses_v2_and_v3_hello) {
+    urma::v2_wire::HelloMessage v2{};
+    v2.msg_len = urma::v2_wire::HELLO_PACKET_LEN;
+    v2.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+    v2.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+    v2.buffer_size = 8192;
+    v2.recv_buffer_cnt = 127;
+    v2.jetty_id = 7;
+    v2.tp_type = URMA_CTP;
+    v2.seg_va = 0x1000;
+    v2.seg_len = 8192;
+    uint8_t v2_body[urma::v2_wire::HELLO_BODY_LEN];
+    v2.Serialize(v2_body);
+    const std::string v2_payload(
+        reinterpret_cast<const char*>(v2_body + sizeof(uint16_t)),
+        sizeof(v2_body) - sizeof(uint16_t));
+
+    urma::UrmaHandshakeAdapter v2_adapter(nullptr, 2);
+    ASSERT_EQ(handshake::STEP_OK, v2_adapter.ParseHello(v2_payload));
+    EXPECT_EQ(7u, v2_adapter.remote().jetty_id);
+    EXPECT_EQ(urma::v2_wire::HELLO_PACKET_LEN,
+              v2_adapter.HelloFrameSpec().min_frame_len);
+
+    urma::UrmaHello v3;
+    v3.set_buffer_size(8192);
+    v3.set_recv_buffer_cnt(127);
+    v3.set_jetty_id(9);
+    v3.set_eid(std::string(16, '\1'));
+    v3.set_uasid(1);
+    v3.set_tp_type(URMA_CTP);
+    v3.set_seg_eid(std::string(16, '\2'));
+    v3.set_seg_uasid(2);
+    v3.set_seg_va(0x2000);
+    v3.set_seg_len(8192);
+    v3.set_seg_token_id(3);
+    std::string v3_payload;
+    ASSERT_TRUE(v3.SerializeToString(&v3_payload));
+
+    urma::UrmaHandshakeAdapter v3_adapter(nullptr, 3);
+    ASSERT_EQ(handshake::STEP_OK, v3_adapter.ParseHello(v3_payload));
+    EXPECT_EQ(9u, v3_adapter.remote().jetty_id);
+    EXPECT_EQ(handshake::FrameSpec::U32_BODY_LENGTH,
+              v3_adapter.HelloFrameSpec().length_encoding);
+}
+
 // ---------------------------------------------------------------------------
 // CreateServerHandshakeByMagic dispatches on the magic bytes.
 // ---------------------------------------------------------------------------

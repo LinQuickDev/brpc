@@ -30,6 +30,7 @@ namespace brpc {
 class TcpTransport;
 class RdmaTransport;
 class UBShmTransport;
+class UrmaTransport;
 
 // The top-level Transport installed in Socket. It starts on TcpTransport and
 // may switch to an independent RDMA/URMA/UBSHM Transport after a successful
@@ -38,6 +39,7 @@ class AdapterTransport : public Transport {
     friend class TransportFactory;
     friend class RdmaTransport;
     friend class UBShmTransport;
+    friend class UrmaTransport;
 public:
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;

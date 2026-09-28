@@ -34,6 +34,7 @@ namespace brpc {
 // resolves _urma_state to URMA_ON or URMA_OFF.
 class UrmaTransport : public Transport {
     friend class TransportFactory;
+    friend class AdapterTransport;
     friend class urma::UrmaEndpoint;
     friend class urma::UrmaConnect;
     friend class urma::UrmaHandshakeServerV2;
@@ -61,6 +62,14 @@ public:
     }
 
     static int ContextInitOrDie(bool server_or_not, const void* options);
+
+    bool UpgradeReady() const { return _urma_ep != nullptr; }
+    int PrepareUpgradeResources(bool server_side);
+    int NegotiateUpgradeResources(const urma::ParsedHello& remote,
+                                  bool server_side);
+    void ActivateUpgrade();
+    void DeactivateUpgrade();
+    void SetHighSpeedAvailable(bool available);
 
 private:
     static bool OptionsAvailableForUrma(const ChannelOptions* opt);

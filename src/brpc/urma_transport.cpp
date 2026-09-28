@@ -39,29 +39,24 @@ namespace brpc {
 DECLARE_bool(urma_use_polling);
 DECLARE_bool(urma_disable_bthread);
 
+namespace urma {
+DECLARE_bool(urma_recv_zerocopy);
+}  // namespace urma
+
 void UrmaTransport::Init(Socket* socket, const SocketOptions& options) {
     CHECK(_urma_ep == nullptr);
     if (options.socket_mode == SOCKET_MODE_URMA) {
         _urma_ep = new (std::nothrow) urma::UrmaEndpoint(socket);
         if (!_urma_ep) {
-            const int saved_errno = errno;
-            PLOG(ERROR) << "Fail to create UrmaEndpoint";
-            socket->SetFailed(saved_errno, "Fail to create UrmaEndpoint: %s",
-                              berror(saved_errno));
+            PLOG(WARNING) << "Fail to create UrmaEndpoint, fallback to TCP";
+            _urma_state = URMA_OFF;
+        } else {
+            _urma_state = URMA_UNKNOWN;
         }
-        _urma_state = URMA_UNKNOWN;
     } else {
         _urma_state = URMA_OFF;
-        socket->_socket_mode = SOCKET_MODE_TCP;
     }
     _socket = socket;
-    _default_connect = options.app_connect;
-    _on_edge_trigger = options.on_edge_triggered_events;
-    if (options.need_on_edge_trigger && _on_edge_trigger == nullptr) {
-        _on_edge_trigger = urma::UrmaEndpoint::OnNewDataFromTcp;
-    }
-    _tcp_transport = std::make_shared<TcpTransport>();
-    _tcp_transport->Init(socket, options);
 }
 
 void UrmaTransport::Release() {
@@ -80,9 +75,6 @@ int UrmaTransport::Reset(int32_t /*expected_nref*/) {
 }
 
 std::shared_ptr<AppConnect> UrmaTransport::Connect() {
-    if (_default_connect == nullptr) {
-        return std::make_shared<urma::UrmaConnect>();
-    }
     return _default_connect;
 }
 
@@ -187,6 +179,62 @@ void UrmaTransport::Debug(std::ostream& os) {
     if (_urma_state.load(butil::memory_order_acquire) == URMA_ON &&
         _urma_ep) {
         _urma_ep->DebugInfo(os);
+    }
+}
+
+int UrmaTransport::PrepareUpgradeResources(bool server_side) {
+    if (!_urma_ep || _urma_ep->AllocateResources() < 0) {
+        return -1;
+    }
+    // A bonding provider must import the peer before receives are posted.
+    if ((!server_side || !urma::IsUrmaBondingDevice()) &&
+        _urma_ep->PostRecv(_urma_ep->_rq_size,
+                           urma::FLAGS_urma_recv_zerocopy) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int UrmaTransport::NegotiateUpgradeResources(
+    const urma::ParsedHello& remote, bool server_side) {
+    CHECK(_urma_ep != nullptr);
+    _urma_ep->ApplyRemoteHello(remote);
+    if (_urma_ep->ImportPeer(remote) < 0) {
+        return -1;
+    }
+    if (server_side && urma::IsUrmaBondingDevice() &&
+        _urma_ep->PostRecv(_urma_ep->_rq_size,
+                           urma::FLAGS_urma_recv_zerocopy) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+void UrmaTransport::ActivateUpgrade() {
+    CHECK(_urma_ep != nullptr);
+    _urma_state.store(URMA_ON, butil::memory_order_release);
+    _urma_ep->_state.store(urma::UrmaEndpoint::ESTABLISHED,
+                           butil::memory_order_release);
+    SocketUniquePtr socket;
+    if (Socket::Address(_socket->id(), &socket) == 0) {
+        _urma_ep->DispatchReceivedBytes(socket, 0);
+    }
+}
+
+void UrmaTransport::DeactivateUpgrade() {
+    _urma_state.store(URMA_OFF, butil::memory_order_release);
+    if (_urma_ep) {
+        _urma_ep->_state.store(urma::UrmaEndpoint::FALLBACK_TCP,
+                               butil::memory_order_release);
+        _urma_ep->DeallocateResources();
+    }
+}
+
+void UrmaTransport::SetHighSpeedAvailable(bool available) {
+    if (available) {
+        ActivateUpgrade();
+    } else {
+        DeactivateUpgrade();
     }
 }
 
