@@ -27,11 +27,8 @@
 
 namespace brpc {
 
-// UrmaTransport is the Transport subclass for URMA (openEuler Unified Remote
-// Memory Access). It composes a TcpTransport for fallback (mirroring the
-// RdmaTransport / UBShmTransport design) and delegates the URMA data path to
-// the per-connection urma::UrmaEndpoint. Negotiation runs over the TCP fd and
-// resolves _urma_state to URMA_ON or URMA_OFF.
+// UrmaTransport owns the URMA data path. AdapterTransport owns TCP fallback
+// and selects this transport only after the handshake establishes URMA.
 class UrmaTransport : public Transport {
     friend class TransportFactory;
     friend class AdapterTransport;
@@ -84,7 +81,6 @@ private:
 
     urma::UrmaEndpoint* _urma_ep = nullptr;
     butil::atomic<UrmaState> _urma_state{URMA_UNKNOWN};
-    std::shared_ptr<TcpTransport> _tcp_transport;
 };
 
 }  // namespace brpc

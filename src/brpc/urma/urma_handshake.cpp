@@ -301,6 +301,11 @@ handshake::StepResult UrmaHandshakeAdapter::ParseHello(
             errno = EPROTO;
             return handshake::STEP_ERROR;
         }
+        // ParsedHello stores this as a byte. Reject an out-of-range protobuf
+        // value before narrowing it, otherwise e.g. 256 becomes a valid 0.
+        if (message.tp_type() > static_cast<uint32_t>(URMA_UTP)) {
+            return handshake::STEP_FALLBACK;
+        }
         TranslateV3Hello(message, &remote);
     } else {
         if (payload.size() < v2_wire::HELLO_BODY_LEN - sizeof(uint16_t)) {

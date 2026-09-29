@@ -79,29 +79,28 @@ std::shared_ptr<AppConnect> UrmaTransport::Connect() {
 }
 
 int UrmaTransport::CutFromIOBuf(butil::IOBuf* buf) {
-    // The URMA endpoint is not usable until negotiation and peer-resource
-    // import have completed. Keep using TCP while the state is UNKNOWN, and
-    // switch the data path only after the handshake publishes URMA_ON.
-    if (_urma_ep &&
-        _urma_state.load(butil::memory_order_acquire) == URMA_ON) {
-        butil::IOBuf* data_arr[1] = {buf};
-        return _urma_ep->CutFromIOBufList(data_arr, 1);
-    } else {
-        return _tcp_transport->CutFromIOBuf(buf);
+    // AdapterTransport selects TcpTransport until the handshake is established.
+    // Reaching this transport earlier is an error, not a second TCP fallback.
+    if (!_urma_ep ||
+        _urma_state.load(butil::memory_order_acquire) != URMA_ON) {
+        errno = ENOTCONN;
+        return -1;
     }
+    butil::IOBuf* data_arr[1] = {buf};
+    return _urma_ep->CutFromIOBufList(data_arr, 1);
 }
 
 ssize_t UrmaTransport::CutFromIOBufList(butil::IOBuf** buf, size_t ndata) {
-    if (_urma_ep &&
-        _urma_state.load(butil::memory_order_acquire) == URMA_ON) {
-        return _urma_ep->CutFromIOBufList(buf, ndata);
-    } else {
-        return _tcp_transport->CutFromIOBufList(buf, ndata);
+    if (!_urma_ep ||
+        _urma_state.load(butil::memory_order_acquire) != URMA_ON) {
+        errno = ENOTCONN;
+        return -1;
     }
+    return _urma_ep->CutFromIOBufList(buf, ndata);
 }
 
 int UrmaTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
-                                bool pollin, const timespec duetime) {
+                                bool /*pollin*/, const timespec duetime) {
     if (_urma_state.load(butil::memory_order_acquire) == URMA_ON) {
         const int expected_val =
             epollout_butex->load(butil::memory_order_acquire);
@@ -126,7 +125,8 @@ int UrmaTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
         }
         return 0;
     }
-    return _tcp_transport->WaitEpollOut(epollout_butex, pollin, duetime);
+    errno = ENOTCONN;
+    return 1;
 }
 
 void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
