@@ -529,14 +529,20 @@ public:
         _protocol = static_cast<urma::UrmaHandshakeAdapter*>(protocol);
     }
     StepResult PrepareResources() override {
-        return _transport->PrepareUpgradeResources(true) == 0
-            ? STEP_OK : STEP_FALLBACK;
+        if (_transport->PrepareUpgradeResources(true) == 0) {
+            return STEP_OK;
+        }
+        _transport->DeactivateUpgrade();
+        return STEP_FALLBACK;
     }
     StepResult NegotiateResources() override {
         CHECK(_protocol != NULL);
-        return _transport->NegotiateUpgradeResources(
-                   _protocol->remote(), true) == 0
-            ? STEP_OK : STEP_FALLBACK;
+        if (_transport->NegotiateUpgradeResources(
+                _protocol->remote(), true) == 0) {
+            return STEP_OK;
+        }
+        _transport->DeactivateUpgrade();
+        return STEP_FALLBACK;
     }
     void OnEstablished() override { _transport->ActivateUpgrade(); }
     void OnFallback() override { _transport->DeactivateUpgrade(); }
