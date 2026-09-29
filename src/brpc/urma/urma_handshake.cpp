@@ -521,8 +521,9 @@ namespace handshake {
 
 class UrmaServerHandshakeTransport : public HandshakeTransport {
 public:
-    explicit UrmaServerHandshakeTransport(UrmaTransport* transport)
-        : _transport(transport), _protocol(NULL) {}
+    UrmaServerHandshakeTransport(UrmaTransport* transport,
+                                 butil::IOBuf* source)
+        : _transport(transport), _source(source), _protocol(NULL) {}
 
     void OnProtocolSelected(HandshakeProtocol* protocol) override {
         _protocol = static_cast<urma::UrmaHandshakeAdapter*>(protocol);
@@ -540,9 +541,13 @@ public:
     void OnEstablished() override { _transport->ActivateUpgrade(); }
     void OnFallback() override { _transport->DeactivateUpgrade(); }
     void OnFailed() override { _transport->DeactivateUpgrade(); }
+    StepResult ValidateEstablished() override {
+        return _source->empty() ? STEP_OK : STEP_ERROR;
+    }
 
 private:
     UrmaTransport* _transport;
+    butil::IOBuf* _source;
     urma::UrmaHandshakeAdapter* _protocol;
 };
 
@@ -562,7 +567,7 @@ protected:
             protocols.push_back(owned[i].get());
         }
         IOBufHandshakeInput input(source);
-        UrmaServerHandshakeTransport participant(transport);
+        UrmaServerHandshakeTransport participant(transport, source);
         return adapter->handshake_session()->RunServer(
             protocols, &input, &participant, false);
     }
