@@ -27,7 +27,7 @@
 #include "brpc/destroyable.h"
 #include "brpc/handshake/rdma_handshake.h"
 #include "brpc/handshake/ubshm_handshake.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #if BRPC_WITH_RDMA
 #include "brpc/rdma/rdma_helper.h"
 #endif

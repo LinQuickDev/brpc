@@ -26,7 +26,7 @@
 #include "butil/atomicops.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #include "brpc/handshake/handshake_frame.h"
 #include "brpc/handshake/handshake_io.h"
 #include "brpc/urma/urma_handshake.pb.h"

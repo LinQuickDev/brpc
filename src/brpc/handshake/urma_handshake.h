@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_URMA_HANDSHAKE_H
-#define BRPC_URMA_HANDSHAKE_H
+#ifndef BRPC_HANDSHAKE_URMA_HANDSHAKE_H
+#define BRPC_HANDSHAKE_URMA_HANDSHAKE_H
 
 #include <cstddef>
 #include <cstdint>
@@ -218,4 +218,4 @@ int ReadBodyAndNegotiate(UrmaEndpoint* ep, ParsedHello* out, bool* negotiated);
 
 #endif  // BRPC_WITH_URMA
 
-#endif  // BRPC_URMA_HANDSHAKE_H
+#endif  // BRPC_HANDSHAKE_URMA_HANDSHAKE_H

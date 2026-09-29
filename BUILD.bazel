@@ -424,7 +424,10 @@ cc_library(
     deps = [
         ":butil",
     ]  + select({
-        "//bazel/config:with_babylon_counter": ["@babylon//:concurrent_counter"],
+        "//bazel/config:with_babylon_counter": [
+            "@babylon//:concurrent_counter",
+            "@babylon//:concurrent_thread_local",
+        ],
         "//conditions:default": [],
     }),
 )
@@ -539,6 +542,7 @@ brpc_proto_library(
 )
 
 URMA_SRC_PATTERNS = [
+    "src/brpc/handshake/urma_handshake.cpp",
     "src/brpc/urma/*.cpp",
     "src/brpc/urma/**/*.cpp",
 ]
