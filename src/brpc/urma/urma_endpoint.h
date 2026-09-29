@@ -36,7 +36,7 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 
 namespace brpc {
