@@ -124,6 +124,8 @@ jobs:
     steps:
     - uses: actions/checkout@v7.0.1
     - uses: ./.github/actions/install-essential-dependencies
+      with:
+        extra-packages: libgoogle-perftools-dev
 
     - name: Configure URMA mock tests
       run: |
