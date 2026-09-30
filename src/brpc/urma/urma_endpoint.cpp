@@ -742,6 +742,26 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
         const uint32_t remote_jetty_id = _resource->remote_jetty->id.id;
+        for (size_t i = 0; i < sge_index; ++i) {
+            const urma_sge_t& sge = sglist[i];
+            const uint64_t seg_base = sge.tseg->seg.ubva.va;
+            const uint64_t seg_len = sge.tseg->seg.len;
+            const bool in_range = sge.addr >= seg_base &&
+                sge.len <= seg_len && sge.addr - seg_base <= seg_len - sge.len;
+            VLOG(1) << "URMA send SGE: index=" << i
+                    << " addr=" << reinterpret_cast<const void*>(sge.addr)
+                    << " len=" << sge.len
+                    << " tseg=" << static_cast<const void*>(sge.tseg)
+                    << " seg_base=" << reinterpret_cast<const void*>(seg_base)
+                    << " seg_len=" << seg_len
+                    << " in_range=" << in_range
+                    << " from_pool=" << (GetPoolSegFor(
+                        reinterpret_cast<void*>(sge.addr)) == sge.tseg)
+                    << " context_matches="
+                    << (sge.tseg->urma_ctx == GetUrmaContext())
+                    << " local_jetty_id=" << local_jetty_id
+                    << " sq_slot=" << sq_slot;
+        }
 
         // Reserve both credits before making the WR visible to the provider.
         // In polling mode a completion (and even the peer's receive-credit
