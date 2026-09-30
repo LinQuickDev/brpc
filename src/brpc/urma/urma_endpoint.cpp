@@ -664,6 +664,7 @@ public:
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
+            sglist[*sge_index].user_tseg = nullptr;
             cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
