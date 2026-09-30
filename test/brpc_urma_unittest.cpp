@@ -16,7 +16,9 @@
 // under the License.
 
 #include <cstring>
+#include <errno.h>
 #include <limits>
+#include <vector>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 
@@ -24,9 +26,12 @@
 #include "butil/atomicops.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
+#include "brpc/handshake/handshake_frame.h"
+#include "brpc/handshake/handshake_io.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma_transport.h"
 #include "urma_types.h"
 
 using namespace brpc;
@@ -137,6 +142,194 @@ TEST(UrmaHandshakeTest, v3_protobuf_roundtrip) {
     EXPECT_EQ(msg.seg_va(), msg2.seg_va());
     EXPECT_EQ(msg.seg_len(), msg2.seg_len());
     EXPECT_EQ(msg.seg_token_id(), msg2.seg_token_id());
+}
+
+TEST(UrmaHandshakeTest, common_adapter_parses_v2_and_v3_hello) {
+    urma::v2_wire::HelloMessage v2{};
+    v2.msg_len = urma::v2_wire::HELLO_PACKET_LEN;
+    v2.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+    v2.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+    v2.buffer_size = 8192;
+    v2.recv_buffer_cnt = 127;
+    v2.jetty_id = 7;
+    v2.tp_type = URMA_CTP;
+    v2.seg_va = 0x1000;
+    v2.seg_len = 8192;
+    uint8_t v2_body[urma::v2_wire::HELLO_BODY_LEN];
+    v2.Serialize(v2_body);
+    const std::string v2_payload(
+        reinterpret_cast<const char*>(v2_body + sizeof(uint16_t)),
+        sizeof(v2_body) - sizeof(uint16_t));
+
+    urma::UrmaHandshakeAdapter v2_adapter(nullptr, 2);
+    ASSERT_EQ(handshake::STEP_OK, v2_adapter.ParseHello(v2_payload));
+    EXPECT_EQ(7u, v2_adapter.remote().jetty_id);
+    EXPECT_EQ(urma::v2_wire::HELLO_PACKET_LEN,
+              v2_adapter.HelloFrameSpec().min_frame_len);
+
+    urma::UrmaHello v3;
+    v3.set_buffer_size(8192);
+    v3.set_recv_buffer_cnt(127);
+    v3.set_jetty_id(9);
+    v3.set_eid(std::string(16, '\1'));
+    v3.set_uasid(1);
+    v3.set_tp_type(URMA_CTP);
+    v3.set_seg_eid(std::string(16, '\2'));
+    v3.set_seg_uasid(2);
+    v3.set_seg_va(0x2000);
+    v3.set_seg_len(8192);
+    v3.set_seg_token_id(3);
+    std::string v3_payload;
+    ASSERT_TRUE(v3.SerializeToString(&v3_payload));
+
+    urma::UrmaHandshakeAdapter v3_adapter(nullptr, 3);
+    ASSERT_EQ(handshake::STEP_OK, v3_adapter.ParseHello(v3_payload));
+    EXPECT_EQ(9u, v3_adapter.remote().jetty_id);
+    EXPECT_EQ(handshake::FrameSpec::U32_BODY_LENGTH,
+              v3_adapter.HelloFrameSpec().length_encoding);
+}
+
+TEST(UrmaHandshakeTest, common_adapter_rejects_oversized_v3_tp_type) {
+    urma::UrmaHello message;
+    message.set_buffer_size(8192);
+    message.set_recv_buffer_cnt(127);
+    message.set_jetty_id(9);
+    message.set_eid(std::string(16, '\1'));
+    message.set_uasid(1);
+    message.set_tp_type(256);
+    message.set_seg_eid(std::string(16, '\2'));
+    message.set_seg_uasid(2);
+    message.set_seg_va(0x2000);
+    message.set_seg_len(8192);
+    message.set_seg_token_id(3);
+    std::string payload;
+    ASSERT_TRUE(message.SerializeToString(&payload));
+
+    urma::UrmaHandshakeAdapter adapter(nullptr, 3);
+    EXPECT_EQ(handshake::STEP_FALLBACK, adapter.ParseHello(payload));
+}
+
+TEST(UrmaHandshakeTest, common_frames_preserve_fragmented_and_coalesced_data) {
+    for (int version = 2; version <= 3; ++version) {
+        urma::UrmaHandshakeAdapter adapter(nullptr, version);
+        std::string hello;
+        ASSERT_EQ(handshake::STEP_OK, adapter.BuildHello(false, &hello));
+        std::string frame;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            adapter.HelloFrameSpec(), hello, &frame));
+
+        butil::IOBuf source;
+        source.append(frame.data(), 3);
+        handshake::IOBufHandshakeInput input(&source);
+        std::string parsed;
+        EXPECT_EQ(handshake::FRAME_NEED_MORE,
+                  handshake::FrameCodec::ParseBufferedFrame(
+                      &input, adapter.HelloFrameSpec(), &parsed));
+        EXPECT_EQ(3u, source.size());
+
+        source.append(frame.data() + 3, frame.size() - 3);
+        source.append("RPC", 3);
+        ASSERT_EQ(handshake::FRAME_OK,
+                  handshake::FrameCodec::ParseBufferedFrame(
+                      &input, adapter.HelloFrameSpec(), &parsed));
+        EXPECT_EQ(hello, parsed);
+        EXPECT_EQ(3u, source.size());
+        EXPECT_EQ("RPC", source.to_string());
+    }
+}
+
+TEST(UrmaTransportTest, inactive_data_path_fails_without_tcp_delegate) {
+    UrmaTransport transport;
+    butil::IOBuf data;
+    butil::IOBuf* list[] = {&data};
+    errno = 0;
+    EXPECT_EQ(-1, transport.CutFromIOBuf(&data));
+    EXPECT_EQ(ENOTCONN, errno);
+    errno = 0;
+    EXPECT_EQ(-1, transport.CutFromIOBufList(list, 1));
+    EXPECT_EQ(ENOTCONN, errno);
+
+    butil::atomic<int> epollout_butex(0);
+    const timespec duetime = {};
+    errno = 0;
+    EXPECT_EQ(1, transport.WaitEpollOut(&epollout_butex, false, duetime));
+    EXPECT_EQ(ENOTCONN, errno);
+}
+
+class CapturingUrmaHandshakeIO : public handshake::HandshakeIO {
+public:
+    int ReadExact(void*, size_t) override { return -1; }
+    int WriteAll(const void* data, size_t len) override {
+        output.append(static_cast<const char*>(data), len);
+        return 0;
+    }
+    int PushBack(const void*, size_t) override { return -1; }
+
+    std::string output;
+};
+
+class FailingUrmaResources : public handshake::HandshakeTransport {
+public:
+    FailingUrmaResources() : version(0), fallback(false), failed(false) {}
+    void OnProtocolSelected(handshake::HandshakeProtocol* protocol) override {
+        version = protocol->ProtocolVersion();
+    }
+    handshake::StepResult PrepareResources() override {
+        return handshake::STEP_FALLBACK;
+    }
+    handshake::StepResult NegotiateResources() override {
+        return handshake::STEP_ERROR;
+    }
+    void OnEstablished() override { ADD_FAILURE() << "Unexpected upgrade"; }
+    void OnFallback() override { fallback = true; }
+    void OnFailed() override { failed = true; }
+
+    int version;
+    bool fallback;
+    bool failed;
+};
+
+TEST(UrmaHandshakeTest, common_server_fallback_preserves_coalesced_rpc) {
+    urma::v2_wire::HelloMessage hello{};
+    hello.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+    hello.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+    hello.buffer_size = 8192;
+    hello.recv_buffer_cnt = 127;
+    hello.jetty_id = 7;
+    hello.tp_type = URMA_CTP;
+    hello.seg_va = 0x1000;
+    hello.seg_len = 8192;
+    uint8_t body[urma::v2_wire::HELLO_BODY_LEN];
+    hello.Serialize(body);
+    const std::string payload(
+        reinterpret_cast<const char*>(body + sizeof(uint16_t)),
+        sizeof(body) - sizeof(uint16_t));
+    urma::UrmaHandshakeAdapter protocol(nullptr, 2);
+    std::string frame;
+    ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+        protocol.HelloFrameSpec(), payload, &frame));
+
+    butil::IOBuf source;
+    source.append(frame);
+    const uint32_t disabled_ack = 0;
+    source.append(&disabled_ack, sizeof(disabled_ack));
+    source.append("RPC", 3);
+    handshake::IOBufHandshakeInput input(&source);
+    CapturingUrmaHandshakeIO io;
+    handshake::HandshakeSession session;
+    session.SetIOForTest(&io);
+    FailingUrmaResources transport;
+    std::vector<handshake::HandshakeProtocol*> protocols(1, &protocol);
+
+    EXPECT_EQ(handshake::STEP_FALLBACK,
+              session.RunServer(protocols, &input, &transport, false));
+    EXPECT_EQ(handshake::FALLBACK_TCP, session.phase());
+    EXPECT_EQ(2, transport.version);
+    EXPECT_TRUE(transport.fallback);
+    EXPECT_FALSE(transport.failed);
+    EXPECT_EQ("RPC", source.to_string());
+    EXPECT_EQ(urma::v2_wire::HELLO_PACKET_LEN, io.output.size());
+    EXPECT_EQ("URMA", io.output.substr(0, 4));
 }
 
 // ---------------------------------------------------------------------------
