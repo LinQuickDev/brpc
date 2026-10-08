@@ -268,6 +268,8 @@ protected:
 
     SocketUniquePtr _wait_socket;
 
+    void VerifyCompleteFallbackRPC();
+
     butil::TempFile _server_list;
     std::string _naming_url;
 
@@ -1031,7 +1033,7 @@ TEST_F(RdmaTest, server_stops_parsing_tcp_fd_once_rdma_is_on) {
     StopServer();
 }
 
-TEST_F(RdmaTest, server_serves_complete_rpc_after_fallback_ack) {
+void RdmaTest::VerifyCompleteFallbackRPC() {
     StartServer();
     butil::fd_guard sockfd;
     ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
@@ -1082,10 +1084,20 @@ TEST_F(RdmaTest, server_serves_complete_rpc_after_fallback_ack) {
     ASSERT_EQ(1, echo.code_list_size());
     ASSERT_EQ(42, echo.code_list(0));
     ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
+    auto* transport = RdmaTransportOf(s);
+    EXPECT_EQ(RdmaTransport::RDMA_OFF, transport->_rdma_state);
+    EXPECT_EQ(nullptr, transport->_rdma_ep->_resource);
+    EXPECT_EQ(INVALID_SOCKET_ID, transport->_rdma_ep->_cq_sid);
+    EXPECT_EQ(0, transport->_rdma_ep->_remote_rq_window_size.load(
+        butil::memory_order_relaxed));
     ASSERT_FALSE(s->Failed());
     sockfd.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());
     StopServer();
+}
+
+TEST_F(RdmaTest, server_serves_complete_rpc_after_fallback_ack) {
+    ASSERT_NO_FATAL_FAILURE(VerifyCompleteFallbackRPC());
 }
 
 TEST_F(RdmaTest, server_parses_qp_stream_after_rdma_is_on) {
@@ -2427,6 +2439,11 @@ public:
 private:
     bool _saved;
 };
+
+TEST_F(RdmaTest, allocation_failure_cleans_endpoint_and_serves_complete_rpc) {
+    ResourceAllocFailGuard alloc_fail_guard(true);
+    ASSERT_NO_FATAL_FAILURE(VerifyCompleteFallbackRPC());
+}
 
 TEST_F(RdmaTest, client_alloc_resource_fail_fallback_tcp) {
     StartServer();
