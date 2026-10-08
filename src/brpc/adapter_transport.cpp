@@ -171,15 +171,19 @@ class UBShmClientHandshakeTransport : public handshake::HandshakeTransport {
 public:
     UBShmClientHandshakeTransport(
         UBShmTransport* transport, ubring::SHM* local_shm,
-        const std::string& shm_name, Socket* socket, int* connect_error)
+        const std::string& shm_name, ubring::UBShmHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
         : _transport(transport), _local_shm(local_shm),
-          _shm_name(shm_name), _socket(socket),
+          _shm_name(shm_name), _protocol(protocol), _socket(socket),
           _connect_error(connect_error) {}
 
     handshake::StepResult PrepareResources() override {
-        return _transport->PrepareUpgradeResources(
-                   _local_shm, _shm_name.c_str()) == 0
-            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+        if (_transport->PrepareUpgradeResources(
+                _local_shm, _shm_name.c_str()) != 0) {
+            return handshake::STEP_FALLBACK;
+        }
+        _protocol->ConfigureClientHello(*_local_shm);
+        return handshake::STEP_OK;
     }
 
     handshake::StepResult NegotiateResources() override {
@@ -205,6 +209,7 @@ private:
     UBShmTransport* _transport;
     ubring::SHM* _local_shm;
     std::string _shm_name;
+    ubring::UBShmHandshakeAdapter* _protocol;
     Socket* _socket;
     int* _connect_error;
 };
@@ -383,9 +388,8 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         const auto shm_name_str =
             butil::endpoint2str(socket->local_side());
         ubring::UBShmHandshakeAdapter wire;
-        wire.ConfigureClientHello(local_shm_len, shm_name_str.c_str());
         UBShmClientHandshakeTransport participant(
-            transport, &local_trx_shm, shm_name_str.c_str(), socket,
+            transport, &local_trx_shm, shm_name_str.c_str(), &wire, socket,
             &connect_error);
         const handshake::StepResult result = adapter->_handshake.RunClient(
             &wire, &participant);
@@ -585,7 +589,9 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
         return;
     }
 
-    InputMessenger::OnNewMessages(socket);
+    InputMessenger::OnNewMessagesUntil(socket, [](Socket* s) {
+        return Get(s)->handshake_phase() == handshake::ESTABLISHED;
+    });
 
 #if BRPC_WITH_RDMA
     if (adapter->_mode == SOCKET_MODE_RDMA &&
@@ -605,6 +611,9 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
         }
     }
 #endif
+    if (adapter->handshake_phase() == handshake::ESTABLISHED) {
+        adapter->CheckUnexpectedTcpData();
+    }
 }
 
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {

@@ -95,6 +95,9 @@ public:
         const std::string& payload) override;
 
     void ConfigureClientHello(uint64_t len, const char* shm_name);
+    void ConfigureClientHello(const SHM& local_shm) {
+        ConfigureClientHello(local_shm.len, local_shm.name);
+    }
     void ConfigureServerReply(uint64_t len) {
         _local_len = len;
         _server_reply = true;

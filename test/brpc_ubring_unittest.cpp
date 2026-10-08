@@ -257,6 +257,20 @@ TEST(UBShmHandshakeAdapterTest, short_name_is_zero_padded) {
     }
 }
 
+TEST(UBShmHandshakeAdapterTest, client_hello_advertises_allocated_shm_name) {
+    brpc::ubring::SHM local_shm{};
+    local_shm.len = 4096;
+    strcpy(local_shm.name, "UBRING_127.0.0.1:8000_C");
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    adapter.ConfigureClientHello(local_shm);
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK, adapter.BuildHello(true, &payload));
+    brpc::ubring::HelloMessage decoded{};
+    ASSERT_EQ(brpc::handshake::STEP_OK, adapter.ParseHello(payload, &decoded));
+    EXPECT_EQ(local_shm.len, decoded.len);
+    EXPECT_STREQ(local_shm.name, decoded.shm_name);
+}
+
 TEST(UBShmHandshakeAdapterTest, rejects_unterminated_remote_name) {
     brpc::ubring::HelloMessage message{};
     message.msg_len = 64;
