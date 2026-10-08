@@ -75,6 +75,9 @@ public:
     // Whether the endpoint can send more data
     bool IsWritable() const;
 
+    // Start receiving only after the TCP handshake parser has returned.
+    void StartReceiveEvents();
+
     void PollerRegisterEpollOut(bool pollin) {
         uint32_t events = EPOLLOUT | EPOLLET;
         if (pollin) {
@@ -162,6 +165,8 @@ private:
         std::atomic<bool> running;
     };
     static std::vector<PollerGroup> _poller_groups;
+
+    butil::atomic<bool> _receive_events_started{false};
 
     void PollerRegisterEvent(PollerSidOp::OpType op, uint32_t events = EPOLLET);
 };
