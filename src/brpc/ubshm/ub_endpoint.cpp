@@ -61,6 +61,7 @@ UBShmEndpoint::~UBShmEndpoint() {
 }
 
 void UBShmEndpoint::Reset() {
+    _receive_events_started.store(false, butil::memory_order_release);
     DeallocateResources();
 
     delete _ub_ring;
@@ -164,7 +165,6 @@ int UBShmEndpoint::AllocateClientResources(ubring::SHM *local_trx_shm,
         errno = saved_errno;
         return ret;
     }
-    PollerRegisterEvent(PollerSidOp::ADD, EPOLLIN);
     return 0;
 }
 
@@ -201,8 +201,23 @@ int UBShmEndpoint::AllocateServerResources(ubring::SHM *remote_trx_shm,
         errno = saved_errno;
         return ret;
     }
-    PollerRegisterEvent(PollerSidOp::ADD, EPOLLIN);
     return ret;
+}
+
+void UBShmEndpoint::StartReceiveEvents() {
+    if (g_skip_ub_init || _ub_ring == nullptr ||
+        _poller_sid == INVALID_SOCKET_ID ||
+        _receive_events_started.load(butil::memory_order_acquire)) {
+        return;
+    }
+    // The last TCP parse pins the handshake handler on NOT_ENOUGH_DATA.
+    // Release that preference before the first shared-memory RPC is parsed.
+    _socket->set_preferred_index(-1);
+    if (!_receive_events_started.exchange(true, butil::memory_order_acq_rel)) {
+        // The poller is level-triggered: bytes queued before registration are
+        // picked up on its first scan, without needing another peer write.
+        PollerRegisterEvent(PollerSidOp::ADD, EPOLLIN);
+    }
 }
 
 void UBShmEndpoint::DeallocateResources() {
@@ -222,6 +237,9 @@ void UBShmEndpoint::DeallocateResources() {
 }
 
 void UBShmEndpoint::PollIn(UBShmEndpoint* ep, uint32_t ep_event) {
+    if (!ep->_receive_events_started.load(butil::memory_order_acquire)) {
+        return;
+    }
     SocketUniquePtr s;
     if (Socket::Address(ep->_socket_id, &s) < 0) {
         return;

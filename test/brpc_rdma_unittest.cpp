@@ -294,16 +294,6 @@ static int WaitForHandshakePhase(Socket* s, handshake::Phase expected) {
 #define ASSERT_HANDSHAKE_PHASE(expected, socket) \
     ASSERT_EQ(expected, WaitForHandshakePhase(socket, expected))
 
-// Only observe the atomic read timestamp, never the IO thread's mutable IOBuf.
-// Callers snapshot it before writing to the otherwise idle connection. This
-// observes a read event, not publication of the parser's mutable buffer.
-static bool WaitForSocketRead(Socket* s, int64_t previous_read_us) {
-    return WaitUntil([s, previous_read_us] {
-        return s->_last_readtime_us.load(butil::memory_order_relaxed) !=
-            previous_read_us;
-    });
-}
-
 static void MakeV2ClientHello(uint8_t (&data)[rdma::HELLO_V2_MSG_LEN_MIN]) {
     rdma::v2_wire::HelloMessage msg{};
     msg.msg_len = rdma::HELLO_V2_MSG_LEN_MIN;
@@ -414,16 +404,7 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
 
     uint8_t data[rdma::HELLO_V2_MSG_LEN_MIN];
     memcpy(data, "PRPC", 4);  // send as normal baidu_std protocol
-    const int64_t previous_read_us =
-        s->_last_readtime_us.load(butil::memory_order_relaxed);
-    ASSERT_TRUE(WriteAll(sockfd, data, 4));
-    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
-    // A non-RDMA magic makes the transport-handshake parser return TRY_OTHERS
-    // and hand the bytes to other protocols; it does not touch the endpoint
-    // state, so it stays UNINIT (the old blocking handshake used to set
-    // FALLBACK_TCP here).
-    ASSERT_EQ(handshake::UNINITIALIZED,
-              AdapterTransport::Get(s)->handshake_phase());
+    ASSERT_EQ(4, write(sockfd, data, 4));
 
     StopServer();
 }
@@ -446,14 +427,9 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RD", 2);
-    const int64_t previous_read_us =
-        s->_last_readtime_us.load(butil::memory_order_relaxed);
     ASSERT_EQ(2, write(sockfd1, data, 2));  // break in magic str
-    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
-    // Fewer than 4 magic bytes leave the handshake uninitialized while the
-    // parser waits for the rest of the magic.
-    ASSERT_EQ(handshake::UNINITIALIZED,
-              AdapterTransport::Get(s)->handshake_phase());
+    // Close and wait for teardown. Parser phase assertions for incomplete
+    // magic belong to the synchronous common-handshake regression test.
     sockfd1.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());
 
@@ -963,16 +939,12 @@ TEST_F(RdmaTest, server_accepts_data_pipelined_behind_fallback_ack) {
     const uint32_t flags = butil::HostToNet32(0);
     memcpy(ack_and_data, &flags, rdma::HELLO_ACK_LEN);
     memcpy(ack_and_data + rdma::HELLO_ACK_LEN, "PRPC", 4);
-    const int64_t previous_read_us =
-        s->_last_readtime_us.load(butil::memory_order_relaxed);
     ASSERT_TRUE(WriteAll(sockfd, ack_and_data, sizeof(ack_and_data)));
 
-    // Observe fallback and an atomic read event without inspecting the IO
-    // thread's buffer. The complete-RPC test below verifies parser handoff.
+    // The complete-RPC test below verifies parser handoff.
     ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
     ASSERT_EQ(RdmaTransport::RDMA_OFF, transport->_rdma_state);
     ASSERT_TRUE(GetSocketFromServer(0) != nullptr);
-    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
 
     sockfd.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());
@@ -1178,13 +1150,9 @@ TEST_F(RdmaTest, fd_and_qp_input_streams_are_separate) {
     ASSERT_NE(&fd_stream, &qp_stream);
     ASSERT_NE(&fd_stream.read_buf(), &qp_stream.read_buf());
 
-    // Two magic bytes are too few to dispatch on, so they stay buffered. In the
-    // fd stream, and only there.
-    const int64_t previous_read_us =
-        s->_last_readtime_us.load(butil::memory_order_relaxed);
+    // Exercise close with an incomplete prefix without inspecting the IO
+    // thread's buffer or treating a read timestamp as parser completion.
     ASSERT_TRUE(WriteAll(sockfd, "RD", 2));
-    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
-    ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
 
     sockfd.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());

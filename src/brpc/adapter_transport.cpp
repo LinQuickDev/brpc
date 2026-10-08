@@ -397,6 +397,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             transport->GetUBShmEp()->SetNegotiatedDataFormat(
                 ubring::UBR_DATA_FORMAT_LEGACY_64);
             transport->FinishUpgrade();
+            transport->GetUBShmEp()->StartReceiveEvents();
         }
         if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
@@ -609,6 +610,14 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
                 "Fail to start RDMA CQ events from %s: %s",
                 socket->description().c_str(), berror(saved_errno));
         }
+    }
+#endif
+#if BRPC_WITH_UBRING
+    if (adapter->_mode == SOCKET_MODE_UBRING &&
+        adapter->handshake_phase() == handshake::ESTABLISHED) {
+        UBShmTransport* transport = static_cast<UBShmTransport*>(
+            adapter->_high_speed_transport.get());
+        transport->GetUBShmEp()->StartReceiveEvents();
     }
 #endif
     if (adapter->handshake_phase() == handshake::ESTABLISHED) {

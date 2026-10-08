@@ -33,6 +33,7 @@
 #include "bthread/bthread.h"
 #include "brpc/acceptor.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/channel.h"
 #include "brpc/controller.h"
 #include "brpc/policy/baidu_rpc_meta.pb.h"
 #include "brpc/policy/baidu_rpc_protocol.h"
@@ -622,6 +623,180 @@ TEST_F(UBShmEndpointTest, malformed_hello_releases_allocated_ring_and_poller) {
     butil::fd_guard removed(shm_open(local.name, O_RDONLY, 0));
     EXPECT_LT(removed, 0);
     EXPECT_EQ(ENOENT, errno);
+}
+
+TEST_F(UBShmEndpointTest, shared_memory_rpc_waits_for_final_tcp_ack) {
+    UBFallbackEchoService service;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions options;
+    options.socket_mode = brpc::SOCKET_MODE_UBRING;
+    options.enabled_protocols = "baidu_std";
+    options.internal_port = -1;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &options));
+
+    brpc::SocketUniquePtr server_socket;
+    brpc::SocketUniquePtr client_socket;
+    butil::fd_guard peer(::socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_GE(peer, 0);
+    timeval timeout = {5, 0};
+    ASSERT_EQ(0, setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO,
+                           &timeout, sizeof(timeout)));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(server.listen_address().port);
+    ASSERT_EQ(0, connect(peer, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)));
+    ASSERT_TRUE(WaitForUBCondition([&] {
+        std::vector<brpc::SocketId> ids;
+        server._am->ListConnections(&ids);
+        return !ids.empty() && brpc::Socket::Address(ids[0], &server_socket) == 0;
+    }));
+
+    brpc::SocketOptions client_options;
+    client_options.socket_mode = brpc::SOCKET_MODE_UBRING;
+    brpc::SocketId client_id;
+    ASSERT_EQ(0, brpc::Socket::Create(client_options, &client_id));
+    ASSERT_EQ(0, brpc::Socket::Address(client_id, &client_socket));
+    BRPC_SCOPE_EXIT { client_socket->SetFailed(); };
+    auto* client_transport = brpc::UBShmTransport::Get(client_socket.get());
+    brpc::ubring::SHM local{};
+    local.len = 4 * 1024 * 1024;
+    local.fd = peer;
+    const std::string name = "ack_race_" + std::to_string(getpid());
+    ASSERT_EQ(0, client_transport->PrepareUpgradeResources(&local, name.c_str()));
+    brpc::ubring::UBShmHandshakeAdapter protocol;
+    protocol.ConfigureClientHello(local);
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK, protocol.BuildHello(true, &payload));
+    std::string hello;
+    ASSERT_EQ(brpc::handshake::FRAME_OK, brpc::handshake::FrameCodec::Encode(
+        protocol.HelloFrameSpec(), payload, &hello));
+    ASSERT_TRUE(TransferUBTestBytes(peer, &hello[0], hello.size(), true));
+    char reply[64];
+    ASSERT_TRUE(TransferUBTestBytes(peer, reply, sizeof(reply), false));
+    brpc::ubring::HelloMessage server_hello{};
+    server_hello.Deserialize(reply + 2);
+    ASSERT_GT(server_hello.len, 0u);
+    std::string extension_payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              protocol.BuildExtension(true, &extension_payload));
+    std::string extension;
+    ASSERT_EQ(brpc::handshake::FRAME_OK, brpc::handshake::FrameCodec::Encode(
+        protocol.ExtensionFrameSpec(), extension_payload, &extension));
+    ASSERT_TRUE(TransferUBTestBytes(peer, &extension[0], extension.size(), true));
+    char extension_reply[brpc::ubring::HelloFormatExtension::WIRE_SIZE];
+    ASSERT_TRUE(TransferUBTestBytes(peer, extension_reply,
+                                   sizeof(extension_reply), false));
+    auto* adapter = brpc::AdapterTransport::Get(server_socket.get());
+    ASSERT_TRUE(WaitForUBCondition([&] {
+        return adapter->handshake_phase() == brpc::handshake::ACK_WAIT;
+    }));
+    ASSERT_EQ(0, client_transport->NegotiateUpgradeResources(&local, name.c_str()));
+
+    test::EchoRequest request;
+    request.set_message("RPC queued before the final ACK");
+    brpc::Controller cntl;
+    butil::IOBuf body;
+    brpc::policy::SerializeRpcRequest(&body, &cntl, &request);
+    butil::IOBuf packet;
+    brpc::policy::PackRpcRequest(&packet, nullptr, 201,
+        test::EchoService::descriptor()->FindMethodByName("Echo"),
+        &cntl, body, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+    const std::string bytes = packet.to_string();
+    iovec data{const_cast<char*>(bytes.data()), bytes.size()};
+    auto* client_ring = client_transport->GetUBShmEp()->_ub_ring;
+    ASSERT_EQ(static_cast<ssize_t>(bytes.size()), client_ring->UbrTrxWritev(&data, 1));
+
+    auto* server_ep = brpc::UBShmTransport::Get(server_socket.get())->GetUBShmEp();
+    EXPECT_FALSE(server_ep->_receive_events_started.load(butil::memory_order_acquire));
+    // Invoke a would-be early poll synchronously while ACK is deliberately
+    // withheld. It must not feed PRPC bytes into the TCP handshake context.
+    ASSERT_NE(nullptr, server_socket->parsing_context());
+    brpc::ubring::UBShmEndpoint::PollIn(server_ep, EPOLLIN);
+    EXPECT_EQ(brpc::handshake::ACK_WAIT, adapter->handshake_phase());
+    EXPECT_FALSE(server_socket->Failed());
+
+    uint32_t ack = butil::HostToNet32(1);
+    ASSERT_TRUE(TransferUBTestBytes(peer, &ack, sizeof(ack), true));
+    // No second SHM write: registering level-triggered receive polling must
+    // pick up the request that was already queued before the ACK.
+    butil::IOPortal response;
+    ASSERT_TRUE(WaitForUBCondition([&] {
+        const ssize_t n = response.append_from_reader(client_ring, 65536);
+        if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            return true;
+        }
+        if (response.size() < 12) {
+            return false;
+        }
+        uint8_t header[12];
+        response.copy_to(header, sizeof(header));
+        uint32_t total_size;
+        memcpy(&total_size, header + 4, sizeof(total_size));
+        return response.size() >= 12 + butil::NetToHost32(total_size);
+    }));
+    const std::string received = response.to_string();
+    ASSERT_GE(received.size(), 12u);
+    ASSERT_EQ(0, memcmp(received.data(), "PRPC", 4));
+    uint32_t meta_size;
+    memcpy(&meta_size, received.data() + 8, sizeof(meta_size));
+    meta_size = butil::NetToHost32(meta_size);
+    ASSERT_LE(meta_size, received.size() - 12);
+    brpc::policy::RpcMeta meta;
+    ASSERT_TRUE(meta.ParseFromArray(received.data() + 12, meta_size));
+    EXPECT_EQ(201u, meta.correlation_id());
+    EXPECT_EQ(0, meta.response().error_code());
+    test::EchoResponse echo;
+    ASSERT_TRUE(echo.ParseFromArray(received.data() + 12 + meta_size,
+                                   received.size() - 12 - meta_size));
+    EXPECT_EQ(request.message(), echo.message());
+    EXPECT_EQ(brpc::handshake::ESTABLISHED, adapter->handshake_phase());
+    EXPECT_TRUE(server_ep->_receive_events_started.load(butil::memory_order_acquire));
+    client_transport->DeactivateUpgrade();
+    peer.reset(-1);
+    server_socket.reset();
+    server.Stop(0);
+    server.Join();
+}
+
+TEST_F(UBShmEndpointTest, upgraded_client_receives_shared_memory_rpc_responses) {
+    UBFallbackEchoService service;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions server_options;
+    server_options.socket_mode = brpc::SOCKET_MODE_UBRING;
+    server_options.enabled_protocols = "baidu_std";
+    server_options.internal_port = -1;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    {
+        brpc::Channel channel;
+        brpc::ChannelOptions options;
+        options.socket_mode = brpc::SOCKET_MODE_UBRING;
+        options.timeout_ms = 5000;
+        ASSERT_EQ(0, channel.Init(server.listen_address(), &options));
+        test::EchoService_Stub stub(&channel);
+        for (int i = 0; i < 2; ++i) {
+            brpc::Controller cntl;
+            test::EchoRequest request;
+            request.set_message(std::string(1024, 'a' + i));
+            test::EchoResponse response;
+            stub.Echo(&cntl, &request, &response, nullptr);
+            ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+            EXPECT_EQ(request.message(), response.message());
+        }
+        std::vector<brpc::SocketId> ids;
+        server._am->ListConnections(&ids);
+        ASSERT_EQ(1u, ids.size());
+        brpc::SocketUniquePtr socket;
+        ASSERT_EQ(0, brpc::Socket::Address(ids[0], &socket));
+        EXPECT_EQ(brpc::handshake::ESTABLISHED,
+                  brpc::AdapterTransport::Get(socket.get())->handshake_phase());
+        EXPECT_TRUE(brpc::UBShmTransport::Get(socket.get())->UpgradeActive());
+    }
+    server.Stop(0);
+    server.Join();
 }
 
 // The receive paths (UbrTrxRecvBlockMode / StartReadv) read `msg_len' and
