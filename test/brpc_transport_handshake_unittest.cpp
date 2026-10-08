@@ -373,7 +373,7 @@ TEST(TransportHandshakeTest, publish_fallback_after_tcp_state) {
     session.SetPhase(NEGOTIATING);
     session.PublishFallback([&tcp_active]() { tcp_active = 1; });
     ASSERT_EQ(1, tcp_active);
-    ASSERT_EQ(FALLBACK_TCP, session.phase());
+    ASSERT_EQ(FALLBACK_TCP, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, client_runs_codec_and_resource_sequence) {
@@ -388,7 +388,7 @@ TEST(TransportHandshakeTest, client_runs_codec_and_resource_sequence) {
     ASSERT_EQ(STEP_OK, session.RunClient(&protocol, &transport));
     ASSERT_EQ("prepare build parse negotiate ack1 activate", calls);
     ASSERT_EQ("HSLO1", io.output());
-    ASSERT_EQ(ESTABLISHED, session.phase());
+    ASSERT_EQ(ESTABLISHED, session.phase(butil::memory_order_acquire));
     ASSERT_EQ(7, session.protocol_version());
 }
 
@@ -402,7 +402,7 @@ TEST(TransportHandshakeTest, client_exchanges_extension_before_ack) {
 
     ASSERT_EQ(STEP_OK, session.RunClient(&protocol, &transport));
     EXPECT_EQ("HSLOE1", io.output());
-    EXPECT_EQ(ESTABLISHED, session.phase());
+    EXPECT_EQ(ESTABLISHED, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, server_resumes_fragmented_extension_then_ack) {
@@ -419,18 +419,18 @@ TEST(TransportHandshakeTest, server_resumes_fragmented_extension_then_ack) {
 
     ASSERT_EQ(STEP_NEED_MORE,
               session.RunServer(protocols, &input, &transport, false));
-    EXPECT_EQ(EXTENSION_WAIT, session.phase());
+    EXPECT_EQ(EXTENSION_WAIT, session.phase(butil::memory_order_acquire));
     EXPECT_EQ("HSLO", io.output());
     source.append("E", 1);
     ASSERT_EQ(STEP_NEED_MORE,
               session.RunServer(protocols, &input, &transport, false));
-    EXPECT_EQ(EXTENSION_WAIT, session.phase());
+    EXPECT_EQ(EXTENSION_WAIT, session.phase(butil::memory_order_acquire));
     source.append("11", 2);  // Remainder of extension, then ACK.
     ASSERT_EQ(STEP_OK,
               session.RunServer(protocols, &input, &transport, false));
     EXPECT_EQ("HSLOE1", io.output());
     EXPECT_TRUE(source.empty());
-    EXPECT_EQ(ESTABLISHED, session.phase());
+    EXPECT_EQ(ESTABLISHED, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, client_resource_failure_falls_back_before_io) {
@@ -445,7 +445,7 @@ TEST(TransportHandshakeTest, client_resource_failure_falls_back_before_io) {
     ASSERT_EQ(STEP_FALLBACK, session.RunClient(&protocol, &transport));
     ASSERT_TRUE(transport.tcp_active);
     ASSERT_TRUE(io.output().empty());
-    ASSERT_EQ(FALLBACK_TCP, session.phase());
+    ASSERT_EQ(FALLBACK_TCP, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
@@ -463,7 +463,7 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
 
     ASSERT_EQ(STEP_NEED_MORE,
               session.RunServer(protocols, &input, &transport, false));
-    ASSERT_EQ(ACK_WAIT, session.phase());
+    ASSERT_EQ(ACK_WAIT, session.phase(butil::memory_order_acquire));
     ASSERT_EQ("HSLO", io.output());
     ASSERT_TRUE(source.empty());
 
@@ -472,7 +472,7 @@ TEST(TransportHandshakeTest, server_resumes_at_buffered_ack) {
               session.RunServer(protocols, &input, &transport, false));
     ASSERT_EQ("parse prepare negotiate build parse_ack validate activate",
               calls);
-    ASSERT_EQ(ESTABLISHED, session.phase());
+    ASSERT_EQ(ESTABLISHED, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, server_resource_failure_falls_back_after_ack) {
@@ -493,7 +493,7 @@ TEST(TransportHandshakeTest, server_resource_failure_falls_back_after_ack) {
     ASSERT_EQ("HSNO", io.output());
     ASSERT_TRUE(source.empty());
     ASSERT_TRUE(transport.tcp_active);
-    ASSERT_EQ(FALLBACK_TCP, session.phase());
+    ASSERT_EQ(FALLBACK_TCP, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, server_falls_back_without_consuming_other_magic) {
@@ -513,12 +513,12 @@ TEST(TransportHandshakeTest, server_falls_back_without_consuming_other_magic) {
               session.RunServer(protocols, &input, &transport, true));
     ASSERT_TRUE(transport.tcp_active);
     ASSERT_EQ(4UL, source.size());
-    ASSERT_EQ(FALLBACK_TCP, session.phase());
+    ASSERT_EQ(FALLBACK_TCP, session.phase(butil::memory_order_acquire));
 
     ASSERT_EQ(STEP_NOT_MINE,
               session.RunServer(protocols, &input, &transport, true));
     ASSERT_EQ(4UL, source.size());
-    ASSERT_EQ(FALLBACK_TCP, session.phase());
+    ASSERT_EQ(FALLBACK_TCP, session.phase(butil::memory_order_acquire));
 }
 
 TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
@@ -535,12 +535,12 @@ TEST(TransportHandshakeTest, server_enters_hello_phase_after_magic_matches) {
     source.append("H", 1);
     ASSERT_EQ(STEP_NEED_MORE,
               session.RunServer(protocols, &input, &transport, false));
-    ASSERT_EQ(UNINITIALIZED, session.phase());
+    ASSERT_EQ(UNINITIALIZED, session.phase(butil::memory_order_acquire));
 
     source.append("S", 1);
     ASSERT_EQ(STEP_NEED_MORE,
               session.RunServer(protocols, &input, &transport, false));
-    ASSERT_EQ(HELLO_WAIT, session.phase());
+    ASSERT_EQ(HELLO_WAIT, session.phase(butil::memory_order_acquire));
     ASSERT_EQ(7, session.protocol_version());
     ASSERT_EQ(2UL, source.size());
 }
@@ -700,6 +700,32 @@ TEST(TransportHandshakeTest,
     ASSERT_EQ(nullptr, socket->parsing_context());
     socket->SetFailed();
 }
+
+#if BRPC_WITH_URMA
+TEST(TransportHandshakeTest, urma_socket_skips_adapter_handshake_parser) {
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+
+    SocketOptions options;
+    options.fd = fds[0];
+    options.socket_mode = SOCKET_MODE_URMA;
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+
+    butil::IOBuf source;
+    source.append("PRPC", 4);
+    const ParseResult result = policy::ParseTransportHandshake(
+        &source, socket.get(), false, nullptr);
+    ASSERT_FALSE(result.is_ok());
+    EXPECT_EQ(PARSE_ERROR_TRY_OTHERS, result.error());
+    EXPECT_EQ(4UL, source.size());
+    EXPECT_EQ(nullptr, socket->parsing_context());
+    socket->SetFailed();
+}
+#endif
 
 #if BRPC_WITH_RDMA
 TEST(TransportHandshakeTest,

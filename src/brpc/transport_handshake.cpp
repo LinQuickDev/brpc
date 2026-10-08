@@ -298,13 +298,14 @@ StepResult HandshakeSession::RunServer(
     // Once TCP fallback has been published, subsequent bytes are application
     // protocol data and must bypass every upgrade codec without changing the
     // terminal state.
-    if (phase() == FALLBACK_TCP) {
+    if (phase(butil::memory_order_acquire) == FALLBACK_TCP) {
         return STEP_NOT_MINE;
     }
 
     HandshakeProtocol* selected = NULL;
-    if (phase() != ACK_WAIT && phase() != EXTENSION_WAIT) {
-        const int previous_phase = phase();
+    if (phase(butil::memory_order_acquire) != ACK_WAIT &&
+        phase(butil::memory_order_acquire) != EXTENSION_WAIT) {
+        const int previous_phase = phase(butil::memory_order_acquire);
         _local_enabled = false;
         SetPhase(HELLO_WAIT);
         StepResult result = SelectAndReceiveHello(
@@ -371,7 +372,7 @@ StepResult HandshakeSession::RunServer(
         CHECK(selected != NULL);
     }
 
-    if (phase() == EXTENSION_WAIT) {
+    if (phase(butil::memory_order_acquire) == EXTENSION_WAIT) {
         StepResult result = ReceiveExtension(selected, input);
         if (result == STEP_NEED_MORE) {
             return STEP_NEED_MORE;

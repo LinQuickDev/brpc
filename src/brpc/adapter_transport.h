@@ -35,9 +35,9 @@ class UBShmTransport;
 // may switch to an independent RDMA/URMA/UBSHM Transport after a successful
 // handshake. TCP remains usable before negotiation and after fallback.
 class AdapterTransport : public Transport {
-    friend class TransportFactory;
-    friend class RdmaTransport;
-    friend class UBShmTransport;
+friend class TransportFactory;
+friend class RdmaTransport;
+friend class UBShmTransport;
 public:
     void Init(Socket* socket, const SocketOptions& options) override;
     void Release() override;
@@ -52,7 +52,9 @@ public:
                       int* num_bthread_created, bool last_msg) override;
     void Debug(std::ostream& os) override;
 
-    int handshake_phase() const { return _handshake.phase(); }
+    int handshake_phase() const {
+        return _handshake.phase(butil::memory_order_acquire);
+    }
     int handshake_version() const { return _handshake.protocol_version(); }
     handshake::HandshakeSession* handshake_session() { return &_handshake; }
     Transport* high_speed_transport() const {

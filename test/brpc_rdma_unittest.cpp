@@ -66,13 +66,11 @@ DECLARE_int32(rdma_memory_pool_max_regions);
 DECLARE_int32(rdma_client_handshake_version);
 DECLARE_bool(rdma_ece);
 
-extern ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*,
-                              int);
+extern ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*, int);
 extern int (*IbvDestroyCq)(ibv_cq*);
 extern ibv_qp* (*IbvCreateQp)(ibv_pd*, ibv_qp_init_attr*);
 extern int (*IbvModifyQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask);
-extern int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask,
-                         ibv_qp_init_attr*);
+extern int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask, ibv_qp_init_attr*);
 extern int (*IbvDestroyQp)(ibv_qp*);
 extern butil::atomic<bool> g_rdma_available;
 extern bool g_skip_rdma_init;
@@ -366,13 +364,12 @@ TEST_F(RdmaTest, client_close_before_hello_send) {
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd >= 0);
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    Socket* s = GetSocketFromServer(0);
+    Socket* s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    sockfd.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     StopServer();
 }
@@ -388,15 +385,15 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd >= 0);
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    Socket* s = GetSocketFromServer(0);
+    Socket* s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
 
     uint8_t data[rdma::HELLO_V2_MSG_LEN_MIN];
     memcpy(data, "PRPC", 4);  // send as normal baidu_std protocol
-    ASSERT_EQ(4, write(sockfd, data, 4));
-    usleep(100000);  // wait for server to handle the msg
+    ASSERT_TRUE(WriteAll(sockfd, data, 4));
+    ASSERT_TRUE(WaitForFdReadBuf(s, 4));
     // A non-RDMA magic makes the transport-handshake parser return TRY_OTHERS
     // and hand the bytes to other protocols; it does not touch the endpoint
     // state, so it stays UNINIT (the old blocking handshake used to set
@@ -420,42 +417,38 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     butil::fd_guard sockfd1(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd1 >= 0);
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RD", 2);
     ASSERT_EQ(2, write(sockfd1, data, 2));  // break in magic str
-    usleep(100000);                         // wait for server to handle the msg
-    // Fewer than 4 magic bytes: the transport-handshake parser can't tell yet,
-    // returns NOT_ENOUGH_DATA and leaves the endpoint UNINIT (the old blocking
-    // the common handshake state remains uninitialized before reading magic).
+    ASSERT_TRUE(WaitForFdReadBuf(s, 2));
+    // Fewer than 4 magic bytes leave the handshake uninitialized while the
+    // parser waits for the rest of the magic.
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd1);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    sockfd1.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     butil::fd_guard sockfd2(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd2 >= 0);
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd2, data, 4));  // break after magic str
-    usleep(100000);                         // wait for server to handle the msg
-    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd2);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    ASSERT_HANDSHAKE_PHASE(handshake::HELLO_WAIT, s);
+    sockfd2.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     butil::fd_guard sockfd3(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd3 >= 0);
     ASSERT_EQ(0, connect(sockfd3, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     // Send the 4B magic plus a valid msg_len (=40) but no body, so the server
@@ -465,11 +458,9 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     uint16_t v2_len = butil::HostToNet16(rdma::HELLO_V2_MSG_LEN_MIN);
     memcpy(data + 4, &v2_len, sizeof(v2_len));
     ASSERT_EQ(6, write(sockfd3, data, 6));  // magic + msg_len, body missing
-    usleep(100000);                         // wait for server to handle the msg
-    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd3);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    ASSERT_HANDSHAKE_PHASE(handshake::HELLO_WAIT, s);
+    sockfd3.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     StopServer();
 }

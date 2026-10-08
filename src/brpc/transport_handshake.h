@@ -159,7 +159,7 @@ public:
         _phase.store(UNINITIALIZED, butil::memory_order_relaxed);
     }
 
-    int phase(butil::memory_order order = butil::memory_order_acquire) const {
+    int phase(butil::memory_order order) const {
         return _phase.load(order);
     }
 

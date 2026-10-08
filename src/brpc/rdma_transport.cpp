@@ -29,11 +29,11 @@ DECLARE_bool(usercode_in_pthread);
 
 extern SocketVarsCollector *g_vars;
 
-RdmaTransport *RdmaTransport::Get(const Socket *socket) {
-    const AdapterTransport *adapter = AdapterTransport::Get(socket);
-    Transport *transport = adapter->high_speed_transport();
+RdmaTransport* RdmaTransport::Get(const Socket* socket) {
+    const AdapterTransport* adapter = AdapterTransport::Get(socket);
+    Transport* transport = adapter->high_speed_transport();
     CHECK(transport != NULL);
-    return static_cast<RdmaTransport *>(transport);
+    return static_cast<RdmaTransport*>(transport);
 }
 
 void RdmaTransport::Init(Socket *socket, const SocketOptions &options) {
