@@ -143,6 +143,8 @@ protected:
     // Load data from m->fd() into m->read_buf, cut off new messages and
     // call callbacks.
     static void OnNewMessages(Socket* m);
+    // Stop draining the TCP fd when a parser changes the transport state.
+    static void OnNewMessagesUntil(Socket* m, bool (*stop_reading)(Socket*));
     
 private:
 

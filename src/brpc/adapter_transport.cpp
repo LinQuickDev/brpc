@@ -689,7 +689,9 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
         return;
     }
 
-    InputMessenger::OnNewMessages(socket);
+    InputMessenger::OnNewMessagesUntil(socket, [](Socket* s) {
+        return Get(s)->handshake_phase() == handshake::ESTABLISHED;
+    });
 
 #if BRPC_WITH_RDMA
     if (adapter->_mode == SOCKET_MODE_RDMA &&
@@ -708,6 +710,9 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
         }
     }
 #endif
+    if (adapter->handshake_phase() == handshake::ESTABLISHED) {
+        adapter->CheckUnexpectedTcpData();
+    }
 }
 
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
