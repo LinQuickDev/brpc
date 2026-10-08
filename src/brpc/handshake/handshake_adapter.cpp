@@ -25,17 +25,18 @@ namespace handshake {
 // InputMessenger may call this entry repeatedly while bytes arrive. Keep all
 // connection state in HandshakeSession and Socket rather than in the adapter,
 // so a single stateless adapter can serve every connection. The parsing
-// context retains that selected adapter between the server hello and the peer
-// ACK, whose frame has no protocol magic of its own.
+// context retains that selected adapter while waiting for the peer extension
+// or ACK, whose frames have no protocol magic of their own.
 ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
     butil::IOBuf* source, Socket* socket) {
     const StepResult result = RunServerStep(source, socket);
     if (result == STEP_NEED_MORE) {
-        if (GetSession(socket)->phase() == ACK_WAIT &&
-            socket->parsing_context() == NULL) {
+        const int phase = GetSession(socket)->phase(butil::memory_order_acquire);
+        if ((phase == ACK_WAIT || phase == EXTENSION_WAIT) &&
+            socket->parsing_context() == nullptr) {
             ServerHandshakeContext* context =
                 ServerHandshakeContext::Create(this);
-            if (context == NULL) {
+            if (context == nullptr) {
                 GetSession(socket)->MarkFailed();
                 return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
             }
@@ -44,9 +45,14 @@ ParseResult StandardHandshakeAdapter::ExecuteServerHandshake(
         return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
 
-    socket->reset_parsing_context(NULL);
+    socket->reset_parsing_context(nullptr);
     if (result == STEP_ERROR) {
         return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+    }
+    if (GetSession(socket)->phase(butil::memory_order_acquire) == ESTABLISHED) {
+        // Do not hand this TCP control stream to ordinary RPC parsers. The
+        // outer transport event handler stops reading once upgrade completes.
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
     return MakeParseError(PARSE_ERROR_TRY_OTHERS);
 }

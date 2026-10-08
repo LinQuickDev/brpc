@@ -30,6 +30,8 @@
 #include "brpc/handshake/rdma_handshake.h"
 #include "brpc/handshake/rdma_handshake_constants.h"
 #include "brpc/parallel_channel.h"
+#include "brpc/policy/baidu_rpc_meta.pb.h"
+#include "brpc/policy/baidu_rpc_protocol.h"
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma/rdma_helper.h"
@@ -66,13 +68,11 @@ DECLARE_int32(rdma_memory_pool_max_regions);
 DECLARE_int32(rdma_client_handshake_version);
 DECLARE_bool(rdma_ece);
 
-extern ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*,
-                              int);
+extern ibv_cq* (*IbvCreateCq)(ibv_context*, int, void*, ibv_comp_channel*, int);
 extern int (*IbvDestroyCq)(ibv_cq*);
 extern ibv_qp* (*IbvCreateQp)(ibv_pd*, ibv_qp_init_attr*);
 extern int (*IbvModifyQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask);
-extern int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask,
-                         ibv_qp_init_attr*);
+extern int (*IbvQueryQp)(ibv_qp*, ibv_qp_attr*, ibv_qp_attr_mask, ibv_qp_init_attr*);
 extern int (*IbvDestroyQp)(ibv_qp*);
 extern butil::atomic<bool> g_rdma_available;
 extern bool g_skip_rdma_init;
@@ -212,7 +212,10 @@ protected:
 
     virtual void SetUp() {}
 
-    virtual void TearDown() { rdma::DumpMemoryPoolInfo(std::cout); }
+    virtual void TearDown() {
+        _wait_socket.reset();
+        rdma::DumpMemoryPoolInfo(std::cout);
+    }
 
 protected:
     void StartServer(bool use_rdma = true) {
@@ -227,6 +230,7 @@ protected:
 
     void StopServer() {
         _server.Stop(0);
+        _wait_socket.reset();
         _server.Join();
     }
 
@@ -245,14 +249,26 @@ protected:
 
     // Server-side connection creation and teardown are asynchronous.
     Socket* WaitForServerSocket() {
-        Socket* s = nullptr;
-        WaitUntil([this, &s] { return (s = GetSocketFromServer(0)) != nullptr; });
-        return s;
+        _wait_socket.reset();
+        WaitUntil([this] {
+            std::vector<SocketId> sids;
+            _server._am->ListConnections(&sids);
+            return !sids.empty() &&
+                Socket::Address(sids[0], &_wait_socket) == 0;
+        });
+        return _wait_socket.get();
     }
 
     bool WaitForServerSocketGone() {
+        // Acceptor removes the connection in BeforeRecycle; release our pin
+        // before waiting for removal, and do not use the raw pointer afterwards.
+        _wait_socket.reset();
         return WaitUntil([this] { return GetSocketFromServer(0) == nullptr; });
     }
+
+    SocketUniquePtr _wait_socket;
+
+    void VerifyCompleteFallbackRPC();
 
     butil::TempFile _server_list;
     std::string _naming_url;
@@ -278,9 +294,13 @@ static int WaitForHandshakePhase(Socket* s, handshake::Phase expected) {
 #define ASSERT_HANDSHAKE_PHASE(expected, socket) \
     ASSERT_EQ(expected, WaitForHandshakePhase(socket, expected))
 
-static bool WaitForFdReadBuf(Socket* s, size_t size) {
-    return WaitUntil([s, size] {
-        return s->fd_input_processor().read_buf().size() == size;
+// Only observe the atomic read timestamp, never the IO thread's mutable IOBuf.
+// Callers snapshot it before writing to the otherwise idle connection. This
+// observes a read event, not publication of the parser's mutable buffer.
+static bool WaitForSocketRead(Socket* s, int64_t previous_read_us) {
+    return WaitUntil([s, previous_read_us] {
+        return s->_last_readtime_us.load(butil::memory_order_relaxed) !=
+            previous_read_us;
     });
 }
 
@@ -366,13 +386,12 @@ TEST_F(RdmaTest, client_close_before_hello_send) {
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd >= 0);
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    Socket* s = GetSocketFromServer(0);
+    Socket* s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    sockfd.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     StopServer();
 }
@@ -388,15 +407,17 @@ TEST_F(RdmaTest, client_hello_msg_invalid_magic_str) {
     butil::fd_guard sockfd(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd >= 0);
     ASSERT_EQ(0, connect(sockfd, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    Socket* s = GetSocketFromServer(0);
+    Socket* s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
 
     uint8_t data[rdma::HELLO_V2_MSG_LEN_MIN];
     memcpy(data, "PRPC", 4);  // send as normal baidu_std protocol
-    ASSERT_EQ(4, write(sockfd, data, 4));
-    usleep(100000);  // wait for server to handle the msg
+    const int64_t previous_read_us =
+        s->_last_readtime_us.load(butil::memory_order_relaxed);
+    ASSERT_TRUE(WriteAll(sockfd, data, 4));
+    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
     // A non-RDMA magic makes the transport-handshake parser return TRY_OTHERS
     // and hand the bytes to other protocols; it does not touch the endpoint
     // state, so it stays UNINIT (the old blocking handshake used to set
@@ -420,42 +441,40 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     butil::fd_guard sockfd1(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd1 >= 0);
     ASSERT_EQ(0, connect(sockfd1, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RD", 2);
+    const int64_t previous_read_us =
+        s->_last_readtime_us.load(butil::memory_order_relaxed);
     ASSERT_EQ(2, write(sockfd1, data, 2));  // break in magic str
-    usleep(100000);                         // wait for server to handle the msg
-    // Fewer than 4 magic bytes: the transport-handshake parser can't tell yet,
-    // returns NOT_ENOUGH_DATA and leaves the endpoint UNINIT (the old blocking
-    // the common handshake state remains uninitialized before reading magic).
+    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
+    // Fewer than 4 magic bytes leave the handshake uninitialized while the
+    // parser waits for the rest of the magic.
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd1);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    sockfd1.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     butil::fd_guard sockfd2(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd2 >= 0);
     ASSERT_EQ(0, connect(sockfd2, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     memcpy(data, "RDMA", 4);
     ASSERT_EQ(4, write(sockfd2, data, 4));  // break after magic str
-    usleep(100000);                         // wait for server to handle the msg
-    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd2);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    ASSERT_HANDSHAKE_PHASE(handshake::HELLO_WAIT, s);
+    sockfd2.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     butil::fd_guard sockfd3(socket(AF_INET, SOCK_STREAM, 0));
     ASSERT_TRUE(sockfd3 >= 0);
     ASSERT_EQ(0, connect(sockfd3, (sockaddr*)&addr, sizeof(sockaddr)));
-    usleep(100000);  // wait for server to handle the msg
-    s = GetSocketFromServer(0);
+    s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
     ASSERT_EQ(handshake::UNINITIALIZED,
               AdapterTransport::Get(s)->handshake_phase());
     // Send the 4B magic plus a valid msg_len (=40) but no body, so the server
@@ -465,11 +484,9 @@ TEST_F(RdmaTest, client_close_during_hello_send) {
     uint16_t v2_len = butil::HostToNet16(rdma::HELLO_V2_MSG_LEN_MIN);
     memcpy(data + 4, &v2_len, sizeof(v2_len));
     ASSERT_EQ(6, write(sockfd3, data, 6));  // magic + msg_len, body missing
-    usleep(100000);                         // wait for server to handle the msg
-    ASSERT_EQ(handshake::HELLO_WAIT, AdapterTransport::Get(s)->handshake_phase());
-    close(sockfd3);
-    usleep(100000);  // wait for server to handle the msg
-    ASSERT_EQ(nullptr, GetSocketFromServer(0));
+    ASSERT_HANDSHAKE_PHASE(handshake::HELLO_WAIT, s);
+    sockfd3.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
 
     StopServer();
 }
@@ -946,16 +963,16 @@ TEST_F(RdmaTest, server_accepts_data_pipelined_behind_fallback_ack) {
     const uint32_t flags = butil::HostToNet32(0);
     memcpy(ack_and_data, &flags, rdma::HELLO_ACK_LEN);
     memcpy(ack_and_data + rdma::HELLO_ACK_LEN, "PRPC", 4);
+    const int64_t previous_read_us =
+        s->_last_readtime_us.load(butil::memory_order_relaxed);
     ASSERT_TRUE(WriteAll(sockfd, ack_and_data, sizeof(ack_and_data)));
 
-    // The handshake took the ACK only and left "PRPC" to baidu_std, which is
-    // now waiting for the rest of its 12B header. So the connection lives on
-    // with those 4 bytes still buffered. Note that baidu_std gets them a moment
-    // after the handshake gave up the stream, hence the wait.
+    // Observe fallback and an atomic read event without inspecting the IO
+    // thread's buffer. The complete-RPC test below verifies parser handoff.
     ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
     ASSERT_EQ(RdmaTransport::RDMA_OFF, transport->_rdma_state);
     ASSERT_TRUE(GetSocketFromServer(0) != nullptr);
-    ASSERT_TRUE(WaitForFdReadBuf(s, 4));
+    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
 
     sockfd.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());
@@ -1004,9 +1021,83 @@ TEST_F(RdmaTest, server_stops_parsing_tcp_fd_once_rdma_is_on) {
     ASSERT_TRUE(GetSocketFromServer(0) != nullptr);
 
     ASSERT_TRUE(WriteAll(sockfd, "PRPC", 4));
+    ASSERT_TRUE(WaitUntil([s] { return s->Failed(); }));
+    // OnFailed publishes error details under this mutex. Keep the Socket pin
+    // until the event callback has reported the protocol error.
+    ASSERT_TRUE(WaitUntil([s] {
+        BAIDU_SCOPED_LOCK(s->_id_wait_list_mutex);
+        return s->_error_code == EPROTO;
+    }));
     ASSERT_TRUE(WaitForServerSocketGone());
 
     StopServer();
+}
+
+void RdmaTest::VerifyCompleteFallbackRPC() {
+    StartServer();
+    butil::fd_guard sockfd;
+    ASSERT_NO_FATAL_FAILURE(HandshakeUntilAckWait(&sockfd));
+    Socket* s = WaitForServerSocket();
+    ASSERT_NE(nullptr, s);
+    ASSERT_HANDSHAKE_PHASE(handshake::ACK_WAIT, s);
+
+    test::EchoRequest request;
+    request.set_message("fallback");
+    request.set_code(42);
+    Controller cntl;
+    butil::IOBuf body;
+    policy::SerializeRpcRequest(&body, &cntl, &request);
+    butil::IOBuf packet;
+    policy::PackRpcRequest(&packet, nullptr, 123,
+        test::EchoService::descriptor()->FindMethodByName("Echo"),
+        &cntl, body, nullptr);
+    ASSERT_FALSE(cntl.Failed());
+
+    const uint32_t disabled_ack = 0;
+    std::string bytes(reinterpret_cast<const char*>(&disabled_ack),
+                      sizeof(disabled_ack));
+    bytes += packet.to_string();
+    ASSERT_TRUE(WriteAll(sockfd, bytes.data(), bytes.size()));
+
+    uint8_t header[12];
+    ASSERT_TRUE(ReadAll(sockfd, header, sizeof(header)));
+    ASSERT_EQ(0, memcmp(header, "PRPC", 4));
+    uint32_t total_size;
+    uint32_t meta_size;
+    memcpy(&total_size, header + 4, sizeof(total_size));
+    memcpy(&meta_size, header + 8, sizeof(meta_size));
+    total_size = butil::NetToHost32(total_size);
+    meta_size = butil::NetToHost32(meta_size);
+    ASSERT_LE(meta_size, total_size);
+    ASSERT_GT(total_size, 0u);
+    ASSERT_LT(total_size, 65536u);
+    std::string response(total_size, '\0');
+    ASSERT_TRUE(ReadAll(sockfd, &response[0], response.size()));
+    policy::RpcMeta meta;
+    ASSERT_TRUE(meta.ParseFromArray(response.data(), meta_size));
+    ASSERT_EQ(123u, meta.correlation_id());
+    ASSERT_EQ(0, meta.response().error_code());
+    test::EchoResponse echo;
+    ASSERT_TRUE(echo.ParseFromArray(response.data() + meta_size,
+                                   total_size - meta_size));
+    ASSERT_EQ("MyEchoService", echo.message());
+    ASSERT_EQ(1, echo.code_list_size());
+    ASSERT_EQ(42, echo.code_list(0));
+    ASSERT_HANDSHAKE_PHASE(handshake::FALLBACK_TCP, s);
+    auto* transport = RdmaTransportOf(s);
+    EXPECT_EQ(RdmaTransport::RDMA_OFF, transport->_rdma_state);
+    EXPECT_EQ(nullptr, transport->_rdma_ep->_resource);
+    EXPECT_EQ(INVALID_SOCKET_ID, transport->_rdma_ep->_cq_sid);
+    EXPECT_EQ(0, transport->_rdma_ep->_remote_rq_window_size.load(
+        butil::memory_order_relaxed));
+    ASSERT_FALSE(s->Failed());
+    sockfd.reset(-1);
+    ASSERT_TRUE(WaitForServerSocketGone());
+    StopServer();
+}
+
+TEST_F(RdmaTest, server_serves_complete_rpc_after_fallback_ack) {
+    ASSERT_NO_FATAL_FAILURE(VerifyCompleteFallbackRPC());
 }
 
 TEST_F(RdmaTest, server_parses_qp_stream_after_rdma_is_on) {
@@ -1089,11 +1180,11 @@ TEST_F(RdmaTest, fd_and_qp_input_streams_are_separate) {
 
     // Two magic bytes are too few to dispatch on, so they stay buffered. In the
     // fd stream, and only there.
+    const int64_t previous_read_us =
+        s->_last_readtime_us.load(butil::memory_order_relaxed);
     ASSERT_TRUE(WriteAll(sockfd, "RD", 2));
-    ASSERT_TRUE(WaitForFdReadBuf(s, 2));
+    ASSERT_TRUE(WaitForSocketRead(s, previous_read_us));
     ASSERT_EQ(handshake::UNINITIALIZED, AdapterTransport::Get(s)->handshake_phase());
-    ASSERT_EQ(2u, fd_stream.read_buf().size());
-    ASSERT_TRUE(qp_stream.read_buf().empty());
 
     sockfd.reset(-1);
     ASSERT_TRUE(WaitForServerSocketGone());
@@ -2348,6 +2439,11 @@ public:
 private:
     bool _saved;
 };
+
+TEST_F(RdmaTest, allocation_failure_cleans_endpoint_and_serves_complete_rpc) {
+    ResourceAllocFailGuard alloc_fail_guard(true);
+    ASSERT_NO_FATAL_FAILURE(VerifyCompleteFallbackRPC());
+}
 
 TEST_F(RdmaTest, client_alloc_resource_fail_fallback_tcp) {
     StartServer();

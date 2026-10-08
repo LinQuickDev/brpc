@@ -171,15 +171,19 @@ class UBShmClientHandshakeTransport : public handshake::HandshakeTransport {
 public:
     UBShmClientHandshakeTransport(
         UBShmTransport* transport, ubring::SHM* local_shm,
-        const std::string& shm_name, Socket* socket, int* connect_error)
+        const std::string& shm_name, ubring::UBShmHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
         : _transport(transport), _local_shm(local_shm),
-          _shm_name(shm_name), _socket(socket),
+          _shm_name(shm_name), _protocol(protocol), _socket(socket),
           _connect_error(connect_error) {}
 
     handshake::StepResult PrepareResources() override {
-        return _transport->PrepareUpgradeResources(
-                   _local_shm, _shm_name.c_str()) == 0
-            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+        if (_transport->PrepareUpgradeResources(
+                _local_shm, _shm_name.c_str()) != 0) {
+            return handshake::STEP_FALLBACK;
+        }
+        _protocol->ConfigureClientHello(*_local_shm);
+        return handshake::STEP_OK;
     }
 
     handshake::StepResult NegotiateResources() override {
@@ -205,6 +209,7 @@ private:
     UBShmTransport* _transport;
     ubring::SHM* _local_shm;
     std::string _shm_name;
+    ubring::UBShmHandshakeAdapter* _protocol;
     Socket* _socket;
     int* _connect_error;
 };
@@ -295,7 +300,7 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
             result = adapter->ExecuteServerHandshake(source, _socket);
         }
     }
-    const int phase = _handshake.phase();
+    const int phase = _handshake.phase(butil::memory_order_acquire);
     if (!connection_completed() &&
         (phase == handshake::ESTABLISHED ||
          phase == handshake::FALLBACK_TCP || phase == handshake::FAILED)) {
@@ -309,7 +314,7 @@ void AdapterTransport::CompleteConnection(handshake::Phase terminal_phase) {
           terminal_phase == handshake::FALLBACK_TCP ||
           terminal_phase == handshake::FAILED);
     if (terminal_phase == handshake::FAILED &&
-        _handshake.phase() != handshake::FAILED) {
+        _handshake.phase(butil::memory_order_acquire) != handshake::FAILED) {
         _handshake.MarkFailed();
     }
     int expected = 0;
@@ -359,7 +364,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
         adapter->CompleteConnection(static_cast<handshake::Phase>(
-            adapter->_handshake.phase()));
+            adapter->_handshake.phase(butil::memory_order_acquire)));
         task->done(connect_error, task->data);
         return NULL;
     }
@@ -383,9 +388,8 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         const auto shm_name_str =
             butil::endpoint2str(socket->local_side());
         ubring::UBShmHandshakeAdapter wire;
-        wire.ConfigureClientHello(local_shm_len, shm_name_str.c_str());
         UBShmClientHandshakeTransport participant(
-            transport, &local_trx_shm, shm_name_str.c_str(), socket,
+            transport, &local_trx_shm, shm_name_str.c_str(), &wire, socket,
             &connect_error);
         const handshake::StepResult result = adapter->_handshake.RunClient(
             &wire, &participant);
@@ -398,7 +402,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
         adapter->CompleteConnection(static_cast<handshake::Phase>(
-            adapter->_handshake.phase()));
+            adapter->_handshake.phase(butil::memory_order_acquire)));
         task->done(connect_error, task->data);
         return NULL;
     }
@@ -493,7 +497,8 @@ std::shared_ptr<AppConnect> AdapterTransport::Connect() {
 
 Transport* AdapterTransport::ActiveTransport() const {
     if (_high_speed_transport &&
-        _handshake.phase() == handshake::ESTABLISHED) {
+        _handshake.phase(butil::memory_order_acquire) ==
+            handshake::ESTABLISHED) {
         return _high_speed_transport.get();
     }
     return _tcp_transport.get();
@@ -530,7 +535,7 @@ void AdapterTransport::Debug(std::ostream& os) {
         _high_speed_transport->Debug(os);
     }
     const char* state = "UNKNOWN";
-    switch (_handshake.phase()) {
+    switch (_handshake.phase(butil::memory_order_acquire)) {
     case handshake::UNINITIALIZED: state = "UNINITIALIZED"; break;
     case handshake::PREPARING: state = "PREPARING"; break;
     case handshake::HELLO_SEND: state = "HELLO_SEND"; break;
@@ -578,16 +583,20 @@ void AdapterTransport::SetHighSpeedAvailable(bool available) {
 
 void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
     AdapterTransport* adapter = Get(socket);
-    if (adapter->_handshake.phase() == handshake::ESTABLISHED) {
+    if (adapter->_handshake.phase(butil::memory_order_acquire) ==
+        handshake::ESTABLISHED) {
         adapter->CheckUnexpectedTcpData();
         return;
     }
 
-    InputMessenger::OnNewMessages(socket);
+    InputMessenger::OnNewMessagesUntil(socket, [](Socket* s) {
+        return Get(s)->handshake_phase() == handshake::ESTABLISHED;
+    });
 
 #if BRPC_WITH_RDMA
     if (adapter->_mode == SOCKET_MODE_RDMA &&
-        adapter->_handshake.phase() == handshake::ESTABLISHED) {
+        adapter->_handshake.phase(butil::memory_order_acquire) ==
+            handshake::ESTABLISHED) {
         RdmaTransport* transport = static_cast<RdmaTransport*>(
             adapter->_high_speed_transport.get());
         if (transport->StartUpgradeEvents() < 0) {
@@ -602,6 +611,9 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
         }
     }
 #endif
+    if (adapter->handshake_phase() == handshake::ESTABLISHED) {
+        adapter->CheckUnexpectedTcpData();
+    }
 }
 
 void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
@@ -611,7 +623,7 @@ void AdapterTransport::OnNewDataFromTcp(Socket* socket) {
 void AdapterTransport::ProcessTcpEvent() {
     int progress = Socket::PROGRESS_INIT;
     while (true) {
-        const int phase = _handshake.phase();
+        const int phase = _handshake.phase(butil::memory_order_acquire);
         if (phase != handshake::UNINITIALIZED &&
             phase < handshake::ESTABLISHED) {
             _handshake.NotifyReadable();
@@ -662,7 +674,7 @@ void AdapterTransport::TryReadOnTcp() {
     if (_socket->_nevent.fetch_add(1, butil::memory_order_acq_rel) != 0) {
         return;
     }
-    const int phase = _handshake.phase();
+    const int phase = _handshake.phase(butil::memory_order_acquire);
     if (phase == handshake::FALLBACK_TCP) {
         InputMessenger::OnNewMessages(_socket);
     } else if (phase == handshake::ESTABLISHED) {

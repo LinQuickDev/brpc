@@ -21,13 +21,15 @@
 客户端在 TCP 连接建立后启动握手 bthread；服务端通过 `InputMessenger`
 增量解析 hello、扩展字段（若协议需要）和 ACK。`AdapterTransport` 选择具体的
 protocol 和 transport participant，`HandshakeSession` 只负责调用参与者并编排流程。
-服务端通过协议版本恢复选中的 protocol，因为 ACK 本身不带 magic。
+服务端在 `EXTENSION_WAIT` 和 `ACK_WAIT` 保留解析上下文，并通过协议版本
+恢复选中的 protocol，因为扩展帧和 ACK 本身不带 magic。
 
 ## 状态与回退
 
 握手终态为 `ESTABLISHED`、`FALLBACK_TCP` 或 `FAILED`。升级成功后，TCP
 仍是控制连接，业务数据走 RDMA/UBSHM；控制连接上出现额外业务数据视为
-协议错误。资源不可用或协商拒绝时，释放本次升级资源，设置 TCP 为数据面，
+协议错误。升级完成时停止当前 TCP 业务解析循环，由控制连接处理额外输入。
+资源不可用或协商拒绝时，释放本次升级资源，设置 TCP 为数据面，
 再以 release 顺序发布 `FALLBACK_TCP`。事件线程以 acquire 顺序读取终态，
 继续解析已缓存及后续的 TCP 业务数据。已确认属于握手协议的畸形帧则失败，
 不作为普通 RPC 数据回放。
