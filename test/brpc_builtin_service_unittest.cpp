@@ -562,13 +562,13 @@ TEST_F(BuiltinServiceTest, customized_health) {
     brpc::ServerOptions opt;
     MyHealthReporter hr;
     opt.health_reporter = &hr;
-    ASSERT_EQ(0, _server.Start(9798, &opt));
+    ASSERT_EQ(0, _server.Start(0, &opt));
     brpc::HealthRequest req;
     brpc::HealthResponse res;
     brpc::ChannelOptions copt;
     copt.protocol = brpc::PROTOCOL_HTTP;
     brpc::Channel chan;
-    ASSERT_EQ(0, chan.Init("127.0.0.1:9798", &copt));
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
     brpc::Controller cntl;
     cntl.http_request().uri() = "/health";
     chan.CallMethod(nullptr, &cntl, &req, &res, nullptr);
@@ -597,7 +597,7 @@ public:
 
 TEST_F(BuiltinServiceTest, normal_grpc_health) {
     brpc::ServerOptions opt;
-    ASSERT_EQ(0, _server.Start(9798, &opt));
+    ASSERT_EQ(0, _server.Start(0, &opt));
 
     grpc::health::v1::HealthCheckResponse response;
     grpc::health::v1::HealthCheckRequest request;
@@ -606,7 +606,7 @@ TEST_F(BuiltinServiceTest, normal_grpc_health) {
     brpc::ChannelOptions copt;
     copt.protocol = "h2:grpc";
     brpc::Channel chan;
-    ASSERT_EQ(0, chan.Init("127.0.0.1:9798", &copt));
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
     grpc::health::v1::Health_Stub stub(&chan);
     stub.Check(&cntl, &request, &response, nullptr);
     EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
@@ -624,7 +624,7 @@ TEST_F(BuiltinServiceTest, customized_grpc_health) {
     brpc::ServerOptions opt;
     MyGrpcHealthReporter hr;
     opt.health_reporter = &hr;
-    ASSERT_EQ(0, _server.Start(9798, &opt));
+    ASSERT_EQ(0, _server.Start(0, &opt));
 
     grpc::health::v1::HealthCheckResponse response;
     grpc::health::v1::HealthCheckRequest request;
@@ -634,7 +634,7 @@ TEST_F(BuiltinServiceTest, customized_grpc_health) {
     brpc::ChannelOptions copt;
     copt.protocol = "h2:grpc";
     brpc::Channel chan;
-    ASSERT_EQ(0, chan.Init("127.0.0.1:9798", &copt));
+    ASSERT_EQ(0, chan.Init(_server.listen_address(), &copt));
 
     grpc::health::v1::Health_Stub stub(&chan);
     stub.Check(&cntl, &request, &response, nullptr);
@@ -760,7 +760,7 @@ TEST_F(BuiltinServiceTest, bad_method) {
 
 TEST_F(BuiltinServiceTest, vars) {
     // Start server to show bvars inside 
-    ASSERT_EQ(0, _server.Start("127.0.0.1:9798", nullptr));
+    ASSERT_EQ(0, _server.Start(0, nullptr));
     brpc::VarsService service;
     brpc::VarsRequest req;
     brpc::VarsResponse res;
@@ -791,6 +791,35 @@ TEST_F(BuiltinServiceTest, vars) {
                      "<tr class=\"variable\"><td>myvar</td><td><span id=\"value-myvar\">9</span></td></tr>");
         CheckContent(cntl,
                      "<tr class=\"detail-row\"><td colspan=\"2\"><div class=\"detail\"><div id=\"myvar\" class=\"flot-placeholder\"></div></div></td></tr>");
+    }
+    {
+        // A Histogram writes one metric per bucket and the name of each carries
+        // a `le` label. Quotes cannot go into an html id, and no series is
+        // exposed under such a name anyway, so the value must come out plainly
+        // instead of inside a <span id="value-...">.
+        bvar::Histogram myhist("myhist", bvar::Histogram::BucketSchema({10, 20}));
+        myhist << 5;
+        ClosureChecker done;
+        brpc::Controller cntl;
+        SetUpController(&cntl, true);
+        cntl.http_request()._unresolved_path = "myhist";
+        service.default_method(&cntl, &req, &res, &done);
+        ASSERT_FALSE(cntl.Failed());
+        CheckContent(cntl, "<tr class=\"nonplot-variable\">"
+                           "<td>myhist_bucket{le=\"10\"}</td><td>1</td></tr>");
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_bucket"));
+        // `_sum` and `_count` carry no label and so no quotes, but they are no
+        // more a bvar of their own than the buckets are: the script refreshes
+        // a span by looking its name up among the exposed bvars, so one here
+        // would sit at the value of the page load forever, next to neighbours
+        // that do tick.
+        CheckContent(cntl, "<td>myhist_sum</td><td>5</td></tr>");
+        CheckContent(cntl, "<td>myhist_count</td><td>1</td></tr>");
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_sum"));
+        ASSERT_EQ(std::string::npos, cntl.response_attachment().to_string()
+                  .find("id=\"value-myhist_count"));
     }
     {
         ClosureChecker done;
