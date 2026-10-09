@@ -241,13 +241,16 @@ RETURN_CODE UBRing::UbrTrxClose() {
             // to an already running delayed-clear callback otherwise.
             UbrTimerDelAndWait(&_trx->close_timer);
             UbrTimerDelAndWait(&_trx->hb_timer);
-            UbrCleanupCtl* ctl = UBRingManager::SnapshotUnitCleanupCtl(_trx->trx_mgr_index);
-            if (ctl != nullptr && ctl->ubr_id != expect_ubr_id) {
-                ctl->ReleaseRef();               // snapshot reference
-                ctl = nullptr;                   // slot reused, not ours
-            }
+            // Snapshot the delayed cleanup and, when there is none, claim the
+            // cleanup for this force close in one critical section. Splitting
+            // the two would let a concurrent SDK-fault callback publish a new
+            // cleanup after our empty snapshot, leaving two paths running the
+            // cleanup of the same shared memory.
+            UbrCleanupCtl* ctl = nullptr;
+            const UbrCleanupClaim claim = UBRingManager::ClaimTrxCleanupForced(
+                    _trx->trx_mgr_index, expect_ubr_id, &ctl);
             bool cleanup_owned = false;
-            if (ctl != nullptr) {
+            if (claim == CLAIM_HAS_CTL) {
                 int expected = UBR_CLEANUP_PENDING;
                 if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, expected, UBR_CLEANUP_RUNNING)) {
                     cleanup_owned = true;
@@ -255,7 +258,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
                         ctl->ReleaseRef();   // timer/callback reference
                     }
                 }
-            } else if (ATOMIC_LOAD(_trx->ubr_id) == expect_ubr_id) {
+            } else if (claim == CLAIM_OWNED_NULL) {
                 cleanup_owned = true;
             }
             if (cleanup_owned) {
