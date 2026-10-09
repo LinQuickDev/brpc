@@ -23,6 +23,7 @@
 #include "bthread/bthread.h"
 #include "butil/logging.h"
 #include "brpc/ubshm/ub_ring.h"
+#include "brpc/ubshm/ub_cleanup_worker.h"
 #include "brpc/ubshm/ub_ring_manager.h"
 #include "brpc/ubshm/shm/shm_ipc.h"
 
@@ -159,26 +160,32 @@ static RETURN_CODE UbrScheduleClearTimer(UbrTrx *trx, uint64_t expect_ubr_id,
             expect_ubr_id);
     if (BAIDU_UNLIKELY(rc != UBRING_OK)) {
         // The timer was never scheduled: this path owns the manager,
-        // timer/callback and starter references. Roll the schedule back
-        // and run the cleanup inline so the trx does not end up with
-        // neither timers nor a queued cleanup. If force close claimed the
-        // ownership meanwhile, leave the manager anchor to it.
+        // timer/callback and starter references. Hand the cleanup to the
+        // worker -- the caller may be the timer thread -- so the trx does not
+        // end up with neither timers nor a queued cleanup, and run it inline
+        // only when the worker cannot be started.
         int state_expected = UBR_CLEANUP_PENDING;
         if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, state_expected, UBR_CLEANUP_RUNNING)) {
-            // Gate on the slot still being used by this generation: force
-            // close may have claimed the cleanup and released the slot (which
-            // already freed the trx resources) after we were anchored.
-            if (UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id)) {
-                work(trx, ctl->ubr_id);
+            if (!UbrCleanupWorker::PostTrxCleanup(trx, ctl->ubr_id, work, ctl)) {
+                // Gate on the slot still being used by this generation: force
+                // close may have claimed the cleanup and released the slot
+                // (which already freed the trx resources) after we were
+                // anchored.
+                if (UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id)) {
+                    work(trx, ctl->ubr_id);
+                }
+                ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
+                ctl->ReleaseRef();           // timer/callback reference
             }
-            ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-            // Detach only after DONE: while the inline cleanup runs, the
-            // anchor and cleanup_ctl must keep telling a concurrent force
-            // close that this cleanup is owned (RUNNING/DONE), otherwise it
-            // would fall into its no-ctl branch and clean the trx again.
-            UBRingManager::DetachUnitCleanupCtl(trx->trx_mgr_index, ctl);
+            // When the job was posted, the worker owns the timer/callback
+            // reference and settles state/anchor exactly like the timer-fired
+            // path; the manager anchor keeps the control object alive until
+            // the slot is acquired again or UbrMgrFini retires it.
+        } else {
+            // A force close already owns the cleanup. It could not take the
+            // reference through the never-armed timer, so release it here.
+            ctl->ReleaseRef();               // timer/callback reference
         }
-        ctl->ReleaseRef();                   // timer/callback reference
         ctl->ReleaseRef();                   // starter reference
         return UBRING_ERR;
     }
@@ -541,12 +548,19 @@ void* UBRing::UbrPassiveClearCallback(void* args, uint64_t) {
         ctl->ReleaseRef();
         return nullptr;
     }
+    // The ownership arbitration above is settled; hand the blocking work to
+    // the cleanup worker instead of running it on the timer thread, which
+    // serves every timer in the process. The job takes over the timer/callback
+    // reference.
     UbrTrx* trx = ctl->trx;
-    if (BAIDU_UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
-        UbrDoPassiveClearWork(trx, ctl->ubr_id);
+    if (!UbrCleanupWorker::PostTrxCleanup(trx, ctl->ubr_id,
+                                          UbrDoPassiveClearWork, ctl)) {
+        if (BAIDU_UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
+            UbrDoPassiveClearWork(trx, ctl->ubr_id);
+        }
+        ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
+        ctl->ReleaseRef();                   // timer/callback reference
     }
-    ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-    ctl->ReleaseRef();                       // timer/callback reference
     return nullptr;
 }
 
@@ -618,12 +632,17 @@ void *UBRing::UbrAsynClearCallback(void *args, uint64_t)
         ctl->ReleaseRef();
         return nullptr;
     }
+    // Same offload as the passive path: the timer thread only arbitrates
+    // ownership, the worker does the SDK-backed cleanup.
     UbrTrx* trx = ctl->trx;
-    if (BAIDU_UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
-        UbrDoAsynClearWork(trx, ctl->ubr_id);
+    if (!UbrCleanupWorker::PostTrxCleanup(trx, ctl->ubr_id,
+                                          UbrDoAsynClearWork, ctl)) {
+        if (BAIDU_UNLIKELY(UBRingManager::IsUbrTrxSlotUsed(trx->trx_mgr_index, ctl->ubr_id))) {
+            UbrDoAsynClearWork(trx, ctl->ubr_id);
+        }
+        ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
+        ctl->ReleaseRef();                   // timer/callback reference
     }
-    ATOMIC_STORE(ctl->state, UBR_CLEANUP_DONE);
-    ctl->ReleaseRef();                       // timer/callback reference
     return nullptr;
 }
 
