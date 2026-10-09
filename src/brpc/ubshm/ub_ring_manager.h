@@ -35,13 +35,13 @@ typedef enum {
 typedef enum {
     // The slot is not (or no longer) used by the requested generation: the
     // caller must not touch it and must not run the cleanup.
-    CLAIM_NOT_OURS = 0,
+    UBR_CLEANUP_CLAIM_NOT_OURS = 0,
     // A delayed cleanup is published for that generation and was handed back
     // in *out_ctl with a snapshot reference the caller must release.
-    CLAIM_HAS_CTL = 1,
+    UBR_CLEANUP_CLAIM_HAS_CTL = 1,
     // No delayed cleanup existed; the forced claim took the cleanup ownership
     // and later publications for that generation are refused.
-    CLAIM_OWNED_NULL = 2
+    UBR_CLEANUP_CLAIM_OWNED_NULL = 2
 } UbrCleanupClaim;
 
 typedef struct TagUbrMgr {
@@ -113,15 +113,15 @@ public:
     // that will run it. Both the snapshot and the claim happen under the
     // manager lock, i.e. in the same critical section as
     // TryPublishUnitCleanupCtl, so the two are totally ordered: either the
-    // publication ran first (CLAIM_HAS_CTL, and the existing ctl->state
-    // arbitration decides who runs the cleanup) or the claim ran first
-    // (CLAIM_OWNED_NULL, and every later publication for this generation is
-    // refused through trx->cleanup_forced). Splitting the two steps -- a
-    // snapshot, then an out-of-lock re-check that no ctl appeared -- leaves a
-    // window in which a concurrent SDK-fault callback publishes a new cleanup
-    // after an empty snapshot and both paths run the cleanup.
-    // `*out_ctl' is only written on CLAIM_HAS_CTL, and carries a snapshot
-    // reference the caller must ReleaseRef.
+    // publication ran first (UBR_CLEANUP_CLAIM_HAS_CTL, and the existing
+    // ctl->state arbitration decides who runs the cleanup) or the claim ran
+    // first (UBR_CLEANUP_CLAIM_OWNED_NULL, and every later publication for
+    // this generation is refused through trx->cleanup_forced). Splitting the
+    // two steps -- a snapshot, then an out-of-lock re-check that no ctl
+    // appeared -- leaves a window in which a concurrent SDK-fault callback
+    // publishes a new cleanup after an empty snapshot and both paths run the
+    // cleanup. `*out_ctl' is only written on UBR_CLEANUP_CLAIM_HAS_CTL, and
+    // carries a snapshot reference the caller must ReleaseRef.
     static UbrCleanupClaim ClaimTrxCleanupForced(uint32_t idx,
                                                  uint64_t expect_ubr_id,
                                                  UbrCleanupCtl** out_ctl);

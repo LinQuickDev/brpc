@@ -341,13 +341,13 @@ UbrCleanupClaim UBRingManager::ClaimTrxCleanupForced(
                  g_ubr_mgr.trx_mgr_unit_id == nullptr ||
                  g_ubr_mgr.trx_mgr_unit_ctl == nullptr ||
                  idx >= g_ubr_mgr.trx_cap)) {
-        return CLAIM_NOT_OURS;
+        return UBR_CLEANUP_CLAIM_NOT_OURS;
     }
     // Same generation check as TryClaimTrxClose: a caller that snapshotted the
     // slot before a release/reuse must not claim the new occupant's cleanup.
     if (g_ubr_mgr.trx_mgr_unit_status[idx] != UBR_MGR_UNIT_USED ||
         g_ubr_mgr.trx_mgr_unit_id[idx] != expect_ubr_id) {
-        return CLAIM_NOT_OURS;
+        return UBR_CLEANUP_CLAIM_NOT_OURS;
     }
     UbrCleanupCtl* ctl = g_ubr_mgr.trx_mgr_unit_ctl[idx];
     if (ctl != nullptr) {
@@ -355,20 +355,20 @@ UbrCleanupClaim UBRingManager::ClaimTrxCleanupForced(
         // publication checked it and the acquire retires the previous one.
         // Keep the explicit check as a belt-and-braces guard.
         if (BAIDU_UNLIKELY(ctl->ubr_id != expect_ubr_id)) {
-            return CLAIM_NOT_OURS;
+            return UBR_CLEANUP_CLAIM_NOT_OURS;
         }
         ctl->ref.fetch_add(1);               // snapshot reference
         if (out_ctl != nullptr) {
             *out_ctl = ctl;
         }
-        return CLAIM_HAS_CTL;
+        return UBR_CLEANUP_CLAIM_HAS_CTL;
     }
     // No cleanup was published: this call owns the forced cleanup, and
     // refusing later publications keeps it the only owner. TryPublishUnitCleanupCtl
     // checks the flag in this same critical section, so a publication either
     // happened before (we would have seen its ctl above) or is refused.
     g_ubr_mgr.trx_mgr[idx].cleanup_forced.store(true);
-    return CLAIM_OWNED_NULL;
+    return UBR_CLEANUP_CLAIM_OWNED_NULL;
 }
 
 bool UBRingManager::IsUbrTrxSlotUsed(uint32_t idx, uint64_t expect_ubr_id) {

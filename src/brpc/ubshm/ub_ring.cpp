@@ -257,7 +257,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
             const UbrCleanupClaim claim = UBRingManager::ClaimTrxCleanupForced(
                     _trx->trx_mgr_index, expect_ubr_id, &ctl);
             bool cleanup_owned = false;
-            if (claim == CLAIM_HAS_CTL) {
+            if (claim == UBR_CLEANUP_CLAIM_HAS_CTL) {
                 int expected = UBR_CLEANUP_PENDING;
                 if (ATOMIC_COMPARE_EXCHANGE_STRONG(ctl->state, expected, UBR_CLEANUP_RUNNING)) {
                     cleanup_owned = true;
@@ -265,7 +265,7 @@ RETURN_CODE UBRing::UbrTrxClose() {
                         ctl->ReleaseRef();   // timer/callback reference
                     }
                 }
-            } else if (claim == CLAIM_OWNED_NULL) {
+            } else if (claim == UBR_CLEANUP_CLAIM_OWNED_NULL) {
                 cleanup_owned = true;
             }
             if (cleanup_owned) {
