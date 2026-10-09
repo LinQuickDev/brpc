@@ -65,7 +65,8 @@ struct UbrCleanupJob {
 // A lazily started, process-wide bthread that drains UbrCleanupJob's. It is
 // never stopped during a normal run: after a ShmMgrFini cycle the worker only
 // needs to be quiescent (DrainAndWait) before the shared memory it may touch
-// is finalized, and an idle worker performs no SDK call at all.
+// is finalized, and an idle worker performs no SDK call at all. Posting is
+// serialized, so a job can never be queued behind a worker start that failed.
 class UbrCleanupWorker {
 public:
     // Post a shared-memory drain step. Returns false when the worker cannot be

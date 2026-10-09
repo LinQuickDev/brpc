@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <pthread.h>
 #include <stdint.h>
 #include "butil/atomicops.h"
 #include "butil/containers/mpsc_queue.h"
 #include "butil/logging.h"
+#include "butil/scoped_lock.h"
 #include "bthread/bthread.h"
 #include "brpc/ubshm/ub_cleanup_worker.h"
 #include "brpc/ubshm/ub_ring_manager.h"
@@ -34,15 +36,19 @@ namespace {
 constexpr uint64_t kCleanupIdlePollIntervalUs = 100 * 1000;
 
 butil::atomic<bool> g_worker_started(false);
-// Set when the worker bthread could not be created. Posting then fails
-// forever, and every caller falls back to running its work inline -- the
-// behaviour from before the worker existed.
+// Set when the worker bthread could not be created. Terminal: posting then
+// fails forever, and every caller falls back to running its work inline -- the
+// behaviour from before the worker existed. Never cleared, so no job can ever
+// be queued behind a worker that will not run.
 butil::atomic<bool> g_worker_unavailable(false);
 // Posted-but-not-finished jobs. A poster increments it before enqueueing and
 // the worker decrements it after the job returned, so DrainAndWait can wait
 // for quiescence without observing the queue itself.
 butil::atomic<int> g_cleanup_inflight(0);
 butil::MPSCQueue<UbrCleanupJob> g_cleanup_queue;
+// Serializes the posters (never taken by the worker) around the lazy start and
+// the enqueue; see Post().
+pthread_mutex_t g_worker_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 void RunTrxCleanup(const UbrCleanupJob& job) {
     UbrCleanupCtl* ctl = job.ctl;
@@ -73,33 +79,33 @@ void* UbrCleanupWorkerMain(void*) {
     return nullptr;
 }
 
-bool EnsureStarted() {
+bool Post(const UbrCleanupJob& job) {
+    // Serialize the posters so that "the worker is started" and "a job was
+    // enqueued" cannot be decided by different threads at the same time.
+    // Without this, a poster could observe g_worker_started == true (set by
+    // the thread that is starting the bthread) and enqueue a job while that
+    // start is about to fail: g_worker_unavailable is terminal, so the job
+    // would never be dequeued -- its UbrCleanupCtl reference would leak and
+    // g_cleanup_inflight would never return to zero, hanging every later
+    // DrainAndWait on a teardown path. Posting only happens on cleanup paths,
+    // so the mutex is free in practice. The worker itself never takes it.
+    BAIDU_SCOPED_LOCK(g_worker_mtx);
     if (g_worker_unavailable.load()) {
         return false;
     }
-    if (g_worker_started.load()) {
-        return true;
-    }
-    bool expected = false;
-    if (!g_worker_started.compare_exchange_strong(expected, true)) {
-        return true;                         // another poster is starting it
-    }
-    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
-    bthread_attr_set_name(&attr, "UBCleanup");
-    bthread_t tid;
-    if (BAIDU_UNLIKELY(bthread_start_background(
-            &tid, &attr, UbrCleanupWorkerMain, nullptr) != 0)) {
-        LOG(ERROR) << "Fail to start the ubring cleanup worker bthread.";
-        g_worker_unavailable.store(true);
-        g_worker_started.store(false);
-        return false;
-    }
-    return true;
-}
-
-bool Post(const UbrCleanupJob& job) {
-    if (!EnsureStarted()) {
-        return false;
+    if (!g_worker_started.load()) {
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "UBCleanup");
+        bthread_t tid;
+        if (BAIDU_UNLIKELY(bthread_start_background(
+                &tid, &attr, UbrCleanupWorkerMain, nullptr) != 0)) {
+            LOG(ERROR) << "Fail to start the ubring cleanup worker bthread.";
+            // Terminal: never queue a job behind a worker that cannot run, so
+            // UbrCleanupWorker::DrainAndWait can never observe an orphaned job.
+            g_worker_unavailable.store(true);
+            return false;
+        }
+        g_worker_started.store(true);
     }
     // Increment before enqueueing so a concurrent DrainAndWait can never
     // observe quiescence while this job is still on its way to the queue.
