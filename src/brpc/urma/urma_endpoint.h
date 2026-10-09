@@ -36,7 +36,7 @@
 
 #include "urma_api.h"
 #include "urma_types.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 
 namespace brpc {
@@ -102,7 +102,7 @@ struct UrmaResource {
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
     friend class UrmaConnect;
     friend class Socket;
-    friend class UrmaTransport;
+    friend class ::brpc::UrmaTransport;
     friend class UrmaHandshakeClientV2;
     friend class UrmaHandshakeServerV2;
     friend class UrmaHandshakeClientV3;

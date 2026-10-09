@@ -48,7 +48,7 @@
 #include "brpc/input_messenger.h"
 #include "brpc/socket.h"
 #include "brpc/urma/urma_bonding.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
 #include "brpc/urma_transport.h"
@@ -664,6 +664,7 @@ public:
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
+            sglist[*sge_index].user_tseg = nullptr;
             cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
@@ -741,6 +742,26 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
         const uint32_t remote_jetty_id = _resource->remote_jetty->id.id;
+        for (size_t i = 0; i < sge_index; ++i) {
+            const urma_sge_t& sge = sglist[i];
+            const uint64_t seg_base = sge.tseg->seg.ubva.va;
+            const uint64_t seg_len = sge.tseg->seg.len;
+            const bool in_range = sge.addr >= seg_base &&
+                sge.len <= seg_len && sge.addr - seg_base <= seg_len - sge.len;
+            VLOG(1) << "URMA send SGE: index=" << i
+                    << " addr=" << reinterpret_cast<const void*>(sge.addr)
+                    << " len=" << sge.len
+                    << " tseg=" << static_cast<const void*>(sge.tseg)
+                    << " seg_base=" << reinterpret_cast<const void*>(seg_base)
+                    << " seg_len=" << seg_len
+                    << " in_range=" << in_range
+                    << " from_pool=" << (GetPoolSegFor(
+                        reinterpret_cast<void*>(sge.addr)) == sge.tseg)
+                    << " context_matches="
+                    << (sge.tseg->urma_ctx == GetUrmaContext())
+                    << " local_jetty_id=" << local_jetty_id
+                    << " sq_slot=" << sq_slot;
+        }
 
         // Reserve both credits before making the WR visible to the provider.
         // In polling mode a completion (and even the peer's receive-credit
@@ -927,7 +948,13 @@ int UrmaEndpoint::SendAck(int num) {
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        LOG(WARNING) << "URMA completion failed, status=" << cr.status;
+        LOG(WARNING) << "URMA completion failed, status=" << cr.status
+                     << " kind=" << (cr.flag.bs.s_r == 0 ? "send" : "recv")
+                     << " user_ctx=" << cr.user_ctx
+                     << " completion_len=" << cr.completion_len
+                     << " local_id=" << cr.local_id
+                     << " state=" << GetStateStr()
+                     << " on " << _socket->description();
         errno = EIO;
         return -1;
     }
