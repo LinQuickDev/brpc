@@ -418,10 +418,16 @@ RETURN_CODE UBRing::UbrAddTimer() {
 // A slot cannot be released and reused underneath a callback that already
 // passed that check, and the guarantee is a synchronization one, not a timing
 // one. bthread dispatches all timer callbacks from a single global timer
-// thread, so two per-trx callbacks never run concurrently, and a cleanup that
-// runs from a one-shot timer callback (the delayed-clear path) is serialized
-// after every per-trx callback that was dispatched before it. Entering a close
-// claims the slot for the generation under g_ubr_trx_mgr_mtx
+// thread, so two per-trx callbacks never run concurrently, and the delayed
+// clear arbitration (the ctl->state compare-exchange in the clear callbacks)
+// is serialized after every per-trx callback that was dispatched before it.
+// The cleanup body itself no longer runs on the timer thread but on the
+// cleanup worker (UbrCleanupWorker): it is kept away from a released or reused
+// slot by the generation gate it re-applies under g_ubr_trx_mgr_mtx right
+// before running the work (IsUbrTrxSlotUsed), and by the scheduling paths that
+// wait for the per-trx callbacks through UbrStopTrxTimer -> UbrTimerDelAndWait
+// before they may clear the trx or hand its slot on. Entering a close claims
+// the slot for the generation under g_ubr_trx_mgr_mtx
 // (UBRingManager::TryClaimTrxClose), so a caller working from a stale snapshot
 // -- the faulty-shm event, which looks the slot up before the claim -- cannot
 // touch the next occupant. Teardown that happens on any other thread then waits
