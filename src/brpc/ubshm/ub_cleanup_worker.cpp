@@ -28,6 +28,14 @@
 namespace brpc {
 namespace ubring {
 
+// Test hook, never set in production: when non-zero, the lazy worker start
+// inside Post() skips the real bthread_start_background call and behaves as
+// if it had returned this value, so a transient start failure (e.g. ENOMEM)
+// and its recovery can be exercised deterministically. It is only consulted
+// while the worker is not started; read under g_worker_mtx, written by tests
+// before posting.
+butil::atomic<int> g_ub_test_worker_start_rc(0);
+
 namespace {
 
 // Cleanup latency is tolerated in seconds (it only delays releasing memory of
@@ -36,11 +44,6 @@ namespace {
 constexpr uint64_t kCleanupIdlePollIntervalUs = 100 * 1000;
 
 butil::atomic<bool> g_worker_started(false);
-// Set when the worker bthread could not be created. Terminal: posting then
-// fails forever, and every caller falls back to running its work inline -- the
-// behaviour from before the worker existed. Never cleared, so no job can ever
-// be queued behind a worker that will not run.
-butil::atomic<bool> g_worker_unavailable(false);
 // Posted-but-not-finished jobs. A poster increments it before enqueueing and
 // the worker decrements it after the job returned, so DrainAndWait can wait
 // for quiescence without observing the queue itself.
@@ -91,29 +94,37 @@ void* UbrCleanupWorkerMain(void*) {
 }
 
 bool Post(const UbrCleanupJob& job) {
-    // Serialize the posters so that "the worker is started" and "a job was
-    // enqueued" cannot be decided by different threads at the same time.
-    // Without this, a poster could observe g_worker_started == true (set by
-    // the thread that is starting the bthread) and enqueue a job while that
-    // start is about to fail: g_worker_unavailable is terminal, so the job
-    // would never be dequeued -- its UbrCleanupCtl reference would leak and
-    // g_cleanup_inflight would never return to zero, hanging every later
-    // DrainAndWait on a teardown path. Posting only happens on cleanup paths,
-    // so the mutex is free in practice. The worker itself never takes it.
+    // Serialize the posters (the worker itself never takes this mutex) so
+    // that at most one cleanup worker is ever started: two posters seeing
+    // "not started" at the same time would start two bthreads -- two
+    // concurrent consumers of a single-consumer queue. The start attempt and
+    // the enqueue also share one critical section, so a job is only ever
+    // queued behind a worker whose start succeeded. Posting only happens on
+    // cleanup paths, so the mutex is free in practice.
     BAIDU_SCOPED_LOCK(g_worker_mtx);
-    if (g_worker_unavailable.load()) {
-        return false;
-    }
     if (!g_worker_started.load()) {
+        // Retry the lazy start on every post instead of latching a failure:
+        // bthread_start_background can fail transiently (ENOMEM), and a
+        // permanent fallback would run every later SDK cleanup inline on the
+        // global timer thread -- exactly what the worker exists to avoid,
+        // and worst under the memory pressure that caused the failure. A
+        // failed attempt leaves g_worker_started false and fails only THIS
+        // post; the caller runs it inline as the safety net, and the next
+        // post retries the start.
         bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
         bthread_attr_set_name(&attr, "UBCleanup");
         bthread_t tid;
-        if (BAIDU_UNLIKELY(bthread_start_background(
-                &tid, &attr, UbrCleanupWorkerMain, nullptr) != 0)) {
-            LOG(ERROR) << "Fail to start the ubring cleanup worker bthread.";
-            // Terminal: never queue a job behind a worker that cannot run, so
-            // UbrCleanupWorker::DrainAndWait can never observe an orphaned job.
-            g_worker_unavailable.store(true);
+        // A non-zero test hook overrides the start result without creating
+        // a bthread; see g_ub_test_worker_start_rc.
+        const int injected_rc = g_ub_test_worker_start_rc.load(
+                butil::memory_order_relaxed);
+        const int rc = injected_rc != 0 ? injected_rc
+                : bthread_start_background(&tid, &attr,
+                                           UbrCleanupWorkerMain, nullptr);
+        if (BAIDU_UNLIKELY(rc != 0)) {
+            LOG_EVERY_SECOND(ERROR) << "Fail to start the ubring cleanup "
+                                    << "worker bthread, running the cleanup "
+                                    << "inline.";
             return false;
         }
         g_worker_started.store(true);
