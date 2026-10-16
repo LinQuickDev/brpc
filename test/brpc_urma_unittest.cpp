@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <errno.h>
 #include <limits>
+#include <memory>
+#include <thread>
 #include <vector>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -454,6 +458,57 @@ protected:
     butil::fd_guard peer_fd;
 };
 
+TEST_F(UrmaCommonServerTest, reclaims_send_buffer_before_publishing_sq_credit) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    const uint16_t capacity = 8;
+    endpoint._sq_size = capacity + urma::UrmaEndpoint::RESERVED_WR_NUM;
+    endpoint._local_window_capacity = capacity;
+    endpoint._sbuf.resize(capacity);
+    endpoint._sq_window_size.store(0, butil::memory_order_relaxed);
+    int reclaimed = 0;
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.flag.bs.s_r = 0;
+    completion.user_ctx = 1;
+    for (int round = 0; round < 4 * capacity; ++round) {
+        const uint16_t slot = round % capacity;
+        ASSERT_EQ(slot, endpoint._sq_sent);
+        ASSERT_EQ(0, endpoint._sbuf[slot].append_user_data(
+            new char('x'), 1, [&](void* data) {
+                // Deterministically inspect the publication boundary from
+                // inside clear(), before the slot can be reused by a writer.
+                EXPECT_EQ(0u, endpoint._sq_window_size.load(
+                                  butil::memory_order_acquire));
+                ++reclaimed;
+                delete static_cast<char*>(data);
+            }));
+        ASSERT_EQ(0, endpoint.HandleCompletion(completion));
+        EXPECT_TRUE(endpoint._sbuf[slot].empty());
+        EXPECT_EQ((slot + 1) % capacity, endpoint._sq_sent);
+        EXPECT_EQ(1u, endpoint._sq_window_size.fetch_sub(
+                          1, butil::memory_order_acquire));
+    }
+    EXPECT_EQ(4 * capacity, reclaimed);
+}
+
+TEST_F(UrmaCommonServerTest, excess_send_completion_keeps_buffer_owned) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._local_window_capacity = 8;
+    endpoint._sq_window_size.store(8, butil::memory_order_relaxed);
+    endpoint._sbuf.resize(8);
+    endpoint._sbuf[0].append("still owned");
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.flag.bs.s_r = 0;
+    completion.user_ctx = 1;
+    errno = 0;
+    EXPECT_EQ(-1, endpoint.HandleCompletion(completion));
+    EXPECT_EQ(EPROTO, errno);
+    EXPECT_EQ("still owned", endpoint._sbuf[0].to_string());
+    EXPECT_EQ(0u, endpoint._sq_sent);
+    EXPECT_EQ(8u, endpoint._sq_window_size.load(butil::memory_order_acquire));
+}
+
 TEST_F(UrmaCommonServerTest, resumes_fragmented_hello_and_ack_without_rpc_handoff) {
     for (int version : {2, 3}) {
         BufferedUrmaTestAdapter adapter(version);
@@ -773,6 +828,105 @@ protected:
 private:
     bool _owns_urma_init{false};
 };
+
+TEST_F(UrmaMockTest, send_completion_releases_source_only_after_copy) {
+    int device_count = 0;
+    urma_device_t** devices = urma_get_device_list(&device_count);
+    ASSERT_NE(nullptr, devices);
+    urma_context_t* raw_context = urma_create_context(devices[0], 0);
+    urma_free_device_list(devices);
+    std::unique_ptr<urma_context_t, decltype(&urma_delete_context)> context(
+        raw_context, urma_delete_context);
+    ASSERT_NE(nullptr, context.get());
+    urma::UrmaResource resource;
+    resource.jfce = urma_create_jfce(context.get());
+    ASSERT_NE(nullptr, resource.jfce);
+    urma_jfc_cfg_t jfc_cfg{};
+    jfc_cfg.depth = 8;
+    jfc_cfg.jfce = resource.jfce;
+    resource.jfc = urma_create_jfc(context.get(), &jfc_cfg);
+    ASSERT_NE(nullptr, resource.jfc);
+    urma_jfr_cfg_t jfr_cfg{};
+    jfr_cfg.depth = 4;
+    jfr_cfg.trans_mode = URMA_TM_RM;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.jfc = resource.jfc;
+    resource.jfr = urma_create_jfr(context.get(), &jfr_cfg);
+    ASSERT_NE(nullptr, resource.jfr);
+    urma_jetty_cfg_t jetty_cfg{};
+    jetty_cfg.flag.bs.share_jfr = 1;
+    jetty_cfg.jfs_cfg.depth = 4;
+    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+    jetty_cfg.jfs_cfg.max_sge = 1;
+    jetty_cfg.jfs_cfg.jfc = resource.jfc;
+    jetty_cfg.shared.jfr = resource.jfr;
+    jetty_cfg.shared.jfc = resource.jfc;
+    resource.jetty = urma_create_jetty(context.get(), &jetty_cfg);
+    ASSERT_NE(nullptr, resource.jetty);
+    urma_rjetty_t remote{};
+    remote.jetty_id = resource.jetty->jetty_id;
+    remote.trans_mode = URMA_TM_RM;
+    remote.type = URMA_JETTY;
+    remote.tp_type = URMA_CTP;
+    urma_token_t token{};
+    resource.remote_jetty = urma_import_jetty(context.get(), &remote, &token);
+    ASSERT_NE(nullptr, resource.remote_jetty);
+
+    const std::string expected(1024 * 1024, 'x');
+    std::string payload(expected);
+    std::string received(expected.size(), '\0');
+    for (int round = 0; round < 8; ++round) {
+        payload = expected;
+        urma_sge_t receive_sge{reinterpret_cast<uint64_t>(&received[0]),
+            static_cast<uint32_t>(received.size()), nullptr, nullptr};
+        urma_jfr_wr_t receive_wr{{&receive_sge, 1}, 0, nullptr};
+        urma_jfr_wr_t* bad_receive = nullptr;
+        ASSERT_EQ(URMA_SUCCESS, urma_post_jfr_wr(
+            resource.jfr, &receive_wr, &bad_receive));
+        urma_sge_t send_sge{reinterpret_cast<uint64_t>(&payload[0]),
+            static_cast<uint32_t>(payload.size()), nullptr, nullptr};
+        urma_jfs_wr_t send_wr{};
+        send_wr.opcode = URMA_OPC_SEND;
+        send_wr.flag.bs.complete_enable = 1;
+        send_wr.tjetty = resource.remote_jetty;
+        send_wr.send.src = {&send_sge, 1};
+        std::atomic<bool> ready(false);
+        std::atomic<bool> stop(false);
+        int completions = 0;
+        std::thread poller([&]() {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            ready.store(true, std::memory_order_release);
+            while (completions < 2 && !stop.load(std::memory_order_relaxed) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                urma_cr_t completion{};
+                if (urma_poll_jfc(resource.jfc, 1, &completion) == 1) {
+                    if (completion.flag.bs.s_r == 0) {
+                        // A real caller may reuse the source immediately
+                        // after observing the send completion.
+                        memset(&payload[0], 'z', payload.size());
+                    }
+                    ++completions;
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+        while (!ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        urma_jfs_wr_t* bad_send = nullptr;
+        const urma_status_t status = urma_post_jetty_send_wr(
+            resource.jetty, &send_wr, &bad_send);
+        if (status != URMA_SUCCESS) {
+            stop.store(true, std::memory_order_relaxed);
+        }
+        poller.join();
+        ASSERT_EQ(URMA_SUCCESS, status);
+        ASSERT_EQ(2, completions);
+        EXPECT_EQ(0, memcmp(expected.data(), received.data(), expected.size()));
+    }
+}
 
 TEST_F(UrmaMockTest, init_and_enumerate_device) {
     urma_init_attr_t init_attr{};

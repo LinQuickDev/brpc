@@ -694,7 +694,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     ssize_t total_len = 0;
     while (current < ndata) {
         uint16_t remote_wnd = _remote_rq_window_size.load(butil::memory_order_relaxed);
-        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_relaxed);
+        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_acquire);
         if (remote_wnd == 0 || sq_wnd == 0) {
             if (total_len > 0) {
                 break;
@@ -802,7 +802,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
 
 bool UrmaEndpoint::IsWritable() const {
     return _remote_rq_window_size.load(butil::memory_order_relaxed) > 0 &&
-           _sq_window_size.load(butil::memory_order_relaxed) > 0;
+           _sq_window_size.load(butil::memory_order_acquire) > 0;
 }
 
 // ============================================================================
@@ -977,30 +977,26 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             return 0;
         }
         uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
-        uint16_t old =
+        const uint16_t old =
             _sq_window_size.load(butil::memory_order_relaxed);
-        while (true) {
-            if (old >= _local_window_capacity) {
-                LOG(WARNING)
-                    << "URMA send completion exceeds SQ window: old=" << old
-                    << " increment=" << wnd
-                    << " capacity=" << _local_window_capacity
-                    << " user_ctx=" << cr.user_ctx
-                    << " on " << _socket->description();
-                errno = EPROTO;
-                return -1;
-            }
-            if (_sq_window_size.compare_exchange_weak(
-                    old, static_cast<uint16_t>(old + wnd),
-                    butil::memory_order_relaxed)) {
-                break;
-            }
+        if (old >= _local_window_capacity) {
+            LOG(WARNING)
+                << "URMA send completion exceeds SQ window: old=" << old
+                << " increment=" << wnd
+                << " capacity=" << _local_window_capacity
+                << " user_ctx=" << cr.user_ctx
+                << " on " << _socket->description();
+            errno = EPROTO;
+            return -1;
         }
         for (uint16_t i = 0; i < wnd; ++i) {
             _sbuf[_sq_sent].clear();
             _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
         }
-        butil::subtle::MemoryBarrier();
+        // Only the serialized CQ consumer returns credits. Reclaim the slot
+        // before publishing it to the writer; its acquire load must observe
+        // clear() before appending another payload to the same IOBuf.
+        _sq_window_size.fetch_add(wnd, butil::memory_order_release);
         if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
             _local_window_capacity / 8) {
             _socket->WakeAsEpollOut();
