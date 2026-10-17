@@ -75,8 +75,13 @@ static const size_t HELLO_ACK_LEN = 4;
 static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
 static const size_t URMA_READ_THRESHOLD = 4096;
-static const uint32_t URMA_READ_IMM_TAG = 0xA5000000U;
-static const uint32_t URMA_READ_IMM_MASK = 0xFFFF0000U;
+// Bonding devices with MSN enabled preserve only immediate bits 0..20.
+// Keep the READ control tag in bits 16..20; credits fit below bit 16.
+static const uint64_t URMA_READ_IMM_USABLE_MASK = 0x001FFFFFULL;
+static const uint32_t URMA_READ_IMM_TAG = 0x001A0000U;
+static const uint32_t URMA_READ_IMM_MASK = 0x001F0000U;
+static_assert((URMA_READ_IMM_TAG & ~URMA_READ_IMM_USABLE_MASK) == 0,
+              "READ control IMM must survive bonding MSN masking");
 static const uint8_t URMA_READ_PROTOCOL_VERSION = 1;
 static const size_t URMA_READ_CONTROL_SIZE = 56;
 enum UrmaReadControlType : uint8_t {
@@ -871,6 +876,17 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                     errno = EAGAIN;
                     return -1;
                 }
+                // All submitters hold _io_mutex. Check the OFFER credits
+                // before copying a potentially MiB-sized source; otherwise
+                // every retry during backpressure repeats the same copy.
+                if (_remote_rq_window_size.load(butil::memory_order_relaxed) <=
+                        READ_CONTROL_RESERVE ||
+                    _sq_window_size.load(butil::memory_order_relaxed) <=
+                        READ_CONTROL_RESERVE) {
+                    if (total_len > 0) break;
+                    errno = EAGAIN;
+                    return -1;
+                }
                 length = static_cast<uint32_t>(std::min<size_t>(
                     request->size(), std::min(_read_slot_capacity,
                                                _read_peer_max_chunk)));
@@ -1661,23 +1677,27 @@ ssize_t UrmaEndpoint::HandleCompletionLocked(const urma_cr_t& cr) {
             _read_done_pending = true;
             lock.unlock();
             butil::subtle::MemoryBarrier();
-            if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
-                _local_window_capacity / 8) {
+            if (IsWritable()) {
                 _socket->WakeAsEpollOut();
             }
             return read_len;
         }
         butil::subtle::MemoryBarrier();
-        if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
-            _local_window_capacity / 8) {
+        // Match the actual admission threshold, including the OFFER control
+        // buffer. A higher batching threshold can strand a writable endpoint.
+        if (IsWritable()) {
             _socket->WakeAsEpollOut();
         }
         return 0;
     }
     // Recv completion.
+    // On bonding devices the other immediate bits are reserved for MSN or
+    // provider metadata. Interpret only the bits our wire protocol owns.
+    const uint32_t imm = static_cast<uint32_t>(
+        cr.imm_data & URMA_READ_IMM_USABLE_MASK);
     const bool is_read_control =
         cr.opcode == URMA_CR_OPC_SEND_WITH_IMM &&
-        (cr.imm_data & URMA_READ_IMM_MASK) == URMA_READ_IMM_TAG;
+        (imm & URMA_READ_IMM_MASK) == URMA_READ_IMM_TAG;
     uint8_t read_control_frame[URMA_READ_CONTROL_SIZE];
     if (is_read_control) {
         if (cr.completion_len != URMA_READ_CONTROL_SIZE) {
@@ -1686,18 +1706,23 @@ ssize_t UrmaEndpoint::HandleCompletionLocked(const urma_cr_t& cr) {
         }
         std::memcpy(read_control_frame, _rbuf_data[_rq_received],
                     sizeof(read_control_frame));
-        if ((cr.imm_data & 0xffffU) != read_control_frame[5]) {
+        if ((imm & 0xffffU) != read_control_frame[5]) {
             errno = EPROTO;
             return -1;
         }
         zerocopy = false;
-    } else if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
-        if (cr.completion_len != 0 || cr.imm_data > _local_window_capacity) {
-            LOG(WARNING) << "Invalid URMA receive credit: " << cr.imm_data;
+    } else if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && imm > 0) {
+        if (cr.completion_len != 0 || imm > _local_window_capacity) {
+            LOG(WARNING) << "Invalid URMA receive credit: imm=" << cr.imm_data
+                         << " decoded_imm=" << imm
+                         << " completion_len=" << cr.completion_len
+                         << " capacity=" << _local_window_capacity
+                         << " state=" << GetStateStr()
+                         << " on " << _socket->description();
             errno = EPROTO;
             return -1;
         }
-        const uint16_t acks = static_cast<uint16_t>(cr.imm_data);
+        const uint16_t acks = static_cast<uint16_t>(imm);
         uint16_t old =
             _remote_rq_window_size.load(butil::memory_order_relaxed);
         while (true) {

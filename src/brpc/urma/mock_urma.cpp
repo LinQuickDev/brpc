@@ -97,6 +97,11 @@ void PushCompletion(urma_jfc_t* jfc, JfcState* state,
     }
 }
 
+// Adjustable READ capability so tests can cover both the device-limited and
+// large-slot paths without rebuilding the mock.
+uint32_t mock_max_read_size = 8192;
+std::atomic<uint64_t> mock_read_count{0};
+
 urma_device_attr_t mock_device_attr = {
     .guid = {.raw = {10}},
     .dev_cap = {},
@@ -240,11 +245,12 @@ urma_status_t urma_query_device(urma_device_t *device,
     if (!device || !attr) {
         return URMA_EINVAL;
     }
+    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     mock_device_attr.dev_cap.max_jfc = 1024;
     mock_device_attr.dev_cap.max_jetty = 1024;
     mock_device_attr.dev_cap.max_jfs_sge = 8;
     mock_device_attr.dev_cap.max_jfr_sge = 8;
-    mock_device_attr.dev_cap.max_read_size = 8192;
+    mock_device_attr.dev_cap.max_read_size = mock_max_read_size;
     memcpy(attr, &mock_device_attr, sizeof(urma_device_attr_t));
     return URMA_SUCCESS;
 }
@@ -573,6 +579,9 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                 auto remote_it = seg_map.find(remote.tseg);
                 auto local_it = seg_map.find(local.tseg);
                 if (remote_it != seg_map.end() && local_it != seg_map.end() &&
+                    target_jetty_map.find(current->tjetty) != target_jetty_map.end() &&
+                    jetty_id_map.find(current->tjetty->id.id) != jetty_id_map.end() &&
+                    remote.len > 0 && remote.len <= mock_max_read_size &&
                     remote.tseg->seg.ubva.va <= remote.addr &&
                     remote.addr - remote.tseg->seg.ubva.va <=
                         remote.tseg->seg.len &&
@@ -591,6 +600,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                 if (bad_wr) *bad_wr = current;
                 return URMA_EINVAL;
             }
+            mock_read_count.fetch_add(1, std::memory_order_relaxed);
             std::memcpy(reinterpret_cast<void*>(local.addr),
                         reinterpret_cast<const void*>(remote.addr), remote.len);
             if (current->flag.bs.complete_enable) {
@@ -770,5 +780,17 @@ void urma_ack_jfc(urma_jfc_t*[], uint32_t[], uint32_t) {
 }
 
 }  // extern "C"
+
+// Test-only hook (not part of the URMA API): set the advertised maximum READ
+// length before the URMA environment is initialized. Declared weak by tests so
+// it stays optional when the binary links a real provider.
+extern "C" void mock_urma_set_max_read_size(uint32_t value) {
+    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    mock_max_read_size = value;
+}
+
+extern "C" uint64_t mock_urma_read_count() {
+    return mock_read_count.load(std::memory_order_relaxed);
+}
 
 #endif  // BRPC_WITH_URMA

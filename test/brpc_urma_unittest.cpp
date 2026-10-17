@@ -17,6 +17,11 @@
 
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 
@@ -24,6 +29,8 @@
 #include "butil/atomicops.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
+#include "brpc/socket.h"
+#include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
@@ -35,6 +42,13 @@ namespace brpc {
 namespace urma {
 
 DECLARE_int32(urma_client_handshake_version);
+DECLARE_bool(urma_use_polling);
+DECLARE_int32(urma_sq_size);
+DECLARE_int32(urma_rq_size);
+DECLARE_int32(urma_prepared_jetty_cnt);
+DECLARE_int32(urma_buffer_count);
+DECLARE_uint32(urma_read_slot_size);
+DECLARE_uint64(urma_read_pool_size);
 extern bool g_skip_urma_init;
 extern butil::atomic<bool> g_urma_available;
 
@@ -281,6 +295,8 @@ TEST(UrmaHandshakeTest, supported_by_urma_protocol_allowlist) {
 class UrmaMockTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        _previous_skip = urma::g_skip_urma_init;
+        _previous_available = urma::g_urma_available.load(butil::memory_order_relaxed);
         urma::g_skip_urma_init = false;
 
         urma_init_attr_t init_attr{};
@@ -308,11 +324,13 @@ protected:
         if (_owns_urma_init) {
             EXPECT_EQ(URMA_SUCCESS, urma_uninit());
         }
-        urma::g_skip_urma_init = true;
-        urma::g_urma_available.store(true, butil::memory_order_relaxed);
+        urma::g_skip_urma_init = _previous_skip;
+        urma::g_urma_available.store(_previous_available, butil::memory_order_relaxed);
     }
 
 private:
+    bool _previous_skip{true};
+    bool _previous_available{true};
     bool _owns_urma_init{false};
 };
 
@@ -591,6 +609,971 @@ TEST_F(UrmaMockTest,
     urma_delete_jfce(sender_jfce);
     urma_delete_context(ctx);
     urma_free_device_list(devices);
+}
+
+// ===========================================================================
+// READ (one-sided READ) control protocol and data path.
+//
+// The tests below run against the link-time URMA mock. Control frames are
+// posted through the normal urma_post_jetty_send_wr path and delivered to the
+// peer JFR by the mock; completions are pumped manually so each step of the
+// OFFER -> READ -> DONE exchange is deterministic (no poller bthread).
+// ===========================================================================
+
+namespace {
+
+constexpr size_t kReadControlBytes = 56;
+constexpr uint8_t kReadControlVersion = 1;
+constexpr uint8_t kReadReady = 1;
+constexpr uint8_t kReadOffer = 2;
+constexpr uint8_t kReadDone = 3;
+constexpr size_t kReadSlotBytes = 64 * 1024;
+constexpr size_t kReadArenaBytes = 1 * 1024 * 1024;
+
+// Test-only hook exported by the link-time mock. Weak so the test binary still
+// links against a real liburma provider.
+extern "C" void mock_urma_set_max_read_size(uint32_t) __attribute__((weak));
+extern "C" uint64_t mock_urma_read_count() __attribute__((weak));
+
+uint64_t TestHostToNet64(uint64_t value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (static_cast<uint64_t>(butil::HostToNet32(value & 0xffffffffU))
+            << 32) |
+           butil::HostToNet32(value >> 32);
+#else
+    return value;
+#endif
+}
+
+// Encodes one 56-byte control frame exactly as UrmaEndpoint::SendReadControl
+// does. Keeping the format here pins the on-wire layout in tests.
+void EncodeReadControl(uint8_t frame[kReadControlBytes], uint8_t type,
+                       uint64_t sender_epoch, uint64_t target_epoch,
+                       uint64_t seq, uint64_t stream_offset,
+                       uint64_t segment_offset, uint32_t length,
+                       uint32_t max_chunk) {
+    std::memset(frame, 0, kReadControlBytes);
+    std::memcpy(frame, "URDC", 4);
+    frame[4] = kReadControlVersion;
+    frame[5] = type;
+    const uint16_t size_be =
+        butil::HostToNet16(static_cast<uint16_t>(kReadControlBytes));
+    std::memcpy(frame + 6, &size_be, sizeof(size_be));
+    const uint64_t sender_be = TestHostToNet64(sender_epoch);
+    const uint64_t target_be = TestHostToNet64(target_epoch);
+    const uint64_t seq_be = TestHostToNet64(seq);
+    const uint64_t stream_be = TestHostToNet64(stream_offset);
+    const uint64_t segment_be = TestHostToNet64(segment_offset);
+    const uint32_t length_be = butil::HostToNet32(length);
+    const uint32_t max_chunk_be = butil::HostToNet32(max_chunk);
+    std::memcpy(frame + 8, &sender_be, sizeof(sender_be));
+    std::memcpy(frame + 16, &target_be, sizeof(target_be));
+    std::memcpy(frame + 24, &seq_be, sizeof(seq_be));
+    std::memcpy(frame + 32, &stream_be, sizeof(stream_be));
+    std::memcpy(frame + 40, &segment_be, sizeof(segment_be));
+    std::memcpy(frame + 48, &length_be, sizeof(length_be));
+    std::memcpy(frame + 52, &max_chunk_be, sizeof(max_chunk_be));
+}
+
+std::string MakeReadPayload(size_t size) {
+    std::string data(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+        data[i] = static_cast<char>((i * 131u + 17u) & 0xffu);
+    }
+    return data;
+}
+
+// One-time process-wide setup: small arena plus polling-mode CQ carrier.
+bool EnsureReadTestEnvironment() {
+    static const bool ready = [] {
+        urma_init_attr_t init_attr{};
+        const urma_status_t status = urma_init(&init_attr);
+        if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+            return false;
+        }
+        int num_devices = 0;
+        urma_device_t** devices = urma_get_device_list(&num_devices);
+        const bool using_mock =
+            devices != nullptr && num_devices > 0 &&
+            std::strcmp(devices[0]->name, "mock_urma_device") == 0;
+        urma_free_device_list(devices);
+        if (!using_mock) {
+            return false;
+        }
+        urma::g_skip_urma_init = false;
+        urma::FLAGS_urma_use_polling = true;
+        urma::FLAGS_urma_sq_size = 64;
+        urma::FLAGS_urma_rq_size = 64;
+        urma::FLAGS_urma_prepared_jetty_cnt = 0;
+        urma::FLAGS_urma_buffer_count = 8192;
+        urma::FLAGS_urma_read_slot_size = static_cast<uint32_t>(kReadSlotBytes);
+        urma::FLAGS_urma_read_pool_size = kReadArenaBytes;
+        if (mock_urma_set_max_read_size != nullptr) {
+            // Let one READ cover a whole slot. Without the hook the device
+            // limit (mock default 8 KiB) drives the round count.
+            mock_urma_set_max_read_size(
+                static_cast<uint32_t>(kReadSlotBytes));
+        }
+        urma::GlobalUrmaInitializeOrDie();
+        return urma::IsUrmaAvailable();
+    }();
+    return ready;
+}
+
+bool MakeTestSocket(SocketId* sid) {
+    int fds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        return false;
+    }
+    SocketOptions options;
+    options.fd = fds[0];
+    if (Socket::Create(options, sid) != 0) {
+        ::close(fds[0]);
+        ::close(fds[1]);
+        return false;
+    }
+    ::close(fds[1]);
+    return true;
+}
+
+void DestroyTestSocket(SocketId sid) {
+    if (sid == INVALID_SOCKET_ID) {
+        return;
+    }
+    SocketUniquePtr s;
+    if (Socket::Address(sid, &s) == 0) {
+        s->SetFailed();
+    }
+}
+
+urma::UrmaEndpoint* MakeTestEndpoint(SocketId sid) {
+    SocketUniquePtr s;
+    if (Socket::Address(sid, &s) != 0) {
+        return nullptr;
+    }
+    return new (std::nothrow) urma::UrmaEndpoint(s.get());
+}
+
+// Drains the endpoint CQ and feeds each completion through the same handler
+// the pollers use. Returns false on completion error.
+bool PumpCompletions(urma::UrmaEndpoint* ep, int* completions,
+                     ssize_t* bytes) {
+    urma_cr_t crs[32];
+    while (true) {
+        const int n = urma_poll_jfc(ep->_resource->jfc, 32, crs);
+        if (n < 0) {
+            return false;
+        }
+        if (n == 0) {
+            return true;
+        }
+        for (int i = 0; i < n; ++i) {
+            const ssize_t nr = ep->HandleCompletion(crs[i]);
+            if (nr < 0) {
+                return false;
+            }
+            if (completions != nullptr) {
+                ++*completions;
+            }
+            if (bytes != nullptr) {
+                *bytes += nr;
+            }
+        }
+    }
+}
+
+// Runs both endpoints until neither side produces a completion. Control frames
+// posted by one side show up as receive completions on the other, so this also
+// drains credit ACKs and DONE frames.
+bool PumpBoth(urma::UrmaEndpoint* a, urma::UrmaEndpoint* b,
+              int* completions = nullptr, ssize_t* bytes = nullptr) {
+    for (int round = 0; round < 64; ++round) {
+        int ca = 0;
+        int cb = 0;
+        ssize_t ba = 0;
+        ssize_t bb = 0;
+        if (!PumpCompletions(a, &ca, &ba) ||
+            !PumpCompletions(b, &cb, &bb)) {
+            return false;
+        }
+        if (completions != nullptr) {
+            *completions += ca + cb;
+        }
+        if (bytes != nullptr) {
+            *bytes += ba + bb;
+        }
+        if (ca + cb == 0) {
+            // An empty CQ is not progress if either endpoint is stuck waiting
+            // for a READ, DONE or READY which has no completion to wake it.
+            auto idle = [](urma::UrmaEndpoint* ep) {
+                return !ep->_read_tx_offer_pending && !ep->_read_rx_active &&
+                       !ep->_read_post_pending && !ep->_read_done_pending &&
+                       !ep->_read_ready_pending && !ep->_read_early_offer;
+            };
+            return idle(a) && idle(b);
+        }
+    }
+    return false;
+}
+
+uint32_t ExpectedReadChunk() {
+    const uint32_t device_max = urma::GetUrmaMaxReadSize();
+    return std::min(static_cast<uint32_t>(kReadSlotBytes), device_max);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Control frame validation. These tests only need an endpoint (no URMA
+// resources): every rejected frame must fail before touching the provider.
+// ---------------------------------------------------------------------------
+class UrmaReadControlTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        if (mock_urma_set_max_read_size == nullptr) {
+            GTEST_SKIP() << "READ path tests require the URMA link-time mock";
+        }
+        ASSERT_TRUE(EnsureReadTestEnvironment()) << "Mock READ initialization failed";
+        ASSERT_TRUE(MakeTestSocket(&_sid));
+        _ep.reset(MakeTestEndpoint(_sid));
+        ASSERT_NE(nullptr, _ep);
+        _ep->_read_max_chunk = static_cast<uint32_t>(kReadSlotBytes);
+        _ep->_remote_segment_len = 1ull << 20;
+    }
+
+    void TearDown() override {
+        _ep.reset();
+        DestroyTestSocket(_sid);
+    }
+
+    uint8_t frame_[kReadControlBytes];
+    SocketId _sid{INVALID_SOCKET_ID};
+    std::unique_ptr<urma::UrmaEndpoint> _ep;
+};
+
+TEST_F(UrmaReadControlTest, ready_publishes_peer_capability) {
+    EncodeReadControl(frame_, kReadReady, 7, 0, 0, 0, 0, 0,
+                      static_cast<uint32_t>(kReadSlotBytes));
+    ASSERT_EQ(0, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_TRUE(_ep->_read_peer_ready);
+    EXPECT_EQ(7u, _ep->_read_peer_epoch);
+    EXPECT_EQ(kReadSlotBytes, _ep->_read_peer_max_chunk);
+    EXPECT_TRUE(_ep->_read_tx_credit);
+
+    // A second READY on the same connection is a protocol error.
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, rejects_invalid_ready) {
+    // READY must carry target_epoch == 0 and a usable chunk size.
+    EncodeReadControl(frame_, kReadReady, 7, 1, 0, 0, 0, 0,
+                      static_cast<uint32_t>(kReadSlotBytes));
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    EncodeReadControl(frame_, kReadReady, 7, 0, 0, 0, 0, 0, 4095);
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    // Epoch zero is not a valid sender epoch.
+    EncodeReadControl(frame_, kReadReady, 0, 0, 0, 0, 0, 0,
+                      static_cast<uint32_t>(kReadSlotBytes));
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, offer_before_peer_ready_is_stashed_once) {
+    EncodeReadControl(frame_, kReadOffer, 7, 0, 0, 4096, 0, 8192, 0);
+    ASSERT_EQ(0, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_TRUE(_ep->_read_early_offer);
+    EXPECT_FALSE(_ep->_read_post_pending);
+    EXPECT_FALSE(_ep->_read_rx_active);
+    EXPECT_EQ(0, std::memcmp(frame_, _ep->_read_early_frame,
+                             kReadControlBytes));
+
+    // Only one early OFFER may be outstanding.
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, rejects_invalid_offer) {
+    _ep->_read_peer_ready = true;
+    _ep->_read_peer_epoch = 40;
+    _ep->_read_tx_epoch = 9;
+    _ep->_read_rx_offset = 0;
+    _ep->_read_rx_seq = 0;
+
+    // Correct baseline first.
+    EncodeReadControl(frame_, kReadOffer, 40, 9, 0, 0, 0, 8192, 0);
+    ASSERT_EQ(0, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_TRUE(_ep->_read_post_pending);
+    EXPECT_TRUE(_ep->_read_rx_active);
+    EXPECT_EQ(8192u, _ep->_read_pending_length);
+
+    // While a READ is outstanding the next OFFER must be rejected.
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, rejects_offer_with_bad_fields) {
+    struct Case {
+        uint64_t sender_epoch;
+        uint64_t target_epoch;
+        uint64_t stream_offset;
+        uint32_t length;
+        uint32_t max_chunk;
+    };
+    const Case cases[] = {
+        {41, 9, 0, 8192, 0},                 // wrong sender epoch
+        {40, 8, 0, 8192, 0},                 // wrong target epoch
+        {40, 9, 0, 0, 0},                    // zero length
+        {40, 9, 0, static_cast<uint32_t>(kReadSlotBytes) + 1, 0},  // too big
+        {40, 9, 0, 8192, 1},                 // OFFER must not carry a credit
+        {40, 9, 0, 8192, 0},                 // (baseline, see below)
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        _ep->_read_peer_ready = true;
+        _ep->_read_peer_epoch = 40;
+        _ep->_read_tx_epoch = 9;
+        _ep->_read_rx_offset = 0;
+        _ep->_read_rx_seq = 0;
+        _ep->_read_post_pending = false;
+        _ep->_read_rx_active = false;
+        _ep->_read_early_offer = false;
+        EncodeReadControl(frame_, kReadOffer, cases[i].sender_epoch,
+                          cases[i].target_epoch, 0, cases[i].stream_offset, 0,
+                          cases[i].length, cases[i].max_chunk);
+        const int rc = _ep->HandleReadControl(frame_, kReadControlBytes);
+        if (i + 1 == sizeof(cases) / sizeof(cases[0])) {
+            EXPECT_EQ(0, rc) << "case " << i;
+        } else {
+            EXPECT_EQ(-1, rc) << "case " << i;
+            EXPECT_EQ(EPROTO, errno) << "case " << i;
+        }
+    }
+}
+
+TEST_F(UrmaReadControlTest, rejects_offer_outside_remote_segment) {
+    _ep->_read_peer_ready = true;
+    _ep->_read_peer_epoch = 40;
+    _ep->_read_tx_epoch = 9;
+    _ep->_remote_segment_len = 8192;
+
+    EncodeReadControl(frame_, kReadOffer, 40, 9, 0, 0, 8192, 8192, 0);
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    EncodeReadControl(frame_, kReadOffer, 40, 9, 0, 0,
+                      (1ull << 63), 8192, 0);
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, done_releases_tx_source_and_credit) {
+    _ep->_read_peer_ready = true;
+    _ep->_read_peer_epoch = 40;
+    _ep->_read_tx_epoch = 9;
+    _ep->_read_tx_seq = 3;
+    _ep->_read_tx_offset = 4096;
+    _ep->_read_tx_length = 8192;
+    _ep->_read_tx_offer_pending = true;
+    _ep->_read_tx_credit = false;
+
+    EncodeReadControl(frame_, kReadDone, 40, 9, 3, 4096, 0, 8192, 1);
+    ASSERT_EQ(0, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_FALSE(_ep->_read_tx_offer_pending);
+    EXPECT_TRUE(_ep->_read_tx_credit);
+    EXPECT_EQ(4096u + 8192u, _ep->_read_tx_offset);
+    EXPECT_EQ(4u, _ep->_read_tx_seq);
+
+    // Duplicate DONE without a new OFFER is a protocol error.
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST_F(UrmaReadControlTest, rejects_invalid_frame_header) {
+    EncodeReadControl(frame_, kReadReady, 7, 0, 0, 0, 0, 0,
+                      static_cast<uint32_t>(kReadSlotBytes));
+
+    uint8_t bad[kReadControlBytes];
+    std::memcpy(bad, frame_, sizeof(bad));
+    bad[0] = 'X';
+    EXPECT_EQ(-1, _ep->HandleReadControl(bad, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    std::memcpy(bad, frame_, sizeof(bad));
+    bad[4] = kReadControlVersion + 1;
+    EXPECT_EQ(-1, _ep->HandleReadControl(bad, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    std::memcpy(bad, frame_, sizeof(bad));
+    const uint16_t wrong_size = butil::HostToNet16(55);
+    std::memcpy(bad + 6, &wrong_size, sizeof(wrong_size));
+    EXPECT_EQ(-1, _ep->HandleReadControl(bad, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    std::memcpy(bad, frame_, sizeof(bad));
+    bad[5] = 9;  // unknown control type
+    EXPECT_EQ(-1, _ep->HandleReadControl(bad, kReadControlBytes));
+    EXPECT_EQ(EPROTO, errno);
+
+    // A truncated frame never gets parsed.
+    EXPECT_EQ(-1, _ep->HandleReadControl(frame_, kReadControlBytes - 1));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+// ---------------------------------------------------------------------------
+// READ slot arena: allocation, alignment, exhaustion and recycling.
+// ---------------------------------------------------------------------------
+class UrmaReadArenaTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        if (mock_urma_set_max_read_size == nullptr) {
+            GTEST_SKIP() << "READ path tests require the URMA link-time mock";
+        }
+        ASSERT_TRUE(EnsureReadTestEnvironment()) << "Mock READ initialization failed";
+    }
+};
+
+TEST_F(UrmaReadArenaTest, slot_pair_is_registered_aligned_and_recycled) {
+    butil::IOBuf tx;
+    butil::IOBuf rx;
+    void* tx_data = nullptr;
+    void* rx_data = nullptr;
+    uint32_t capacity = 0;
+    ASSERT_TRUE(urma::AllocateReadSlotPair(&tx, &tx_data, &rx, &rx_data,
+                                           &capacity));
+    EXPECT_EQ(static_cast<uint32_t>(kReadSlotBytes), capacity);
+    ASSERT_NE(nullptr, tx_data);
+    ASSERT_NE(nullptr, rx_data);
+    EXPECT_NE(tx_data, rx_data);
+
+    const long page = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page, 0);
+    EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(tx_data) % page);
+    EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(rx_data) % page);
+
+    // Both slots belong to the single registered pool segment.
+    EXPECT_EQ(urma::GetPoolSegFor(nullptr), urma::GetPoolSegFor(tx_data));
+    EXPECT_EQ(urma::GetPoolSegFor(nullptr), urma::GetPoolSegFor(rx_data));
+    uint64_t tx_offset = 0;
+    uint64_t rx_offset = 0;
+    ASSERT_TRUE(urma::GetPoolSegmentOffset(tx_data, capacity, &tx_offset));
+    ASSERT_TRUE(urma::GetPoolSegmentOffset(rx_data, capacity, &rx_offset));
+    EXPECT_EQ(0u, tx_offset % capacity);
+    EXPECT_EQ(0u, rx_offset % capacity);
+
+    // Exhaust the arena. Every pair takes two fixed slots, so exhaustion is a
+    // clean ENOMEM rather than a fallback to unregistered memory.
+    std::vector<std::unique_ptr<butil::IOBuf>> txs;
+    std::vector<std::unique_ptr<butil::IOBuf>> rxs;
+    int extra_pairs = 0;
+    while (true) {
+        auto tx_buf = std::make_unique<butil::IOBuf>();
+        auto rx_buf = std::make_unique<butil::IOBuf>();
+        void* td = nullptr;
+        void* rd = nullptr;
+        uint32_t cap = 0;
+        if (!urma::AllocateReadSlotPair(tx_buf.get(), &td, rx_buf.get(), &rd,
+                                        &cap)) {
+            EXPECT_EQ(ENOMEM, errno);
+            break;
+        }
+        txs.push_back(std::move(tx_buf));
+        rxs.push_back(std::move(rx_buf));
+        ++extra_pairs;
+        ASSERT_LT(extra_pairs, 1024);
+    }
+    EXPECT_GE(extra_pairs, 2);
+
+    // Releasing buffers returns the slots to the free index.
+    txs.clear();
+    rxs.clear();
+    tx.clear();
+    rx.clear();
+    butil::IOBuf tx2;
+    butil::IOBuf rx2;
+    void* tx2_data = nullptr;
+    void* rx2_data = nullptr;
+    uint32_t capacity2 = 0;
+    EXPECT_TRUE(urma::AllocateReadSlotPair(&tx2, &tx2_data, &rx2, &rx2_data,
+                                           &capacity2));
+    EXPECT_EQ(static_cast<uint32_t>(kReadSlotBytes), capacity2);
+}
+
+TEST_F(UrmaReadArenaTest, control_buffer_is_contiguous_and_registered) {
+    butil::IOBuf owner;
+    void* data = nullptr;
+    EXPECT_FALSE(urma::AllocateReadControlBuffer(&owner, &data, 0));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_FALSE(urma::AllocateReadControlBuffer(&owner, &data, 1024 * 1024));
+    EXPECT_EQ(EINVAL, errno);
+    ASSERT_TRUE(urma::AllocateReadControlBuffer(&owner, &data,
+                                                kReadControlBytes));
+    ASSERT_NE(nullptr, data);
+    EXPECT_EQ(kReadControlBytes, owner.size());
+    EXPECT_NE(nullptr, urma::GetPoolSegFor(data));
+    uint64_t offset = 0;
+    EXPECT_TRUE(urma::GetPoolSegmentOffset(data, kReadControlBytes, &offset));
+
+    // The control buffer is reusable once its owner is released.
+    owner.clear();
+    butil::IOBuf owner2;
+    void* data2 = nullptr;
+    EXPECT_TRUE(urma::AllocateReadControlBuffer(&owner2, &data2,
+                                                kReadControlBytes));
+    EXPECT_NE(nullptr, data2);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end READ data path between two endpoints over the mock provider.
+// ---------------------------------------------------------------------------
+class UrmaReadDataPathTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        if (mock_urma_set_max_read_size == nullptr) {
+            GTEST_SKIP() << "READ path tests require the URMA link-time mock";
+        }
+        ASSERT_TRUE(EnsureReadTestEnvironment()) << "Mock READ initialization failed";
+        ASSERT_TRUE(MakeTestSocket(&_sid_a));
+        ASSERT_TRUE(MakeTestSocket(&_sid_b));
+        _a.reset(MakeTestEndpoint(_sid_a));
+        _b.reset(MakeTestEndpoint(_sid_b));
+        ASSERT_NE(nullptr, _a);
+        ASSERT_NE(nullptr, _b);
+
+        ASSERT_EQ(0, _a->AllocateResources());
+        ASSERT_EQ(0, _b->AllocateResources());
+        ASSERT_EQ(0, _a->PostRecv(_a->_rq_size, false));
+        ASSERT_EQ(0, _b->PostRecv(_b->_rq_size, false));
+
+        urma::ParsedHello hello_a;
+        urma::ParsedHello hello_b;
+        _a->MakeLocalParsedHello(&hello_a);
+        _b->MakeLocalParsedHello(&hello_b);
+        ASSERT_EQ(0, _a->ImportPeer(hello_b));
+        ASSERT_EQ(0, _b->ImportPeer(hello_a));
+        _a->ApplyRemoteHello(hello_b);
+        _b->ApplyRemoteHello(hello_a);
+
+        ASSERT_EQ(0, _a->StartReadProtocol());
+        ASSERT_EQ(0, _b->StartReadProtocol());
+        ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+        ASSERT_TRUE(_a->_read_local_ready);
+        ASSERT_TRUE(_a->_read_peer_ready);
+        ASSERT_TRUE(_b->_read_local_ready);
+        ASSERT_TRUE(_b->_read_peer_ready);
+    }
+
+    void TearDown() override {
+        _a.reset();
+        _b.reset();
+        DestroyTestSocket(_sid_a);
+        DestroyTestSocket(_sid_b);
+    }
+
+    // Hands one WriteRequest to endpoint A and drains both sides.
+    ssize_t CutAndDrain(butil::IOBuf* buf) {
+        butil::IOBuf* list[1] = {buf};
+        const ssize_t n = _a->CutFromIOBufList(list, 1);
+        EXPECT_GE(n, 0);
+        EXPECT_TRUE(PumpBoth(_a.get(), _b.get()));
+        return n;
+    }
+
+    SocketId _sid_a{INVALID_SOCKET_ID};
+    SocketId _sid_b{INVALID_SOCKET_ID};
+    std::unique_ptr<urma::UrmaEndpoint> _a;
+    std::unique_ptr<urma::UrmaEndpoint> _b;
+};
+
+TEST_F(UrmaReadDataPathTest, ready_exchange_publishes_slot_capacity) {
+    const uint32_t chunk = ExpectedReadChunk();
+    ASSERT_GE(chunk, 4096u);
+    EXPECT_EQ(chunk, _a->_read_max_chunk);
+    EXPECT_EQ(chunk, _a->_read_peer_max_chunk);
+    EXPECT_EQ(chunk, _b->_read_max_chunk);
+    EXPECT_EQ(chunk, _b->_read_peer_max_chunk);
+    EXPECT_TRUE(_a->_read_tx_credit);
+    EXPECT_TRUE(_b->_read_tx_credit);
+    EXPECT_FALSE(_a->_read_control_busy[kReadReady - 1]);
+    EXPECT_FALSE(_b->_read_control_busy[kReadReady - 1]);
+
+    // Control frames must never enter the RPC byte stream.
+    EXPECT_EQ(0u, _a->_read_rx_offset);
+    EXPECT_EQ(0u, _b->_read_rx_offset);
+    EXPECT_EQ(0u, _a->_input_processor.read_buf().size());
+    EXPECT_EQ(0u, _b->_input_processor.read_buf().size());
+}
+
+TEST_F(UrmaReadDataPathTest, large_write_is_carried_by_one_read) {
+    const size_t chunk = ExpectedReadChunk();
+    const std::string payload = MakeReadPayload(chunk);
+    butil::IOBuf buf;
+    ASSERT_EQ(0, buf.append(payload.data(), payload.size()));
+
+    ASSERT_NE(nullptr, mock_urma_read_count);
+    const uint64_t reads_before = mock_urma_read_count();
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()), CutAndDrain(&buf));
+    EXPECT_EQ(reads_before + 1, mock_urma_read_count());
+    EXPECT_TRUE(buf.empty());
+
+    // Sender: the OFFER was acknowledged by DONE and its credit returned.
+    EXPECT_EQ(payload.size(), _a->_read_tx_offset);
+    EXPECT_EQ(1u, _a->_read_tx_seq);
+    EXPECT_FALSE(_a->_read_tx_offer_pending);
+    EXPECT_TRUE(_a->_read_tx_credit);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_FALSE(_a->_read_control_busy[i]) << "control slot " << i;
+    }
+    EXPECT_TRUE(_a->_read_path_iobufs.empty());
+
+    // Receiver: the READ copied straight into its registered slot and the
+    // bytes were appended to the input stream in order.
+    EXPECT_EQ(payload.size(), _b->_read_rx_offset);
+    EXPECT_EQ(1u, _b->_read_rx_seq);
+    EXPECT_FALSE(_b->_read_rx_active);
+    EXPECT_FALSE(_b->_read_done_pending);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_FALSE(_b->_read_control_busy[i]) << "control slot " << i;
+    }
+    std::string received;
+    ASSERT_EQ(payload.size(),
+              _b->_input_processor.read_buf().copy_to(&received));
+    EXPECT_EQ(payload, received);
+}
+
+TEST_F(UrmaReadDataPathTest, large_write_is_split_into_back_to_back_offers) {
+    const size_t chunk = ExpectedReadChunk();
+    const size_t total = chunk * 2 + chunk / 2;
+    const std::string payload = MakeReadPayload(total);
+    butil::IOBuf buf;
+    ASSERT_EQ(0, buf.append(payload.data(), payload.size()));
+
+    size_t offered = 0;
+    int rounds = 0;
+    while (!buf.empty() && rounds < 16) {
+        butil::IOBuf* list[1] = {&buf};
+        const ssize_t n = _a->CutFromIOBufList(list, 1);
+        ASSERT_GT(n, 0) << "round " << rounds;
+        ASSERT_LE(static_cast<size_t>(n), chunk) << "round " << rounds;
+        offered += static_cast<size_t>(n);
+        ASSERT_TRUE(PumpBoth(_a.get(), _b.get())) << "round " << rounds;
+        ++rounds;
+    }
+    ASSERT_TRUE(buf.empty());
+    EXPECT_EQ(3, rounds);
+    EXPECT_EQ(total, offered);
+
+    EXPECT_EQ(total, _a->_read_tx_offset);
+    EXPECT_EQ(3u, _a->_read_tx_seq);
+    EXPECT_FALSE(_a->_read_tx_offer_pending);
+    EXPECT_TRUE(_a->_read_tx_credit);
+    EXPECT_TRUE(_a->_read_path_iobufs.empty());
+
+    EXPECT_EQ(total, _b->_read_rx_offset);
+    EXPECT_EQ(3u, _b->_read_rx_seq);
+    EXPECT_FALSE(_b->_read_rx_active);
+    EXPECT_FALSE(_b->_read_done_pending);
+    std::string received;
+    ASSERT_EQ(total, _b->_input_processor.read_buf().copy_to(&received));
+    EXPECT_EQ(payload, received);
+}
+
+TEST_F(UrmaReadDataPathTest, small_write_stays_on_the_send_path) {
+    const std::string payload = MakeReadPayload(1024);
+    butil::IOBuf buf;
+    ASSERT_EQ(0, buf.append(payload.data(), payload.size()));
+
+    butil::IOBuf* list[1] = {&buf};
+    ASSERT_EQ(static_cast<ssize_t>(payload.size()),
+              _a->CutFromIOBufList(list, 1));
+    EXPECT_TRUE(buf.empty());
+    EXPECT_FALSE(_a->_read_tx_offer_pending);
+    EXPECT_TRUE(_a->_read_path_iobufs.empty());
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+
+    EXPECT_EQ(0u, _a->_read_tx_seq);
+    // The SEND path advances the same byte-stream offset the READ path uses.
+    EXPECT_EQ(payload.size(), _a->_read_tx_offset);
+    EXPECT_EQ(payload.size(), _b->_read_rx_offset);
+    EXPECT_EQ(0u, _b->_read_rx_seq);
+    std::string received;
+    ASSERT_EQ(payload.size(),
+              _b->_input_processor.read_buf().copy_to(&received));
+    EXPECT_EQ(payload, received);
+}
+
+TEST_F(UrmaReadDataPathTest, read_path_threshold_is_4096_and_shares_offsets) {
+    // 4095 bytes: SEND, and the byte-stream offset advances.
+    const std::string small_payload = MakeReadPayload(4095);
+    butil::IOBuf small;
+    ASSERT_EQ(0, small.append(small_payload.data(), small_payload.size()));
+    butil::IOBuf* small_list[1] = {&small};
+    ASSERT_EQ(static_cast<ssize_t>(small_payload.size()),
+              _a->CutFromIOBufList(small_list, 1));
+    EXPECT_FALSE(_a->_read_tx_offer_pending);
+    EXPECT_TRUE(_a->_read_path_iobufs.empty());
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    EXPECT_EQ(4095u, _b->_read_rx_offset);
+    _b->_input_processor.read_buf().clear();
+
+    // 4096 bytes: READ, starting at the byte-stream offset the SEND reached.
+    const std::string large_payload = MakeReadPayload(4096);
+    butil::IOBuf large;
+    ASSERT_EQ(0, large.append(large_payload.data(), large_payload.size()));
+    butil::IOBuf* large_list[1] = {&large};
+    ASSERT_EQ(static_cast<ssize_t>(large_payload.size()),
+              _a->CutFromIOBufList(large_list, 1));
+    EXPECT_TRUE(_a->_read_tx_offer_pending);
+    // The request is fully consumed, but the source lease is still pending.
+    EXPECT_TRUE(_a->_read_path_iobufs.empty());
+    EXPECT_FALSE(_a->_read_tx_credit);
+    EXPECT_EQ(4095u, _a->_read_tx_offset);
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+
+    EXPECT_EQ(1u, _a->_read_tx_seq);
+    EXPECT_EQ(4095u + 4096u, _a->_read_tx_offset);
+    EXPECT_EQ(1u, _b->_read_rx_seq);
+    EXPECT_EQ(4095u + 4096u, _b->_read_rx_offset);
+    std::string received;
+    ASSERT_EQ(large_payload.size(),
+              _b->_input_processor.read_buf().copy_to(&received));
+    EXPECT_EQ(large_payload, received);
+}
+
+
+// A rejected attempt must not pay the TX copy cost on every wakeup. There is
+// no input consumption, source lease or provider operation until credits exist.
+TEST_F(UrmaReadDataPathTest, credit_backpressure_does_not_copy_source) {
+    const size_t size = ExpectedReadChunk();
+    const std::string payload(size, 'x');
+    butil::IOBuf data;
+    ASSERT_EQ(0, data.append(payload));
+    butil::IOBuf* list[] = {&data};
+    for (int which = 0; which < 2; ++which) {
+        std::memset(_a->_read_tx_data, 0x5a, size);
+        auto& window = which == 0 ? _a->_remote_rq_window_size : _a->_sq_window_size;
+        const uint16_t saved = window.exchange(2, butil::memory_order_relaxed);
+        const ssize_t rc = _a->CutFromIOBufList(list, 1);
+        const int saved_errno = errno;
+        window.store(saved, butil::memory_order_relaxed);
+        EXPECT_EQ(-1, rc);
+        EXPECT_EQ(EAGAIN, saved_errno);
+        EXPECT_EQ(payload.size(), data.size());
+        EXPECT_FALSE(_a->_read_tx_offer_pending);
+        EXPECT_TRUE(_a->_read_tx_credit);
+        const std::string untouched(size, 'Z');
+        EXPECT_EQ(0, std::memcmp(untouched.data(), _a->_read_tx_data, size));
+    }
+    EXPECT_EQ(static_cast<ssize_t>(size), CutAndDrain(&data));
+}
+
+TEST_F(UrmaReadDataPathTest, completion_wakes_writer_at_minimum_usable_credit) {
+    const uint16_t saved_sq = _a->_sq_window_size.exchange(2, butil::memory_order_relaxed);
+    const uint16_t saved_rq = _a->_remote_rq_window_size.exchange(3, butil::memory_order_relaxed);
+    EXPECT_FALSE(_a->IsWritable());
+    const int before = _a->_socket->_epollout_butex->load(butil::memory_order_acquire);
+    uint16_t slot;
+    ASSERT_TRUE(_a->ReserveSqSlot(&slot));
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.user_ctx = (static_cast<uint64_t>(slot + 1) << 8) | 1;
+    ASSERT_EQ(0, _a->HandleCompletion(completion));
+    EXPECT_TRUE(_a->IsWritable());
+    const int after = _a->_socket->_epollout_butex->load(butil::memory_order_acquire);
+    _a->_sq_window_size.store(saved_sq, butil::memory_order_relaxed);
+    _a->_remote_rq_window_size.store(saved_rq, butil::memory_order_relaxed);
+    EXPECT_GT(after, before);
+}
+
+TEST_F(UrmaReadDataPathTest, done_before_offer_send_completion_does_not_reuse_control) {
+    butil::IOBuf data;
+    ASSERT_EQ(0, data.append(MakeReadPayload(8192)));
+    butil::IOBuf* list[] = {&data};
+    ASSERT_EQ(8192, _a->CutFromIOBufList(list, 1));
+    urma_cr_t held{};
+    ASSERT_EQ(1, urma_poll_jfc(_a->_resource->jfc, 1, &held));
+    ASSERT_EQ(0u, held.flag.bs.s_r);
+    ASSERT_EQ(2u, held.user_ctx & 0xff);
+    ASSERT_TRUE(PumpCompletions(_b.get(), nullptr, nullptr));
+    ASSERT_TRUE(PumpCompletions(_a.get(), nullptr, nullptr));
+    EXPECT_FALSE(_a->_read_tx_offer_pending);
+    EXPECT_TRUE(_a->_read_tx_credit);
+    EXPECT_TRUE(_a->_read_control_busy[kReadOffer - 1]);
+    EXPECT_FALSE(_a->IsWritable());
+    ASSERT_EQ(0, data.append(MakeReadPayload(8192)));
+    EXPECT_EQ(-1, _a->CutFromIOBufList(list, 1));
+    EXPECT_EQ(EAGAIN, errno);
+    EXPECT_EQ(8192u, data.size());
+    ASSERT_EQ(0, _a->HandleCompletion(held));
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    EXPECT_EQ(8192, CutAndDrain(&data));
+    EXPECT_EQ(2u, _b->_read_rx_seq);
+}
+
+TEST_F(UrmaReadDataPathTest, two_and_four_mib_are_delivered_without_extra_reads) {
+    ASSERT_NE(nullptr, mock_urma_read_count);
+    for (size_t size : {2u * 1024 * 1024, 4u * 1024 * 1024}) {
+        const std::string payload = MakeReadPayload(size);
+        butil::IOBuf data;
+        ASSERT_EQ(0, data.append(payload));
+        const uint64_t before = mock_urma_read_count();
+        size_t rounds = 0;
+        while (!data.empty() && rounds++ < 1024) {
+            ASSERT_GT(CutAndDrain(&data), 0);
+        }
+        ASSERT_TRUE(data.empty());
+        const size_t expected = (size + ExpectedReadChunk() - 1) / ExpectedReadChunk();
+        EXPECT_EQ(expected, mock_urma_read_count() - before);
+        std::string received;
+        ASSERT_EQ(size, _b->_input_processor.read_buf().copy_to(&received));
+        EXPECT_EQ(payload, received);
+        _b->_input_processor.read_buf().clear();
+    }
+}
+
+TEST_F(UrmaReadDataPathTest, bidirectional_reads_preserve_both_streams) {
+    const std::string pa = MakeReadPayload(kReadSlotBytes * 2 + 17);
+    const std::string pb(kReadSlotBytes * 3 + 31, 'b');
+    butil::IOBuf a, b;
+    ASSERT_EQ(0, a.append(pa));
+    ASSERT_EQ(0, b.append(pb));
+    for (int round = 0; (!a.empty() || !b.empty()) && round < 16; ++round) {
+        if (!a.empty()) {
+            butil::IOBuf* list[] = {&a};
+            ASSERT_GT(_a->CutFromIOBufList(list, 1), 0);
+        }
+        if (!b.empty()) {
+            butil::IOBuf* list[] = {&b};
+            ASSERT_GT(_b->CutFromIOBufList(list, 1), 0);
+        }
+        ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    }
+    ASSERT_TRUE(a.empty());
+    ASSERT_TRUE(b.empty());
+    std::string ra, rb;
+    EXPECT_EQ(pb.size(), _a->_input_processor.read_buf().copy_to(&ra));
+    EXPECT_EQ(pa.size(), _b->_input_processor.read_buf().copy_to(&rb));
+    EXPECT_EQ(pb, ra);
+    EXPECT_EQ(pa, rb);
+    EXPECT_EQ(3u, _a->_read_tx_seq);  // The 17-byte tail stays on READ.
+    EXPECT_EQ(4u, _b->_read_tx_seq);
+}
+
+TEST_F(UrmaReadDataPathTest, tx_length_uses_peer_read_limit_not_local_read_limit) {
+    _a->_read_max_chunk = _b->_read_peer_max_chunk = 4096;
+    _b->_read_max_chunk = _a->_read_peer_max_chunk = 8192;
+    butil::IOBuf data;
+    ASSERT_EQ(0, data.append(MakeReadPayload(8193)));
+    EXPECT_EQ(8192, CutAndDrain(&data));
+    EXPECT_EQ(1, CutAndDrain(&data));
+    EXPECT_TRUE(data.empty());
+    EXPECT_EQ(8193u, _b->_input_processor.read_buf().size());
+    EXPECT_EQ(2u, _a->_read_tx_seq);
+}
+
+TEST_F(UrmaReadDataPathTest, read_pending_resumes_on_sq_completion) {
+    const uint16_t saved = _b->_sq_window_size.exchange(0, butil::memory_order_relaxed);
+    butil::IOBuf data;
+    ASSERT_EQ(0, data.append(MakeReadPayload(8192)));
+    butil::IOBuf* list[] = {&data};
+    ASSERT_EQ(8192, _a->CutFromIOBufList(list, 1));
+    ASSERT_TRUE(PumpCompletions(_b.get(), nullptr, nullptr));
+    EXPECT_TRUE(_b->_read_post_pending);
+    EXPECT_TRUE(_b->_input_processor.read_buf().empty());
+    // Model one of the WRs occupying SQ completing; the handler must start
+    // the pending READ without another application write or explicit Progress.
+    uint16_t slot;
+    ASSERT_TRUE(_b->ReserveSqSlot(&slot));
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.user_ctx = (static_cast<uint64_t>(slot + 1) << 8) | 1;
+    ASSERT_EQ(0, _b->HandleCompletion(completion));
+    EXPECT_FALSE(_b->_read_post_pending);
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    _b->_sq_window_size.store(saved, butil::memory_order_relaxed);
+    EXPECT_EQ(8192u, _b->_input_processor.read_buf().size());
+    EXPECT_TRUE(_a->_read_tx_credit);
+}
+
+TEST_F(UrmaReadDataPathTest, done_pending_resumes_on_rq_credit_without_redelivery) {
+    const uint16_t saved = _b->_remote_rq_window_size.exchange(0, butil::memory_order_relaxed);
+    butil::IOBuf data;
+    ASSERT_EQ(0, data.append(MakeReadPayload(8192)));
+    butil::IOBuf* list[] = {&data};
+    ASSERT_EQ(8192, _a->CutFromIOBufList(list, 1));
+    ASSERT_TRUE(PumpCompletions(_b.get(), nullptr, nullptr));
+    ASSERT_TRUE(PumpCompletions(_a.get(), nullptr, nullptr));
+    EXPECT_TRUE(_b->_read_done_pending);
+    EXPECT_EQ(8192u, _b->_input_processor.read_buf().size());
+    EXPECT_FALSE(_a->_read_tx_credit);
+    ASSERT_EQ(0, _a->SendImm(1));  // Deliver the modeled replenished RQ credit.
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    _b->_remote_rq_window_size.store(saved, butil::memory_order_relaxed);
+    EXPECT_FALSE(_b->_read_done_pending);
+    EXPECT_EQ(8192u, _b->_input_processor.read_buf().size());
+    EXPECT_EQ(1u, _b->_read_rx_seq);
+    EXPECT_TRUE(_a->_read_tx_credit);
+}
+
+TEST_F(UrmaReadDataPathTest, offer_tag_survives_bonding_msn_mask) {
+    // With MSN enabled, a bonding device preserves only IMM bits 0..20.
+    // The old 0xA5000000 tag disappeared, leaving type=2 to look like a
+    // credit ACK carrying a 56-byte payload.
+    butil::IOBuf payload;
+    const std::string data = MakeReadPayload(8192);
+    ASSERT_EQ(0, payload.append(data));
+    butil::IOBuf* list[] = {&payload};
+    ASSERT_EQ(static_cast<ssize_t>(data.size()),
+              _a->CutFromIOBufList(list, 1));
+    urma_cr_t cr{};
+    ASSERT_EQ(1, urma_poll_jfc(_b->_resource->jfc, 1, &cr));
+    ASSERT_EQ(URMA_CR_OPC_SEND_WITH_IMM, cr.opcode);
+    ASSERT_EQ(kReadControlBytes, cr.completion_len);
+    ASSERT_LE(cr.imm_data, 0x1fffffU);
+    cr.imm_data = (cr.imm_data & 0x1fffffU) | 0xA5000000U;
+    EXPECT_EQ(0, _b->HandleCompletion(cr));
+    ASSERT_TRUE(PumpBoth(_a.get(), _b.get()));
+    std::string received;
+    EXPECT_EQ(data.size(), _b->_input_processor.read_buf().copy_to(&received));
+    EXPECT_EQ(data, received);
+}
+
+TEST_F(UrmaReadDataPathTest, credit_ack_ignores_reserved_immediate_bits) {
+    const uint16_t capacity = _b->_local_window_capacity;
+    ASSERT_GT(capacity, 0);
+    _b->_remote_rq_window_size.store(capacity - 1,
+                                     butil::memory_order_relaxed);
+    ASSERT_EQ(0, _a->SendImm(1));
+    urma_cr_t cr{};
+    ASSERT_EQ(1, urma_poll_jfc(_b->_resource->jfc, 1, &cr));
+    ASSERT_EQ(URMA_CR_OPC_SEND_WITH_IMM, cr.opcode);
+    ASSERT_EQ(0u, cr.completion_len);
+    cr.imm_data |= 0xA5000000U;  // Simulate bonding provider metadata.
+    EXPECT_EQ(0, _b->HandleCompletion(cr));
+    EXPECT_EQ(capacity, _b->_remote_rq_window_size.load(
+                            butil::memory_order_relaxed));
+    EXPECT_TRUE(_b->_input_processor.read_buf().empty());
+    ASSERT_TRUE(PumpCompletions(_a.get(), nullptr, nullptr));
+}
+
+TEST_F(UrmaReadDataPathTest, mock_enforces_read_limit_and_rejection_refunds_sq) {
+    struct RestoreLimit {
+        ~RestoreLimit() { mock_urma_set_max_read_size(kReadSlotBytes); }
+    } restore;
+    mock_urma_set_max_read_size(4096);
+    uint64_t offset;
+    ASSERT_TRUE(urma::GetPoolSegmentOffset(_a->_read_tx_data, 8192, &offset));
+    const uint16_t credits = _b->_sq_window_size.load(butil::memory_order_relaxed);
+    EXPECT_EQ(-1, _b->PostRead(offset, 8192));
+    EXPECT_EQ(EIO, errno);
+    EXPECT_EQ(credits, _b->_sq_window_size.load(butil::memory_order_relaxed));
+    EXPECT_FALSE(_b->_post_uncertain);
+    for (uint8_t in_use : _b->_sq_slot_in_use) EXPECT_EQ(0u, in_use);
+    urma_cr_t completion{};
+    EXPECT_EQ(0, urma_poll_jfc(_b->_resource->jfc, 1, &completion));
 }
 
 #else  // BRPC_WITH_URMA

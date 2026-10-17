@@ -141,6 +141,13 @@ IOBuf 总长度可大于一个 block；普通 block 的容量和 READ 的硬件�
 READY 的长度和 DONE 的 credit。控制 SEND_IMM 消耗已有远端 RQ credit；
 READ 不消耗远端 receive WR；纯 credit ACK 保持原语义。
 
+聚合设备开启 MSN 时，`SEND_IMM` 的应用立即数只保留低 21 位。因此控制
+标记放在 bit 16～20（`0x001A0000`，掩码 `0x001F0000`），消息类型放在
+低 16 位；纯 credit ACK 的值小于 4096，与控制标记不相交。旧标记
+`0xA5000000` 会被该设备截去，导致 READY 的 `imm=1`、56 字节控制帧被
+误判为纯 credit ACK。接收端先以 `0x001FFFFF` 提取应用立即数，再分流
+控制消息和 credit ACK。该 wire 编码变更要求连接两端一起升级。
+
 ```text
 A：TX/RX/控制资源就绪 -> READY                B：同样完成 READY
 A：copy_to(TX, length) -> OFFER ------------> B：验证、保存 descriptor、投递 READ
@@ -338,10 +345,60 @@ cmake --build build-urma --target brpc-static rpc_press -j4
 
 现有目录未开启共享库，因此不以 `brpc-shared` 作为本轮验收目标。
 编译仍有既有 protobuf 废弃接口及 signed/unsigned 比较警告。
-本轮未新增或运行单元测试、端到端传输和性能测试。
+首版实现时未新增或运行单元测试、端到端传输和性能测试；后续单测复审结果见第 11 节。
 
 实际 liburma/provider 不在此次链接环境中；混合 opcode 排序、真实大 READ、
 DMA 完成可见性及正常销毁语义仍须按第 8 节在设备上验证。当前没有实现
 provider reset/flush 后重新回收隔离资源：隔离持续至进程退出，不能把它
 描述为可长期无限重连的资源回收闭环。默认池仅支持最多 32 个连接端点
 （含隔离项），上线前必须按连接数量和故障恢复要求调整并验证。
+
+## 11. READ 单测复审与最小性能修复（2026-10-17）
+
+审阅基于 `b83738fa` 与新增 READ 单测工作区。最初可见的 brpc-dev 报告
+只有旧的 14 个用例，新增测试文件和 mock 与本地哈希不同；本轮重新同步、
+构建和执行，以下结果均来自当前源码。
+
+### 11.1 已复现并修复的问题
+
+| 问题 | 修复前证据 | 修改 |
+|---|---|---|
+| 新测试无法编译 | 7 个 flag 引用缺少 `urma::` 命名空间 | 修正测试引用，保留原用例 |
+| 阈值测试混淆请求路径标记和 source lease | 4096 字节输入消费完后仍要求路径集合大小为 1 | 改为输入路径标记已移除、TX credit 未归还且 OFFER 仍 pending |
+| credit 不足时重复大块拷贝 | SQ/RQ 分别只剩预留额度时返回 EAGAIN，但 TX 哨兵数据已被覆盖 | 在复制前检查 OFFER 的 SQ/RQ 额度；提交互斥锁保证检查到 post 之间没有其他提交者抢占 |
+| 可写后未唤醒 writer | SQ 从 2 恢复到 3、RQ 为 3 时，IsWritable 为真，但旧的 capacity/8 阈值使 butex 不变 | 完成处理使用 IsWritable 判断唤醒，统一准入和唤醒条件 |
+| mock 的 READ 限制未实际执行 | 仅修改能力声明，post 仍可接受超长 READ | 校验非零长度、max_read_size、有效 target，并统计实际成功 READ WR 数 |
+| 测试环境依赖执行顺序 | 旧 mock fixture 结束时无条件恢复 skip=true，可破坏已建立的注册池环境 | 保存并恢复原全局状态，初始化失败视为测试失败，避免被 SKIP 掩盖 |
+
+生产代码仅修改 endpoint 的复制前检查和两处完成唤醒条件；没有扩大协议、
+数据窗口、slot 或 wire 格式。两项生产问题均保留了修复前失败、修复后通过
+的回归证据。性能收益取决于实际背压和 credit 水位，尚无设备时延数据。
+
+### 11.2 当前覆盖与结果
+
+- 38 个用例全部通过，其中 24 个为 READ 控制、arena 与数据路径用例；
+  在用户新增用例基础上补充 9 个回归用例。
+- 2MiB/4MiB 数据逐字节一致，并按实际 READ 计数检查分块；测试配置使用
+  64KiB slot，因此对应 32/64 条 READ，不是单条 2MiB/4MiB 硬件 READ。
+- 覆盖双向 READ、READ 小尾块、非对称读取上限、DONE 早于 OFFER 本地 CQE、
+  SQ 背压后由完成事件继续 READ、RQ credit 恢复后继续 DONE 且不重复交付。
+- mock 超长 READ 拒绝时 SQ 退款且不产生 CQE；CQ 为空但协议状态仍 pending
+  不再被 PumpBoth 当作完成。
+- `brpc_urma_unittest`、`brpc-static`、`rpc_press` 构建/链接通过；CTest
+  通过；随机种子 20261、随机顺序重复 10 轮，共 380 次用例执行通过。
+
+```sh
+cmake --build build-urma --target brpc_urma_unittest brpc-static rpc_press -j4
+ctest --test-dir build-urma -R '^brpc_urma_unittest$' --output-on-failure
+build-urma/test/brpc_urma_unittest --gtest_shuffle --gtest_random_seed=20261 --gtest_repeat=10
+```
+
+远端日志：`/tmp/brpc-read-review-build.log`、
+`/tmp/brpc-read-review-regressions.log`（两个生产问题的修复前失败）、
+`/tmp/brpc-read-review-final.log`、`/tmp/brpc-read-review-final.xml`、
+`/tmp/brpc-read-review-repeat.log`。
+
+验证边界：目前使用同步 memcpy 的 link-time mock，手工投递/处理 CQE；
+部分背压用例直接设置窗口并模拟完成/credit。没有覆盖真实设备异步 DMA、
+event poller、并发 writer/CQ 压力、DMA 在途断连和自动解除隔离。
+第 10 节的隔离预算和真实 provider 验收限制仍然适用。
