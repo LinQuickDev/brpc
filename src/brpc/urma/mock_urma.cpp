@@ -560,10 +560,12 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
         send_cr.status = URMA_CR_SUCCESS;
         send_cr.user_ctx = current->user_ctx;
         send_cr.flag.bs.s_r = 0;
-        if (current->flag.bs.complete_enable) {
-            PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
-                           local_state, send_cr);
-        }
+        auto complete_send = [&]() {
+            if (current->flag.bs.complete_enable) {
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
+                               local_state, send_cr);
+            }
+        };
 
         PendingRecv recv{};
         urma_jfc_t* remote_jfc = nullptr;
@@ -571,6 +573,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
             auto remote_it = jetty_id_map.find(current->tjetty->id.id);
             if (remote_it == jetty_id_map.end()) {
+                complete_send();
                 continue;
             }
             urma_jfr_t* remote_jfr =
@@ -579,6 +582,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             auto jfc_it = jfr_jfc_map.find(remote_jfr);
             if (recv_it == jfr_recv_map.end() || recv_it->second.empty() ||
                 jfc_it == jfr_jfc_map.end()) {
+                complete_send();
                 continue;
             }
             recv = recv_it->second.front();
@@ -595,6 +599,10 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                         reinterpret_cast<const void*>(sge.addr), n);
             copied += n;
         }
+
+        // A send completion transfers buffer ownership back to the caller.
+        // Do not let a polling thread free/reuse it before memcpy finishes.
+        complete_send();
 
         JfcState* remote_state = nullptr;
         {
