@@ -25,6 +25,7 @@
 
 #include "bthread/types.h"
 #include "butil/atomicops.h"
+#include "butil/iobuf.h"
 
 #if BRPC_WITH_URMA
 
@@ -65,6 +66,14 @@ urma_target_seg_t* GetPoolSegFor(void* buf);
 // Resolve an address range inside the registered pool to a segment-relative
 // offset. Returns false unless the entire range belongs to the pool.
 bool GetPoolSegmentOffset(const void* buf, size_t len, uint64_t* offset);
+
+// Allocate two dedicated large slots from the registered arena. Owners must
+// be empty. Failure rolls back both allocations; no unregistered fallback.
+bool AllocateReadSlotPair(butil::IOBuf* tx, void** tx_data,
+                          butil::IOBuf* rx, void** rx_data,
+                          uint32_t* capacity);
+// Allocate a contiguous registered small control buffer, owned by @owner.
+bool AllocateReadControlBuffer(butil::IOBuf* owner, void** data, size_t size);
 
 // Get the global URMA context (the urma_context_t created on the selected
 // device / EID). Returns nullptr if URMA is not initialized.

@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <new>
 #include <utility>
 #include <vector>
@@ -101,6 +102,11 @@ DEFINE_int32(urma_buffer_size, 8 * 1024,
 DEFINE_int32(urma_buffer_count, 65536,
              "Number of buffers in the URMA buffer pool.");
 
+DEFINE_uint32(urma_read_slot_size, 1024 * 1024,
+              "Effective capacity of each registered READ TX/RX slot");
+DEFINE_uint64(urma_read_pool_size, 64ULL * 1024 * 1024,
+              "Budget for READ slots, including disconnected DMA leases");
+
 DEFINE_bool(urma_poller_yield, false,
             "Yield (bthread_yield) in the busy poll loop to let other "
             "bthreads run");
@@ -139,6 +145,13 @@ static urma_target_seg_t* g_pool_seg = nullptr;
 static void* g_pool_base = nullptr;
 static size_t g_pool_size = 0;
 static size_t g_pool_buffer_size = 0;
+static size_t g_normal_pool_size = 0;
+static size_t g_read_pool_offset = 0;
+static size_t g_read_slot_size = 0;
+static size_t g_read_slot_stride = 0;
+static butil::Mutex g_read_pool_mutex;
+static std::vector<size_t> g_read_free_slots;
+static std::vector<uint8_t> g_read_slots_in_use;
 
 // User-registered segments (RegisterMemoryForUrma). Keyed by buffer address.
 struct UserSeg {
@@ -326,8 +339,13 @@ void PoolDeallocate(void* buf) {
     }
     auto* base = static_cast<char*>(g_pool_base);
     auto* p = static_cast<char*>(buf);
-    if (!base || p < base || p >= base + g_pool_size ||
-        static_cast<size_t>(p - base) % g_pool_buffer_size != 0) {
+    if (base && p >= base && p < base + g_pool_size &&
+        (p >= base + g_normal_pool_size ||
+         static_cast<size_t>(p - base) % g_pool_buffer_size != 0)) {
+        LOG(ERROR) << "Non-block address passed to URMA block deallocator";
+        return;
+    }
+    if (!base || p < base || p >= base + g_normal_pool_size) {
         // Not a pool buffer -- hand back to the original allocator.
         if (g_mem_dealloc_orig) {
             g_mem_dealloc_orig(buf);
@@ -361,9 +379,32 @@ bool InitPool() {
     if (count == 0) {
         return false;
     }
-    size_t raw = g_pool_buffer_size * count;
-    size_t page = PageSize();
-    g_pool_size = AlignUp(raw, page);
+    const size_t page = PageSize();
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    if (g_pool_buffer_size > (max_size - page + 1) / count ||
+        FLAGS_urma_read_slot_size < 4096 ||
+        FLAGS_urma_read_slot_size > 0xFFFFFFFFULL - 100 ||
+        FLAGS_urma_read_slot_size > max_size - page + 1 ||
+        FLAGS_urma_read_pool_size > max_size) {
+        errno = EINVAL;
+        return false;
+    }
+    g_normal_pool_size = g_pool_buffer_size * count;
+    g_read_pool_offset = AlignUp(g_normal_pool_size, page);
+    g_read_slot_size = FLAGS_urma_read_slot_size;
+    g_read_slot_stride = AlignUp(g_read_slot_size, page);
+    const size_t read_count = FLAGS_urma_read_pool_size / g_read_slot_stride;
+    if (read_count < 2 ||
+        read_count > (max_size - g_read_pool_offset) / g_read_slot_stride) {
+        errno = EINVAL;
+        return false;
+    }
+    g_pool_size = g_read_pool_offset + read_count * g_read_slot_stride;
+    g_read_free_slots.reserve(read_count);
+    g_read_slots_in_use.assign(read_count, 0);
+    for (size_t i = 0; i < read_count; ++i) {
+        g_read_free_slots.push_back(i);
+    }
 
     g_pool_base = mmap(nullptr, g_pool_size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -405,6 +446,89 @@ bool InitPool() {
 }
 
 }  // namespace
+
+// The registered arena outlives all IOBuf references (see GlobalRelease).
+static void ReleaseReadSlot(void* data) {
+    BAIDU_SCOPED_LOCK(g_read_pool_mutex);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(g_pool_base) +
+                            g_read_pool_offset;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(data);
+    if (addr < start || g_read_slot_stride == 0 ||
+        (addr - start) % g_read_slot_stride != 0) {
+        LOG(ERROR) << "Invalid URMA READ slot";
+        return;
+    }
+    const size_t index = (addr - start) / g_read_slot_stride;
+    if (index >= g_read_slots_in_use.size() || !g_read_slots_in_use[index]) {
+        LOG(ERROR) << "Duplicate or invalid URMA READ slot release";
+        return;
+    }
+    g_read_slots_in_use[index] = 0;
+    g_read_free_slots.push_back(index);
+}
+
+bool AllocateReadSlotPair(butil::IOBuf* tx, void** tx_data,
+                          butil::IOBuf* rx, void** rx_data,
+                          uint32_t* capacity) {
+    if (!tx || !rx || !tx_data || !rx_data || !capacity ||
+        !tx->empty() || !rx->empty() || !g_pool_seg) {
+        errno = EINVAL;
+        return false;
+    }
+    void* data[2];
+    {
+        BAIDU_SCOPED_LOCK(g_read_pool_mutex);
+        if (g_read_free_slots.size() < 2) {
+            errno = ENOMEM;
+            return false;
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            const size_t index = g_read_free_slots.back();
+            g_read_free_slots.pop_back();
+            g_read_slots_in_use[index] = 1;
+            data[i] = static_cast<char*>(g_pool_base) + g_read_pool_offset +
+                      index * g_read_slot_stride;
+        }
+    }
+    if (tx->append_user_data(data[0], g_read_slot_size, ReleaseReadSlot) != 0) {
+        ReleaseReadSlot(data[0]);
+        ReleaseReadSlot(data[1]);
+        errno = ENOMEM;
+        return false;
+    }
+    if (rx->append_user_data(data[1], g_read_slot_size, ReleaseReadSlot) != 0) {
+        tx->clear();
+        ReleaseReadSlot(data[1]);
+        errno = ENOMEM;
+        return false;
+    }
+    *tx_data = data[0];
+    *rx_data = data[1];
+    *capacity = static_cast<uint32_t>(g_read_slot_size);
+    return true;
+}
+
+bool AllocateReadControlBuffer(butil::IOBuf* owner, void** data, size_t size) {
+    if (!owner || !data || !owner->empty() || !g_pool_seg ||
+        size == 0 || size > g_pool_buffer_size) {
+        errno = EINVAL;
+        return false;
+    }
+    void* block = PoolAllocate(g_pool_buffer_size);
+    uint64_t offset = 0;
+    if (!block || !GetPoolSegmentOffset(block, g_pool_buffer_size, &offset)) {
+        if (block) PoolDeallocate(block);
+        errno = ENOMEM;
+        return false;
+    }
+    if (owner->append_user_data(block, size, PoolDeallocate) != 0) {
+        PoolDeallocate(block);
+        errno = ENOMEM;
+        return false;
+    }
+    *data = block;
+    return true;
+}
 
 // Exposed to urma_endpoint.cpp: return the per-buffer target_seg pointer.
 // All pool buffers share the same segment, so we return g_pool_seg for any
@@ -463,6 +587,10 @@ static void GlobalRelease() {
     }
     delete g_pool;
     g_pool = nullptr;
+    g_read_free_slots.clear();
+    g_read_slots_in_use.clear();
+    g_normal_pool_size = g_read_pool_offset = 0;
+    g_read_slot_size = g_read_slot_stride = 0;
     delete g_user_segs;
     g_user_segs = nullptr;
     delete g_user_segs_lock;

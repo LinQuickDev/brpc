@@ -157,7 +157,10 @@ void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
 
 void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
                                  int* num_bthread_created, bool last_msg) {
-    if (last_msg && !urma::FLAGS_urma_use_polling) {
+    // Normal callbacks must not block CQ drain/rearm or READ control progress.
+    // Preserve the explicitly requested inline/coroutine execution modes.
+    if (last_msg && !urma::FLAGS_urma_use_polling &&
+        (urma::FLAGS_urma_disable_bthread || FLAGS_usercode_in_coroutine)) {
         return;
     }
     InputMessageBase* to_run_msg = input_msg.release();

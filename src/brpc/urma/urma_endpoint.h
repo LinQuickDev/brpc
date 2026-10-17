@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <ostream>
 #include <unordered_set>
 #include <vector>
@@ -94,6 +95,7 @@ struct UrmaResource {
 
     UrmaResource() = default;
     ~UrmaResource();
+    bool Destroy();
     DISALLOW_COPY_AND_ASSIGN(UrmaResource);
 };
 
@@ -242,6 +244,9 @@ private:
                         uint32_t max_chunk);
     int HandleReadControl(const void* data, size_t length);
     int PostRead(uint64_t segment_offset, uint32_t length);
+    int StartReadProtocol();
+    int ProgressRead();  // Caller holds _io_mutex; never calls user code.
+    ssize_t HandleCompletionLocked(const urma_cr_t& cr);
     bool ReserveSqSlot(uint16_t* slot);
     void ReleaseSqSlot(uint16_t slot);
 
@@ -326,6 +331,27 @@ private:
     uint16_t _sq_current{0};
     // RQ consumer index.
     uint16_t _rq_received{0};
+
+    // Serialize submitters and CQ state changes, including provider calls.
+    // Recursive only for internal submit/progress helpers; no user callbacks.
+    mutable std::recursive_mutex _io_mutex;
+    bool _closing{false};
+    size_t _cq_active{0};
+    bool _post_uncertain{false};
+    butil::IOBuf _read_control_buf[3];
+    void* _read_control_data[3]{nullptr, nullptr, nullptr};
+    bool _read_control_busy[3]{false, false, false};
+    std::vector<uint8_t> _sq_control_type;
+    uint32_t _read_slot_capacity{0};
+    bool _read_ready_pending{false};
+    bool _read_post_pending{false};
+    bool _read_done_pending{false};
+    bool _read_ack_pending{false};
+    bool _read_early_offer{false};
+    uint8_t _read_early_frame[56]{};
+    uint64_t _read_pending_segment_offset{0};
+    // Ordinary SEND/OFFER leave room for the reverse READ and DONE.
+    static constexpr uint16_t READ_CONTROL_RESERVE = 2;
 
     // READ protocol state. Accessed by the writer and CQ poller.
     butil::Mutex _sq_slot_mutex;
