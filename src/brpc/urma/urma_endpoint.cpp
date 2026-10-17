@@ -63,6 +63,7 @@ namespace urma {
 DECLARE_int32(urma_sq_size);
 DECLARE_int32(urma_rq_size);
 DECLARE_int32(urma_cqe_poll_once);
+DECLARE_bool(urma_cq_batch_dispatch);
 DECLARE_bool(urma_recv_zerocopy);
 DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
@@ -73,6 +74,41 @@ static const int WAIT_TIMEOUT_MS = 50;
 static const size_t HELLO_ACK_LEN = 4;
 static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
+static const size_t URMA_READ_THRESHOLD = 4096;
+static const uint32_t URMA_READ_IMM_TAG = 0xA5000000U;
+static const uint32_t URMA_READ_IMM_MASK = 0xFFFF0000U;
+static const uint8_t URMA_READ_PROTOCOL_VERSION = 1;
+static const size_t URMA_READ_CONTROL_SIZE = 56;
+enum UrmaReadControlType : uint8_t {
+    URMA_READ_READY = 1,
+    URMA_READ_OFFER = 2,
+    URMA_READ_DONE = 3
+};
+
+static uint64_t HostToNet64(uint64_t value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (static_cast<uint64_t>(butil::HostToNet32(value & 0xffffffffU)) << 32) |
+           butil::HostToNet32(value >> 32);
+#else
+    return value;
+#endif
+}
+
+static uint64_t NetToHost64(uint64_t value) {
+    return HostToNet64(value);
+}
+
+static uint64_t MakeWrContext(uint16_t slot, uint8_t kind) {
+    return (static_cast<uint64_t>(slot + 1) << 8) | kind;
+}
+
+static uint16_t WrContextSlot(uint64_t ctx) {
+    return static_cast<uint16_t>((ctx >> 8) - 1);
+}
+
+static uint8_t WrContextKind(uint64_t ctx) {
+    return static_cast<uint8_t>(ctx & 0xff);
+}
 
 // ---- Globals: prepared jetty pool + poller groups ----
 struct PreparedJetty {
@@ -81,6 +117,19 @@ struct PreparedJetty {
 static butil::Mutex g_prepared_mutex;
 static UrmaResource* g_prepared_list = nullptr;  // singly-linked
 static int g_prepared_cnt = 0;
+// A failed connection can disappear while the peer still has a READ issued
+// against our registered pool, or while local WRs still reference buffers.
+// The provider API in this transport has no cross-peer DMA-drain proof, so
+// retain those buffers until process teardown instead of recycling them.
+static butil::Mutex g_urma_dma_quarantine_mutex;
+static std::vector<butil::IOBuf> g_urma_dma_quarantine;
+
+static void QuarantineBuffer(butil::IOBuf* buf) {
+    if (!buf || buf->empty()) return;
+    BAIDU_SCOPED_LOCK(g_urma_dma_quarantine_mutex);
+    g_urma_dma_quarantine.emplace_back();
+    g_urma_dma_quarantine.back().swap(*buf);
+}
 
 static int PreparedJettyCount() {
     const int requested =
@@ -177,14 +226,29 @@ void UrmaEndpoint::Reset() {
     _new_rq_wrs.store(0, butil::memory_order_relaxed);
     _sq_imm_window_size = 0;
     _sq_current = 0;
-    _sq_sent = 0;
     _rq_received = 0;
     _pending_received_bytes.store(0, butil::memory_order_relaxed);
     _input_processor.Reset();
     _sbuf.clear();
+    _sq_slot_in_use.clear();
     _rbuf.clear();
     _rbuf_data.clear();
     _read_butex->store(0, butil::memory_order_relaxed);
+    _read_path_iobufs.clear();
+    _read_tx_buf.clear();
+    _read_rx_buf.clear();
+    _read_tx_data = nullptr;
+    _read_rx_data = nullptr;
+    _read_peer_epoch = _read_tx_epoch = 0;
+    _read_tx_seq = _read_rx_seq = 0;
+    _read_tx_offset = _read_rx_offset = 0;
+    _remote_segment_va = _remote_segment_len = 0;
+    _read_max_chunk = _read_peer_max_chunk = _read_tx_length = 0;
+    _read_local_ready = _read_peer_ready = _read_tx_credit = false;
+    _read_tx_offer_pending = false;
+    _read_rx_active = false;
+    _read_pending_seq = _read_pending_offset = 0;
+    _read_pending_length = 0;
 }
 
 // ============================================================================
@@ -467,8 +531,49 @@ int UrmaEndpoint::AllocateResources() {
     }
 
     _sbuf.resize(_sq_size - RESERVED_WR_NUM);
+    _sq_slot_in_use.assign(_sq_size - RESERVED_WR_NUM, 0);
     _rbuf.resize(_rq_size);
     _rbuf_data.resize(_rq_size, nullptr);
+
+    // Reserve one registered TX source and one registered READ destination.
+    // The READ payload limit is the effective payload capacity of one pool
+    // block, which is greater than 4 KiB under the default configuration.
+    const uint32_t device_max_read = GetUrmaMaxReadSize();
+    if (device_max_read == 0) {
+        LOG(ERROR) << "URMA device does not advertise max_read_size";
+        errno = ENOTSUP;
+        return -1;
+    }
+    _read_max_chunk = static_cast<uint32_t>(std::min<size_t>(
+        GetUrmaRecvBlockSize(), device_max_read));
+    if (_read_max_chunk < URMA_READ_THRESHOLD) {
+        LOG(ERROR) << "URMA READ slot cannot carry a 4 KiB payload: "
+                   << _read_max_chunk;
+        errno = ENOTSUP;
+        return -1;
+    }
+    auto allocate_read_slot = [this](butil::IOBuf* buf, void** data) -> bool {
+        buf->clear();
+        butil::IOBufAsZeroCopyOutputStream stream(
+            buf, _read_max_chunk + IOBUF_BLOCK_HEADER_LEN);
+        int size = 0;
+        if (!stream.Next(data, &size) || !*data ||
+            size < static_cast<int>(_read_max_chunk) ||
+            !GetPoolSegFor(*data)) {
+            return false;
+        }
+        uint64_t ignored = 0;
+        return GetPoolSegmentOffset(*data, _read_max_chunk, &ignored);
+    };
+    if (!allocate_read_slot(&_read_tx_buf, &_read_tx_data) ||
+        !allocate_read_slot(&_read_rx_buf, &_read_rx_data)) {
+        LOG(ERROR) << "Unable to allocate registered URMA READ slots";
+        errno = ENOMEM;
+        return -1;
+    }
+    _read_tx_epoch = static_cast<uint64_t>(butil::cpuwide_time_us()) ^
+                     reinterpret_cast<uintptr_t>(this);
+    if (_read_tx_epoch == 0) _read_tx_epoch = 1;
 
     // Wrap the JFCE fd in a brpc Socket so PollCq is driven by epoll.
     if (!FLAGS_urma_use_polling) {
@@ -507,6 +612,34 @@ int UrmaEndpoint::AllocateResources() {
 void UrmaEndpoint::DeallocateResources() {
     if (!_resource) {
         return;
+    }
+
+    bool read_tx_active = false;
+    bool read_rx_active = false;
+    {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        read_tx_active = _read_tx_offer_pending;
+        read_rx_active = _read_rx_active;
+    }
+    bool any_sq_active = false;
+    {
+        std::unique_lock<butil::Mutex> lock(_sq_slot_mutex);
+        for (size_t i = 0; i < _sq_slot_in_use.size(); ++i) {
+            if (_sq_slot_in_use[i]) {
+                any_sq_active = true;
+                QuarantineBuffer(&_sbuf[i]);
+            }
+        }
+    }
+    if (read_tx_active) QuarantineBuffer(&_read_tx_buf);
+    if (read_rx_active) QuarantineBuffer(&_read_rx_buf);
+    if (read_tx_active || read_rx_active || any_sq_active) {
+        LOG(WARNING) << "Quarantining URMA buffers because DMA completion "
+                        "cannot be proven during disconnect"
+                     << " tx_read=" << read_tx_active
+                     << " rx_read=" << read_rx_active
+                     << " active_sq=" << any_sq_active
+                     << " on " << _socket->description();
     }
 
     if (FLAGS_urma_use_polling) {
@@ -677,6 +810,13 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
+    {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        if (_read_tx_offer_pending) {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
     int max_sge = GetUrmaMaxSge();
     if (max_sge < 1) {
         max_sge = 1;
@@ -692,6 +832,61 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     size_t current = 0;
     ssize_t total_len = 0;
     while (current < ndata) {
+        butil::IOBuf* request = from[current];
+        bool read_path = false;
+        {
+            std::unique_lock<butil::Mutex> lock(_read_mutex);
+            auto it = _read_path_iobufs.find(request);
+            if (it != _read_path_iobufs.end()) {
+                read_path = true;
+                if (request->empty()) _read_path_iobufs.erase(it);
+            } else if (request->size() >= URMA_READ_THRESHOLD) {
+                _read_path_iobufs.insert(request);
+                read_path = true;
+            }
+        }
+        if (read_path && !request->empty()) {
+            uint32_t length = 0;
+            uint64_t seq = 0, stream_offset = 0, segment_offset = 0;
+            {
+                std::unique_lock<butil::Mutex> lock(_read_mutex);
+                if (!_read_local_ready || !_read_peer_ready ||
+                    !_read_tx_credit || _read_tx_offer_pending) {
+                    if (total_len > 0) break;
+                    errno = EAGAIN;
+                    return -1;
+                }
+                length = static_cast<uint32_t>(std::min<size_t>(
+                    request->size(), std::min(_read_max_chunk,
+                                               _read_peer_max_chunk)));
+                seq = _read_tx_seq;
+                stream_offset = _read_tx_offset;
+                if (!GetPoolSegmentOffset(_read_tx_data, length,
+                                          &segment_offset)) {
+                    errno = ERDMAMEM;
+                    return -1;
+                }
+                request->copy_to(_read_tx_data, length);
+                _read_tx_length = length;
+                _read_tx_credit = false;
+                _read_tx_offer_pending = true;
+            }
+            if (SendReadControl(URMA_READ_OFFER, seq, stream_offset,
+                                segment_offset, length, 0) < 0) {
+                std::unique_lock<butil::Mutex> lock(_read_mutex);
+                _read_tx_credit = true;
+                _read_tx_offer_pending = false;
+                if (total_len > 0) break;
+                return -1;
+            }
+            request->pop_front(length);
+            total_len += length;
+            if (request->empty()) {
+                std::unique_lock<butil::Mutex> lock(_read_mutex);
+                _read_path_iobufs.erase(request);
+            }
+            break;  // Preserve byte-stream ordering until READ_DONE.
+        }
         uint16_t remote_wnd = _remote_rq_window_size.load(butil::memory_order_relaxed);
         uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_relaxed);
         if (remote_wnd == 0 || sq_wnd == 0) {
@@ -701,14 +896,34 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             errno = EAGAIN;
             return -1;
         }
-        butil::IOBuf* to = &_sbuf[_sq_current];
+        uint16_t sq_slot = 0;
+        if (!ReserveSqSlot(&sq_slot)) {
+            if (total_len > 0) break;
+            errno = EAGAIN;
+            return -1;
+        }
+        butil::IOBuf* to = &_sbuf[sq_slot];
         size_t sge_index = 0;
         size_t this_len = 0;
         size_t max_len = _remote_recv_block_size > 0
                              ? _remote_recv_block_size
                              : GetUrmaRecvBlockSize();
+        // The legacy path is intentionally kept within the 4 KiB SEND WR
+        // limit even when several small WriteRequests are coalesced here.
+        max_len = std::min(max_len, URMA_READ_THRESHOLD);
         while (sge_index < static_cast<size_t>(max_sge) &&
                this_len < max_len && current < ndata) {
+            bool pinned_read_path = false;
+            {
+                std::unique_lock<butil::Mutex> lock(_read_mutex);
+                pinned_read_path =
+                    _read_path_iobufs.find(from[current]) !=
+                    _read_path_iobufs.end();
+            }
+            if (from[current]->size() >= URMA_READ_THRESHOLD ||
+                pinned_read_path) {
+                break;
+            }
             auto* data = reinterpret_cast<UrmaIOBuf*>(from[current]);
             if (data->empty()) {
                 ++current;
@@ -722,6 +937,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             this_len += n;
         }
         if (sge_index == 0) {
+            ReleaseSqSlot(sq_slot);
             break;
         }
 
@@ -734,11 +950,12 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
         wr.flag.bs.complete_enable = 1;
+        wr.flag.bs.comp_order = 1;
+        wr.flag.bs.place_order = 2;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
-        wr.user_ctx = 1;
+        wr.user_ctx = MakeWrContext(sq_slot, 1);
         urma_jfs_wr_t* bad_wr = nullptr;
-        const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
         const uint32_t remote_jetty_id = _resource->remote_jetty->id.id;
 
@@ -755,6 +972,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             const int provider_errno = errno;
             _remote_rq_window_size.fetch_add(1, butil::memory_order_relaxed);
             _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
+            ReleaseSqSlot(sq_slot);
             LOG(WARNING) << "urma_post_jetty_send_wr failed: " << rc
                          << ", provider_errno=" << provider_errno
                          << " (" << berror(provider_errno) << ')'
@@ -773,15 +991,279 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             errno = rc;
             return -1;
         }
-        _sq_current = (_sq_current + 1) % (_sq_size - RESERVED_WR_NUM);
+        {
+            std::unique_lock<butil::Mutex> lock(_read_mutex);
+            _read_tx_offset += this_len;
+        }
         total_len += static_cast<ssize_t>(this_len);
     }
     return total_len;
 }
 
+bool UrmaEndpoint::ReserveSqSlot(uint16_t* slot) {
+    std::unique_lock<butil::Mutex> lock(_sq_slot_mutex);
+    const uint16_t capacity = static_cast<uint16_t>(_sq_slot_in_use.size());
+    if (capacity == 0) return false;
+    for (uint16_t n = 0; n < capacity; ++n) {
+        const uint16_t i = (_sq_current + n) % capacity;
+        if (!_sq_slot_in_use[i]) {
+            _sq_slot_in_use[i] = 1;
+            _sq_current = static_cast<uint16_t>((i + 1) % capacity);
+            *slot = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+void UrmaEndpoint::ReleaseSqSlot(uint16_t slot) {
+    std::unique_lock<butil::Mutex> lock(_sq_slot_mutex);
+    if (slot < _sq_slot_in_use.size()) {
+        _sq_slot_in_use[slot] = 0;
+    }
+}
+
 bool UrmaEndpoint::IsWritable() const {
+    {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        if (!_read_local_ready || !_read_peer_ready ||
+            _read_tx_offer_pending) {
+            return false;
+        }
+    }
     return _remote_rq_window_size.load(butil::memory_order_relaxed) > 0 &&
            _sq_window_size.load(butil::memory_order_relaxed) > 0;
+}
+
+int UrmaEndpoint::SendReadControl(uint8_t type, uint64_t seq,
+                                  uint64_t stream_offset,
+                                  uint64_t segment_offset, uint32_t length,
+                                  uint32_t max_chunk) {
+    if (!_resource || !_resource->remote_jetty ||
+        _remote_rq_window_size.load(butil::memory_order_relaxed) == 0 ||
+        _sq_window_size.load(butil::memory_order_relaxed) == 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+    uint16_t slot = 0;
+    if (!ReserveSqSlot(&slot)) {
+        errno = EAGAIN;
+        return -1;
+    }
+    uint8_t frame[URMA_READ_CONTROL_SIZE] = {};
+    std::memcpy(frame, "URDC", 4);
+    frame[4] = URMA_READ_PROTOCOL_VERSION;
+    frame[5] = type;
+    const uint16_t frame_size = butil::HostToNet16(URMA_READ_CONTROL_SIZE);
+    std::memcpy(frame + 6, &frame_size, sizeof(frame_size));
+    uint64_t local_epoch;
+    uint64_t peer_epoch;
+    {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        local_epoch = _read_tx_epoch;
+        peer_epoch = _read_peer_epoch;
+    }
+    const uint64_t local_be = HostToNet64(local_epoch);
+    const uint64_t peer_be = HostToNet64(peer_epoch);
+    const uint64_t seq_be = HostToNet64(seq);
+    const uint64_t offset_be = HostToNet64(stream_offset);
+    const uint64_t segment_be = HostToNet64(segment_offset);
+    const uint32_t length_be = butil::HostToNet32(length);
+    const uint32_t max_chunk_be = butil::HostToNet32(max_chunk);
+    std::memcpy(frame + 8, &local_be, sizeof(local_be));
+    std::memcpy(frame + 16, &peer_be, sizeof(peer_be));
+    std::memcpy(frame + 24, &seq_be, sizeof(seq_be));
+    std::memcpy(frame + 32, &offset_be, sizeof(offset_be));
+    std::memcpy(frame + 40, &segment_be, sizeof(segment_be));
+    std::memcpy(frame + 48, &length_be, sizeof(length_be));
+    std::memcpy(frame + 52, &max_chunk_be, sizeof(max_chunk_be));
+
+    butil::IOBuf* send_buf = &_sbuf[slot];
+    send_buf->clear();
+    send_buf->append(frame, sizeof(frame));
+    void* data = const_cast<void*>(
+        reinterpret_cast<UrmaIOBuf*>(send_buf)->fetch1());
+    urma_target_seg_t* tseg = GetPoolSegFor(data);
+    if (!tseg) {
+        ReleaseSqSlot(slot);
+        errno = ERDMAMEM;
+        return -1;
+    }
+    urma_sge_t sge{reinterpret_cast<uint64_t>(data),
+                   static_cast<uint32_t>(sizeof(frame)), tseg, nullptr};
+    urma_sg_t sg{&sge, 1};
+    urma_jfs_wr_t wr{};
+    wr.opcode = URMA_OPC_SEND_IMM;
+    wr.flag.bs.complete_enable = 1;
+    wr.flag.bs.comp_order = 1;
+    wr.flag.bs.place_order = 2;
+    wr.flag.bs.solicited_enable = 1;
+    wr.tjetty = _resource->remote_jetty;
+    wr.send.src = sg;
+    wr.send.imm_data = URMA_READ_IMM_TAG | type;
+    wr.user_ctx = MakeWrContext(slot, 2);
+    _remote_rq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        _remote_rq_window_size.fetch_add(1, butil::memory_order_relaxed);
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
+        send_buf->clear();
+        ReleaseSqSlot(slot);
+        errno = status;
+        return -1;
+    }
+    return 0;
+}
+
+int UrmaEndpoint::PostRead(uint64_t segment_offset, uint32_t length) {
+    if (length == 0 || length > _read_max_chunk ||
+        segment_offset > _remote_segment_len ||
+        length > _remote_segment_len - segment_offset ||
+        _remote_segment_va > UINT64_MAX - segment_offset) {
+        errno = EPROTO;
+        return -1;
+    }
+    const uint64_t remote_addr = _remote_segment_va + segment_offset;
+    if (remote_addr > UINT64_MAX - length) {
+        errno = EPROTO;
+        return -1;
+    }
+    urma_target_seg_t* local_seg = GetPoolSegFor(_read_rx_data);
+    if (!local_seg || !_resource->remote_seg) {
+        errno = ERDMAMEM;
+        return -1;
+    }
+    uint16_t slot = 0;
+    if (_sq_window_size.load(butil::memory_order_relaxed) == 0 ||
+        !ReserveSqSlot(&slot)) {
+        errno = EAGAIN;
+        return -1;
+    }
+    urma_sge_t remote_sge{remote_addr, length, _resource->remote_seg, nullptr};
+    urma_sge_t local_sge{reinterpret_cast<uint64_t>(_read_rx_data), length,
+                         local_seg, nullptr};
+    urma_sg_t src{&remote_sge, 1};
+    urma_sg_t dst{&local_sge, 1};
+    urma_jfs_wr_t wr{};
+    wr.opcode = URMA_OPC_READ;
+    wr.flag.bs.complete_enable = 1;
+    wr.flag.bs.comp_order = 1;
+    wr.flag.bs.place_order = 2;
+    wr.tjetty = _resource->remote_jetty;
+    wr.rw.src = src;
+    wr.rw.dst = dst;
+    wr.user_ctx = MakeWrContext(slot, 3);
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
+        ReleaseSqSlot(slot);
+        errno = status;
+        return -1;
+    }
+    return 0;
+}
+
+int UrmaEndpoint::HandleReadControl(const void* data, size_t length) {
+    if (!data || length != URMA_READ_CONTROL_SIZE) {
+        errno = EPROTO;
+        return -1;
+    }
+    const uint8_t* frame = static_cast<const uint8_t*>(data);
+    uint16_t frame_size_be = 0;
+    std::memcpy(&frame_size_be, frame + 6, sizeof(frame_size_be));
+    if (std::memcmp(frame, "URDC", 4) != 0 ||
+        frame[4] != URMA_READ_PROTOCOL_VERSION ||
+        butil::NetToHost16(frame_size_be) != URMA_READ_CONTROL_SIZE) {
+        errno = EPROTO;
+        return -1;
+    }
+    uint64_t fields64[5];
+    std::memcpy(&fields64[0], frame + 8, 8);
+    std::memcpy(&fields64[1], frame + 16, 8);
+    std::memcpy(&fields64[2], frame + 24, 8);
+    std::memcpy(&fields64[3], frame + 32, 8);
+    std::memcpy(&fields64[4], frame + 40, 8);
+    const uint64_t sender_epoch = NetToHost64(fields64[0]);
+    const uint64_t target_epoch = NetToHost64(fields64[1]);
+    const uint64_t seq = NetToHost64(fields64[2]);
+    const uint64_t stream_offset = NetToHost64(fields64[3]);
+    const uint64_t segment_offset = NetToHost64(fields64[4]);
+    uint32_t length_be = 0, max_chunk_be = 0;
+    std::memcpy(&length_be, frame + 48, 4);
+    std::memcpy(&max_chunk_be, frame + 52, 4);
+    const uint32_t payload_length = butil::NetToHost32(length_be);
+    const uint32_t max_chunk = butil::NetToHost32(max_chunk_be);
+
+    if (frame[5] == URMA_READ_READY) {
+        if (sender_epoch == 0 || target_epoch != 0 || seq != 0 ||
+            stream_offset != 0 || segment_offset != 0 || payload_length != 0 ||
+            max_chunk < URMA_READ_THRESHOLD) {
+            errno = EPROTO;
+            return -1;
+        }
+        {
+            std::unique_lock<butil::Mutex> lock(_read_mutex);
+            if (_read_peer_ready) {
+                errno = EPROTO;
+                return -1;
+            }
+            _read_peer_epoch = sender_epoch;
+            _read_peer_max_chunk = max_chunk;
+            _read_peer_ready = true;
+            _read_tx_credit = true;
+        }
+        _socket->WakeAsEpollOut();
+        return 0;
+    }
+    {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        if (!_read_peer_ready || target_epoch != _read_tx_epoch ||
+            sender_epoch != _read_peer_epoch) {
+            errno = EPROTO;
+            return -1;
+        }
+    }
+    if (frame[5] == URMA_READ_OFFER) {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        if (max_chunk != 0 || payload_length == 0 ||
+            payload_length > _read_max_chunk ||
+            stream_offset != _read_rx_offset || seq != _read_rx_seq ||
+            _read_rx_active || _remote_segment_len == 0 ||
+            segment_offset > _remote_segment_len ||
+            payload_length > _remote_segment_len - segment_offset) {
+            errno = EPROTO;
+            return -1;
+        }
+        _read_rx_active = true;
+        _read_pending_seq = seq;
+        _read_pending_offset = stream_offset;
+        _read_pending_length = payload_length;
+        lock.unlock();
+        return PostRead(segment_offset, payload_length);
+    }
+    if (frame[5] == URMA_READ_DONE) {
+        std::unique_lock<butil::Mutex> lock(_read_mutex);
+        if (max_chunk != 1 || segment_offset != 0 ||
+            !_read_tx_offer_pending || seq != _read_tx_seq ||
+            stream_offset != _read_tx_offset || payload_length != _read_tx_length) {
+            errno = EPROTO;
+            return -1;
+        }
+        _read_tx_offer_pending = false;
+        _read_tx_credit = true;
+        _read_tx_offset += payload_length;
+        _read_tx_seq++;
+        _socket->WakeAsEpollOut();
+        return 0;
+    }
+    errno = EPROTO;
+    return -1;
 }
 
 // ============================================================================
@@ -881,6 +1363,8 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     std::memset(&wr, 0, sizeof(wr));
     wr.opcode = URMA_OPC_SEND_IMM;
     wr.flag.bs.complete_enable = 1;
+    wr.flag.bs.comp_order = 1;
+    wr.flag.bs.place_order = 2;
     wr.flag.bs.solicited_enable = 1;
     wr.tjetty = _resource->remote_jetty;
     wr.send.imm_data = imm;
@@ -949,6 +1433,15 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             SendAck(0);
             return 0;
         }
+        const uint8_t context_kind = WrContextKind(cr.user_ctx);
+        const uint16_t context_slot = WrContextSlot(cr.user_ctx);
+        if (cr.user_ctx < 0x100 || context_slot >= _sbuf.size() ||
+            (context_kind != 1 && context_kind != 2 && context_kind != 3)) {
+            LOG(WARNING) << "Invalid URMA send completion context="
+                         << cr.user_ctx;
+            errno = EPROTO;
+            return -1;
+        }
         uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
         uint16_t old =
             _sq_window_size.load(butil::memory_order_relaxed);
@@ -969,9 +1462,38 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                 break;
             }
         }
-        for (uint16_t i = 0; i < wnd; ++i) {
-            _sbuf[_sq_sent].clear();
-            _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
+        _sbuf[context_slot].clear();
+        ReleaseSqSlot(context_slot);
+        if (context_kind == 3) {
+            // READ completion: the remote source has been consumed into our
+            // registered RX slot. Copy into the byte-stream input buffer
+            // before returning its one-slot credit.
+            std::unique_lock<butil::Mutex> lock(_read_mutex);
+            if (!_read_rx_active || _read_pending_length == 0) {
+                errno = EPROTO;
+                return -1;
+            }
+            const uint32_t read_len = _read_pending_length;
+            if (_read_pending_offset != _read_rx_offset) {
+                errno = EPROTO;
+                return -1;
+            }
+            _input_processor.read_buf().append(_read_rx_data, read_len);
+            _read_rx_offset += read_len;
+            ++_read_rx_seq;
+            _read_rx_active = false;
+            _read_pending_length = 0;
+            lock.unlock();
+            if (SendReadControl(URMA_READ_DONE, _read_rx_seq - 1,
+                                _read_rx_offset - read_len, 0, read_len, 1) < 0) {
+                return -1;
+            }
+            butil::subtle::MemoryBarrier();
+            if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
+                _local_window_capacity / 8) {
+                _socket->WakeAsEpollOut();
+            }
+            return read_len;
         }
         butil::subtle::MemoryBarrier();
         if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
@@ -981,7 +1503,18 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         return 0;
     }
     // Recv completion.
-    if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
+    const bool is_read_control =
+        cr.opcode == URMA_CR_OPC_SEND_WITH_IMM &&
+        (cr.imm_data & URMA_READ_IMM_MASK) == URMA_READ_IMM_TAG;
+    uint8_t read_control_frame[URMA_READ_CONTROL_SIZE];
+    if (is_read_control) {
+        if (cr.completion_len != URMA_READ_CONTROL_SIZE) {
+            errno = EPROTO;
+            return -1;
+        }
+        std::memcpy(read_control_frame, _rbuf_data[_rq_received],
+                    sizeof(read_control_frame));
+    } else if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
         if (cr.imm_data > _local_window_capacity) {
             LOG(WARNING) << "Invalid URMA receive credit: " << cr.imm_data;
             errno = EPROTO;
@@ -1017,17 +1550,21 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         errno = EPROTO;
         return -1;
     }
-    if (cr.completion_len > GetUrmaRecvBlockSize()) {
+    if (!is_read_control && cr.completion_len > GetUrmaRecvBlockSize()) {
         LOG(WARNING) << "URMA completion exceeds receive buffer: "
                      << cr.completion_len;
         errno = EPROTO;
         return -1;
     }
-    if (cr.completion_len < static_cast<uint32_t>(FLAGS_urma_zerocopy_min_size)) {
+    if (!is_read_control &&
+        cr.completion_len < static_cast<uint32_t>(FLAGS_urma_zerocopy_min_size)) {
         zerocopy = false;
     }
     butil::IOPortal& read_buf = _input_processor.read_buf();
-    if (zerocopy) {
+    if (is_read_control) {
+        // The control frame was copied into endpoint state synchronously;
+        // do not expose it as RPC payload.
+    } else if (zerocopy) {
         _rbuf[_rq_received].cutn(&read_buf, cr.completion_len);
     } else {
         read_buf.append(_rbuf_data[_rq_received], cr.completion_len);
@@ -1037,6 +1574,14 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     }
     if (cr.completion_len > 0) {
         SendAck(1);
+        if (!is_read_control) {
+            std::unique_lock<butil::Mutex> lock(_read_mutex);
+            _read_rx_offset += cr.completion_len;
+        }
+    }
+    if (is_read_control &&
+        HandleReadControl(read_control_frame, sizeof(read_control_frame)) < 0) {
+        return -1;
     }
     return static_cast<ssize_t>(cr.completion_len);
 }
@@ -1133,6 +1678,16 @@ void UrmaEndpoint::PollCq(Socket* m) {
                     }
                     bytes += nr;
                 }
+                if (FLAGS_urma_cq_batch_dispatch && bytes > 0) {
+                    // Publish received stream bytes before polling another CQ
+                    // batch. Event mode still drains to empty below, but RPC
+                    // parsing no longer waits for the entire drain to finish.
+                    ep->DispatchReceivedBytes(s, bytes);
+                    bytes = 0;
+                    if (s->Failed()) {
+                        return ECANCELED;
+                    }
+                }
             }
         };
 
@@ -1184,6 +1739,8 @@ void UrmaEndpoint::PollCq(Socket* m) {
 
 void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
     _remote_recv_block_size = remote.buffer_size;
+    _remote_segment_va = remote.seg_va;
+    _remote_segment_len = remote.seg_len;
     const uint32_t peer_rq_size = remote.recv_buffer_cnt + 1;
     const uint32_t local_capacity =
         std::min<uint32_t>(_sq_size, peer_rq_size);
@@ -1385,6 +1942,13 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     }
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
+    ep->_read_local_ready = true;
+    if (ep->SendReadControl(URMA_READ_READY, 0, 0, 0, 0,
+                            ep->_read_max_chunk) < 0) {
+        const int saved_errno = errno ? errno : EIO;
+        s->SetFailed(saved_errno, "Fail to send URMA READ_READY");
+        return nullptr;
+    }
     ep->DispatchReceivedBytes(s, 0);
     return nullptr;
 }
@@ -1470,6 +2034,13 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
+        ep->_read_local_ready = true;
+        if (ep->SendReadControl(URMA_READ_READY, 0, 0, 0, 0,
+                                ep->_read_max_chunk) < 0) {
+            const int saved_errno = errno ? errno : EIO;
+            s->SetFailed(saved_errno, "Fail to send URMA READ_READY");
+            return nullptr;
+        }
         ep->DispatchReceivedBytes(s, 0);
     } else {
         ep->FallbackToTcp(tp, true);

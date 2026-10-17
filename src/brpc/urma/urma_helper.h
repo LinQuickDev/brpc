@@ -62,6 +62,10 @@ void DeregisterMemoryForUrma(void* buf);
 // the segment backing the whole pool. Returns nullptr for any other address.
 urma_target_seg_t* GetPoolSegFor(void* buf);
 
+// Resolve an address range inside the registered pool to a segment-relative
+// offset. Returns false unless the entire range belongs to the pool.
+bool GetPoolSegmentOffset(const void* buf, size_t len, uint64_t* offset);
+
 // Get the global URMA context (the urma_context_t created on the selected
 // device / EID). Returns nullptr if URMA is not initialized.
 urma_context_t* GetUrmaContext();
@@ -98,6 +102,9 @@ size_t GetUrmaRecvBlockSize();
 
 // Return max_sge supported by the device.
 int GetUrmaMaxSge();
+
+// Return the device's advertised maximum READ length, or zero when unknown.
+uint32_t GetUrmaMaxReadSize();
 
 }  // namespace urma
 }  // namespace brpc

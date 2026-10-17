@@ -73,6 +73,10 @@ DEFINE_int32(urma_rq_size, 128,
              "Depth of the local recv jetty (JFR). [16, 4096]");
 DEFINE_int32(urma_cqe_poll_once, 32,
              "Max completion entries polled per urma_poll_jfc call");
+DEFINE_bool(urma_cq_batch_dispatch, true,
+            "Dispatch received bytes after each CQ batch instead of draining first");
+DEFINE_bool(urma_pool_thread_sharding, true,
+            "Assign preferred URMA buffer-pool shards round-robin per physical thread");
 DEFINE_bool(urma_recv_zerocopy, true,
             "Use zero-copy for receives larger than --urma_zerocopy_min_size");
 DEFINE_int32(urma_zerocopy_min_size, 512,
@@ -266,6 +270,14 @@ size_t ShardFor(void* buf) {
 }
 
 size_t PreferredShard() {
+    if (FLAGS_urma_pool_thread_sharding) {
+        // Assign one stable shard per physical thread. Unlike a bthread TLS
+        // address, pthread-local state remains valid across bthread switches.
+        static butil::atomic<size_t> next_shard{0};
+        static thread_local const size_t shard =
+            next_shard.fetch_add(1, butil::memory_order_relaxed) % kShardCount;
+        return shard;
+    }
     // pthread_t is an integer on Linux and a pointer on macOS. Hash its native
     // representation instead of assuming either form with a cast.
     return std::hash<pthread_t>()(pthread_self()) % kShardCount;
@@ -410,6 +422,19 @@ urma_target_seg_t* GetPoolSegFor(void* buf) {
         return g_pool_seg;
     }
     return nullptr;
+}
+
+bool GetPoolSegmentOffset(const void* buf, size_t len, uint64_t* offset) {
+    if (g_skip_urma_init || !g_pool_seg || !g_pool_base || !buf || !offset) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(g_pool_base);
+    const uintptr_t p = reinterpret_cast<uintptr_t>(buf);
+    if (p < base || p - base > g_pool_size || len > g_pool_size - (p - base)) {
+        return false;
+    }
+    *offset = static_cast<uint64_t>(p - base);
+    return true;
 }
 
 static void GlobalRelease() {
@@ -688,6 +713,8 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
 }
 uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
 int GetUrmaMaxSge() { return g_max_sge; }
+
+uint32_t GetUrmaMaxReadSize() { return g_device_attr.dev_cap.max_read_size; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }
 
 // ============================================================================

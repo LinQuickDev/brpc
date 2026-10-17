@@ -244,6 +244,7 @@ urma_status_t urma_query_device(urma_device_t *device,
     mock_device_attr.dev_cap.max_jetty = 1024;
     mock_device_attr.dev_cap.max_jfs_sge = 8;
     mock_device_attr.dev_cap.max_jfr_sge = 8;
+    mock_device_attr.dev_cap.max_read_size = 8192;
     memcpy(attr, &mock_device_attr, sizeof(urma_device_attr_t));
     return URMA_SUCCESS;
 }
@@ -554,6 +555,53 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                 *bad_wr = current;
             }
             return URMA_EINVAL;
+        }
+
+        if (current->opcode == URMA_OPC_READ) {
+            if (current->rw.src.num_sge != 1 ||
+                current->rw.dst.num_sge != 1 ||
+                !current->rw.src.sge || !current->rw.dst.sge) {
+                if (bad_wr) *bad_wr = current;
+                return URMA_EINVAL;
+            }
+            const urma_sge_t& remote = current->rw.src.sge[0];
+            const urma_sge_t& local = current->rw.dst.sge[0];
+            bool valid_remote = false;
+            bool valid_local = false;
+            {
+                std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+                auto remote_it = seg_map.find(remote.tseg);
+                auto local_it = seg_map.find(local.tseg);
+                if (remote_it != seg_map.end() && local_it != seg_map.end() &&
+                    remote.tseg->seg.ubva.va <= remote.addr &&
+                    remote.addr - remote.tseg->seg.ubva.va <=
+                        remote.tseg->seg.len &&
+                    remote.len <= remote.tseg->seg.len -
+                                      (remote.addr - remote.tseg->seg.ubva.va) &&
+                    local.tseg->seg.ubva.va <= local.addr &&
+                    local.addr - local.tseg->seg.ubva.va <= local.tseg->seg.len &&
+                    local.len <= local.tseg->seg.len -
+                                     (local.addr - local.tseg->seg.ubva.va) &&
+                    remote.len == local.len) {
+                    valid_remote = true;
+                    valid_local = true;
+                }
+            }
+            if (!valid_remote || !valid_local) {
+                if (bad_wr) *bad_wr = current;
+                return URMA_EINVAL;
+            }
+            std::memcpy(reinterpret_cast<void*>(local.addr),
+                        reinterpret_cast<const void*>(remote.addr), remote.len);
+            if (current->flag.bs.complete_enable) {
+                urma_cr_t read_cr{};
+                read_cr.status = URMA_CR_SUCCESS;
+                read_cr.user_ctx = current->user_ctx;
+                read_cr.flag.bs.s_r = 0;
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc, local_state,
+                               read_cr);
+            }
+            continue;
         }
 
         urma_cr_t send_cr{};

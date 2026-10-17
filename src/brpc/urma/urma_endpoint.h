@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <ostream>
+#include <unordered_set>
 #include <vector>
 
 #include "butil/atomicops.h"
@@ -233,6 +234,17 @@ private:
     // a standalone SendImm. @num is the number of new recv WRs to add.
     int SendAck(int num);
 
+    // The large-message path uses short SEND_IMM control frames and a single
+    // READ in flight per direction. Control framing is private to this
+    // transport; payload bytes still enter InputMessenger unchanged.
+    int SendReadControl(uint8_t type, uint64_t seq, uint64_t stream_offset,
+                        uint64_t segment_offset, uint32_t length,
+                        uint32_t max_chunk);
+    int HandleReadControl(const void* data, size_t length);
+    int PostRead(uint64_t segment_offset, uint32_t length);
+    bool ReserveSqSlot(uint16_t* slot);
+    void ReleaseSqSlot(uint16_t slot);
+
     // Handle one completion record. For SEND completions: reclaim the SQ
     // window and wake the writer. For RECV completions: cut the payload into
     // the URMA input processor, repost the recv WR, and ack. Returns bytes
@@ -294,6 +306,7 @@ private:
 
     // Per-WR send buffers (own the IOBuf until the SEND completes).
     std::vector<butil::IOBuf> _sbuf;
+    std::vector<uint8_t> _sq_slot_in_use;
     // Per-WR recv buffers (zero-copy targets).
     std::vector<butil::IOBuf> _rbuf;
     std::vector<void*> _rbuf_data;
@@ -311,9 +324,36 @@ private:
 
     // SQ producer / consumer indices.
     uint16_t _sq_current{0};
-    uint16_t _sq_sent{0};
     // RQ consumer index.
     uint16_t _rq_received{0};
+
+    // READ protocol state. Accessed by the writer and CQ poller.
+    butil::Mutex _sq_slot_mutex;
+    mutable butil::Mutex _read_mutex;
+    std::unordered_set<const butil::IOBuf*> _read_path_iobufs;
+    butil::IOBuf _read_tx_buf;
+    void* _read_tx_data{nullptr};
+    butil::IOBuf _read_rx_buf;
+    void* _read_rx_data{nullptr};
+    uint64_t _read_tx_epoch{0};
+    uint64_t _read_peer_epoch{0};
+    uint64_t _read_tx_seq{0};
+    uint64_t _read_rx_seq{0};
+    uint64_t _read_tx_offset{0};
+    uint64_t _read_rx_offset{0};
+    uint64_t _remote_segment_va{0};
+    uint64_t _remote_segment_len{0};
+    uint32_t _read_max_chunk{0};
+    uint32_t _read_peer_max_chunk{0};
+    uint32_t _read_tx_length{0};
+    bool _read_local_ready{false};
+    bool _read_peer_ready{false};
+    bool _read_tx_credit{false};
+    bool _read_tx_offer_pending{false};
+    bool _read_rx_active{false};
+    uint64_t _read_pending_seq{0};
+    uint64_t _read_pending_offset{0};
+    uint32_t _read_pending_length{0};
 
     // Butex for waking the handshake bthread parked in ReadFromFd.
     butil::atomic<int>* _read_butex{nullptr};
