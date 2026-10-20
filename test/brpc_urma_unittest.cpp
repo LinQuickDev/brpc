@@ -766,6 +766,17 @@ TEST(UrmaHandshakeTest, rejects_invalid_resource_and_window_values) {
     EXPECT_FALSE(urma::ValidHello(hello));
 }
 
+TEST(UrmaHelperTest, standalone_bonding_uses_regular_jetty_import) {
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, 0));
+    EXPECT_TRUE(urma::NeedsUrmaBondingJettyExtension(true, 1));
+    EXPECT_TRUE(urma::NeedsUrmaBondingJettyExtension(true, 2));
+    for (int mode = 0; mode <= 2; ++mode) {
+        EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(false, mode));
+    }
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, -1));
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, 3));
+}
+
 TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
     urma_device_attr_t attr{};
     attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;

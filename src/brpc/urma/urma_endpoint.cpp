@@ -66,6 +66,7 @@ DECLARE_int32(urma_cqe_poll_once);
 DECLARE_bool(urma_recv_zerocopy);
 DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
+DECLARE_int32(urma_bonding_mode);
 DECLARE_bool(urma_poller_yield);
 
 // ---- Constants shared with the handshake module ----
@@ -580,11 +581,13 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
 
     urma_token_t token{};
     const bool use_bonding_extension =
-        IsUrmaBondingDevice() && remote.trans_mode == URMA_TM_RM;
+        NeedsUrmaBondingJettyExtension(IsUrmaBondingDevice(),
+                                       FLAGS_urma_bonding_mode) &&
+        remote.trans_mode == URMA_TM_RM;
     errno = 0;
     if (use_bonding_extension) {
 #if BRPC_URMA_HAS_BONDING_EXT
-        // The bonding provider needs the local jetty to associate its send
+        // Non-standalone bonding needs the local jetty to associate its send
         // path with the imported target. A plain import may return success
         // without setting that association, leaving traffic one-way only.
         bondp_rjetty_t bonding_remote{};
