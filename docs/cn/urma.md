@@ -160,6 +160,7 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 | `--urma_zerocopy_min_size` | 512 | 小于此值的接收拷贝 |
 | `--urma_device` | "" | URMA 设备名（空=首个） |
 | `--urma_max_sge` | 0 | 每 WR SGE 上限（0=设备上限） |
+| `--urma_trace_stream` | false | 诊断模式：每连接保存最近 32 条收发记录，失败或关闭时最多输出一次；包含载荷前 16 字节，仅用于可控测试数据 |
 | `--urma_bonding_mode` | 0 | bonding 模式：0=standalone，1=active-backup，2=balance |
 | `--urma_bonding_level` | 0 | bonding 层级：0=IODIE，1=port |
 | `--urma_prepared_jetty_cnt` | 8 | 预连接 Jetty+CQ 请求数量；会根据 `RLIMIT_NOFILE` 自动限制 |
@@ -171,6 +172,13 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 设备名以 `bonding` 开头时，brpc 会在创建 context 后、创建 segment 和队列
 前配置 provider。默认 standalone+IODIE 配置与 UMDK 性能工具保持一致。
 bonding 支持需要 provider 扩展头文件 `urma_ubagg.h`。
+
+排查报文边界异常时，可在两端创建连接前开启 `--urma_trace_stream=true`。
+`URMA_TRACE` 记录各阶段的序号、累计字节偏移、长度、槽位、FNV-1a 摘要和十六进制前缀：
+`TX` 是提交前的发送尝试（不代表已成功发送），`RX_CQ` 是完成到达顺序，
+`RX_USE` 是按接收投递顺序交给输入流的数据。解析失败还会输出当前缓冲区的长度和前缀。
+记录数量有界且只输出一次，不能当作完整抓包；摘要不是安全校验。
+此开关会增加数据扫描开销并暴露部分 RPC 内容，请勿对敏感业务流量开启。
 
 ## 与 UBRing 协同
 

@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <ostream>
 #include <vector>
 
@@ -46,6 +47,7 @@ class UrmaTransport;
 namespace urma {
 
 class UrmaHandshake;
+class UrmaStreamTrace;
 struct ParsedHello;
 
 DECLARE_bool(urma_use_polling);
@@ -247,6 +249,8 @@ private:
     // complete receives during the handshake, but StartCqEvents defers their
     // processing until the TCP parser has returned.
     void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes);
+    void DumpStreamTrace(const char* reason, const std::string& prefix = "",
+                         size_t buffered = 0);
 
     // Consume one async event from the JFCE fd (event mode only). The caller
     // drains completions before acknowledge/rearm because the bonding provider
@@ -281,6 +285,7 @@ private:
 
     // The URMA resources (jetty / jfc / jfr / jfce / imported peer objects).
     UrmaResource* _resource{nullptr};
+    std::unique_ptr<UrmaStreamTrace> _stream_trace;
 
     // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
     // (polling mode). PollCq is the edge-triggered callback on this socket.

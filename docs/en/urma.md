@@ -171,6 +171,7 @@ All flags use the `urma_` prefix (mirroring RDMA's `rdma_` prefix):
 | `--urma_zerocopy_min_size` | 512 | Receives smaller than this are copied |
 | `--urma_device` | "" | URMA device name (empty = first) |
 | `--urma_max_sge` | 0 | Max SGEs per WR (0 = device max) |
+| `--urma_trace_stream` | false | Diagnostics: retain the last 32 stream events per connection and dump once on failure or teardown; includes the first 16 payload bytes, for controlled test data only |
 | `--urma_bonding_mode` | 0 | Bonding mode: 0=standalone, 1=active-backup, 2=balance |
 | `--urma_bonding_level` | 0 | Bonding level: 0=IODIE, 1=port |
 | `--urma_prepared_jetty_cnt` | 8 | Requested pre-allocated Jetty+CQ sets; automatically capped according to `RLIMIT_NOFILE` |
@@ -183,6 +184,16 @@ For a device whose name starts with `bonding`, brpc configures the provider
 immediately after context creation and before creating segments or queues.
 The default standalone+IODIE combination matches the UMDK performance tool.
 Bonding support requires the provider extension header `urma_ubagg.h`.
+
+To diagnose stream boundaries, enable `--urma_trace_stream=true` on both ends
+before creating connections. `URMA_TRACE` includes per-stage sequence numbers,
+byte offsets, lengths, slots, FNV-1a fingerprints and hex prefixes. `TX` records
+post attempts, not successful transmission; `RX_CQ` records completion arrival
+order; `RX_USE` records receive-post order as delivered to the input stream.
+Parse failures also include the current input buffer length and prefix.
+The bounded, one-time dump is not a complete packet capture or a security checksum.
+Tracing scans payloads and exposes partial RPC contents; do not enable it on
+sensitive production traffic.
 
 ## Coexistence with UBRing
 

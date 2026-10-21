@@ -44,6 +44,8 @@
 #include "echo.pb.h"
 #include "brpc/closure_guard.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/urma/urma_stream_trace.h"
+#include "brpc/global.h"
 
 using namespace brpc;
 
@@ -51,6 +53,7 @@ namespace brpc {
 namespace urma {
 
 DECLARE_int32(urma_client_handshake_version);
+DECLARE_bool(urma_trace_stream);
 extern bool g_skip_urma_init;
 extern butil::atomic<bool> g_urma_available;
 
@@ -797,6 +800,69 @@ TEST(UrmaHandshakeTest, rejects_invalid_resource_and_window_values) {
     EXPECT_FALSE(urma::ValidHello(hello));
 }
 
+TEST(UrmaTraceTest, fingerprints_ignore_sge_boundaries) {
+    const std::string payload = "hello";
+    urma_sge_t whole{reinterpret_cast<uint64_t>(payload.data()), 5, nullptr, nullptr};
+    urma_sge_t parts[] = {
+        {reinterpret_cast<uint64_t>(payload.data()), 2, nullptr, nullptr},
+        {reinterpret_cast<uint64_t>(payload.data() + 2), 3, nullptr, nullptr}};
+    const auto a = urma::UrmaStreamTrace::Summarize(&whole, 1);
+    const auto b = urma::UrmaStreamTrace::Summarize(parts, 2);
+    EXPECT_EQ(UINT64_C(0xa430d84680aabd0b), a.hash);
+    EXPECT_EQ(a.hash, b.hash);
+    EXPECT_EQ(a.length, b.length);
+    EXPECT_EQ("68656c6c6f", a.prefix);
+    EXPECT_EQ(a.prefix, b.prefix);
+}
+
+TEST(UrmaTraceTest, bounds_payload_prefix_and_dump_history) {
+    const std::string payload(64, 'a');
+    urma_sge_t sge{reinterpret_cast<uint64_t>(payload.data()), 64, nullptr, nullptr};
+    const auto summary = urma::UrmaStreamTrace::Summarize(&sge, 1);
+    EXPECT_EQ(64u, summary.length);
+    EXPECT_EQ(2 * urma::UrmaStreamTrace::PREFIX_SIZE, summary.prefix.size());
+    urma::UrmaStreamTrace trace;
+    EXPECT_TRUE(trace.DumpOnce().empty());
+    for (size_t i = 0; i < urma::UrmaStreamTrace::CAPACITY + 8; ++i) {
+        trace.Record(urma::UrmaStreamTrace::TX, i, 1, 0, &sge, 1);
+    }
+    const std::string dump = trace.DumpOnce();
+    EXPECT_NE(std::string::npos, dump.find("records=32 total=40"));
+    EXPECT_EQ(std::string::npos, dump.find(" seq=7 "));
+    EXPECT_NE(std::string::npos, dump.find(" seq=8 offset=512 len=64"));
+    EXPECT_NE(std::string::npos, dump.find(" seq=39 offset=2496 len=64"));
+    EXPECT_TRUE(trace.DumpOnce().empty());
+}
+
+TEST(UrmaTraceTest, concurrent_directions_keep_independent_offsets) {
+    const std::string payload = "xy";
+    urma_sge_t sge{reinterpret_cast<uint64_t>(payload.data()), 2, nullptr, nullptr};
+    urma::UrmaStreamTrace trace;
+    auto record = [&](urma::UrmaStreamTrace::Stage stage) {
+        for (size_t i = 0; i < 50; ++i) {
+            trace.Record(stage, i, 1, 0, &sge, 1);
+        }
+    };
+    std::thread sender(record, urma::UrmaStreamTrace::TX);
+    std::thread receiver(record, urma::UrmaStreamTrace::RX_CQ);
+    sender.join();
+    receiver.join();
+    const std::string dump = trace.DumpOnce();
+    EXPECT_NE(std::string::npos, dump.find("records=32 total=100"));
+    EXPECT_NE(std::string::npos, dump.find("seq=49 offset=98 len=2"));
+}
+
+TEST_F(UrmaCommonServerTest, stream_trace_is_opt_in) {
+    const bool saved = urma::FLAGS_urma_trace_stream;
+    urma::FLAGS_urma_trace_stream = false;
+    urma::UrmaEndpoint disabled(socket.get());
+    urma::FLAGS_urma_trace_stream = true;
+    urma::UrmaEndpoint enabled(socket.get());
+    urma::FLAGS_urma_trace_stream = saved;
+    EXPECT_EQ(nullptr, disabled._stream_trace.get());
+    EXPECT_NE(nullptr, enabled._stream_trace.get());
+}
+
 TEST(UrmaHelperTest, standalone_bonding_uses_regular_jetty_import) {
     EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, 0));
     EXPECT_TRUE(urma::NeedsUrmaBondingJettyExtension(true, 1));
@@ -1192,6 +1258,53 @@ TEST_F(UrmaMockTest, concurrent_copy_rpc_preserves_stream_boundaries) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT(_exit(RunUrmaMockConcurrentRpc(false)),
                 ::testing::ExitedWithCode(0), "");
+}
+
+static int RunUrmaMockTracedRpc() {
+    gflags::SetCommandLineOption("urma_trace_stream", "true");
+    return RunUrmaMockConcurrentRpc(false);
+}
+
+TEST_F(UrmaMockTest, traced_rpc_dumps_bounded_history_on_teardown) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockTracedRpc()),
+                ::testing::ExitedWithCode(0), "URMA_TRACE");
+}
+
+static int RunUrmaMalformedResponseTrace() {
+    GlobalInitializeOrDie();
+    gflags::SetCommandLineOption("urma_trace_stream", "true");
+    SocketOptions options;
+    options.user = get_or_new_client_side_messenger();
+    SocketId id;
+    if (Socket::Create(options, &id) != 0) {
+        return 10;
+    }
+    SocketUniquePtr socket;
+    if (Socket::Address(id, &socket) != 0) {
+        return 11;
+    }
+    struct FailSocket {
+        Socket* socket;
+        ~FailSocket() { socket->SetFailed(); }
+    } fail_socket{socket.get()};
+    socket->set_preferred_index(PROTOCOL_BAIDU_STD);
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._state.store(urma::UrmaEndpoint::ESTABLISHED,
+                          butil::memory_order_release);
+    const std::string bad = "BAD!";
+    urma_sge_t sge{reinterpret_cast<uint64_t>(bad.data()), 4, nullptr, nullptr};
+    endpoint._stream_trace->Record(urma::UrmaStreamTrace::RX_USE, 0, 1, 0, &sge, 1);
+    endpoint._input_processor.read_buf().append(bad);
+    endpoint.DispatchReceivedBytes(socket, bad.size());
+    return socket->Failed() ? 0 : 12;
+}
+
+TEST_F(UrmaMockTest, malformed_response_dumps_exact_bounded_prefix) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMalformedResponseTrace()),
+                ::testing::ExitedWithCode(0),
+                "reason=RPC parse failed buffered=4 parse_prefix=42414421");
 }
 
 static int RunUrmaMockReorderedReceives(bool zerocopy) {

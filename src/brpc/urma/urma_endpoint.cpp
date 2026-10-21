@@ -51,6 +51,7 @@
 #include "brpc/handshake/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma/urma_stream_trace.h"
 #include "brpc/urma_transport.h"
 
 DECLARE_int32(task_group_ntags);
@@ -68,6 +69,10 @@ DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
 DECLARE_int32(urma_bonding_mode);
 DECLARE_bool(urma_poller_yield);
+DEFINE_bool(urma_trace_stream, false,
+            "Capture the last 32 URMA stream events per connection and dump on "
+            "parse/completion/post failure or teardown. Includes payload prefixes; "
+            "enable before creating connections only for controlled diagnostics.");
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -156,6 +161,9 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
     _input_processor.Init(s, InputMessengerProcessor::STREAM_URMA_JETTY);
+    if (FLAGS_urma_trace_stream) {
+        _stream_trace.reset(new UrmaStreamTrace);
+    }
 }
 
 UrmaEndpoint::~UrmaEndpoint() {
@@ -168,6 +176,7 @@ UrmaEndpoint::~UrmaEndpoint() {
 
 void UrmaEndpoint::Reset() {
     DeallocateResources();
+    _stream_trace.reset(FLAGS_urma_trace_stream ? new UrmaStreamTrace : nullptr);
     _state = UNINIT;
     _handshake_version = 0;
     _remote_recv_block_size = 0;
@@ -530,6 +539,7 @@ void UrmaEndpoint::DeallocateResources() {
     if (!_resource) {
         return;
     }
+    DumpStreamTrace("connection teardown");
 
     if (FLAGS_urma_use_polling) {
         PollerRemoveCqSid();
@@ -795,6 +805,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // connection.
         _remote_rq_window_size.fetch_sub(1, butil::memory_order_relaxed);
         _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+        if (_stream_trace) {
+            _stream_trace->Record(UrmaStreamTrace::TX, sq_slot, wr.user_ctx, 0,
+                                  sglist, sge_index);
+        }
         int rc = urma_post_jetty_send_wr(_resource->jetty, &wr, &bad_wr);
         if (rc != URMA_SUCCESS) {
             const int provider_errno = errno;
@@ -816,6 +830,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                          << ", payload_size=" << this_len
                          << " on " << _socket->description();
             errno = rc;
+            DumpStreamTrace("data post failed");
             return -1;
         }
         _sq_current = (_sq_current + 1) % (_sq_size - RESERVED_WR_NUM);
@@ -935,6 +950,9 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     // data windows in CutFromIOBufList: polling may observe its completion as
     // soon as the provider accepts the WR.
     --_sq_imm_window_size;
+    if (_stream_trace) {
+        _stream_trace->Record(UrmaStreamTrace::TX, 0, wr.user_ctx, imm, nullptr, 0);
+    }
     const urma_status_t status =
         urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     if (status != URMA_SUCCESS) {
@@ -954,6 +972,7 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
         errno = status;
+        DumpStreamTrace("credit ACK post failed");
         return -1;
     }
     return 0;
@@ -1035,6 +1054,13 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         return -1;
     }
     const size_t slot = cr.user_ctx - 1;
+    if (_stream_trace && cr.completion_len <= GetUrmaRecvBlockSize()) {
+        urma_sge_t sge{reinterpret_cast<uint64_t>(_rbuf_data[slot]),
+                       cr.completion_len, nullptr, nullptr};
+        _stream_trace->Record(UrmaStreamTrace::RX_CQ, slot, cr.user_ctx,
+                              cr.opcode == URMA_CR_OPC_SEND_WITH_IMM ? cr.imm_data : 0,
+                              &sge, 1);
+    }
     if (_recv_completed[slot]) {
         LOG(WARNING) << "Duplicate URMA receive completion: slot=" << slot;
         errno = EPROTO;
@@ -1109,6 +1135,14 @@ ssize_t UrmaEndpoint::HandleRecvCompletion(const urma_cr_t& cr) {
         zerocopy = false;
     }
     butil::IOPortal& read_buf = _input_processor.read_buf();
+    if (_stream_trace) {
+        urma_sge_t sge{reinterpret_cast<uint64_t>(_rbuf_data[_rq_received]),
+                       cr.completion_len, nullptr, nullptr};
+        _stream_trace->Record(UrmaStreamTrace::RX_USE, _rq_received,
+                              cr.user_ctx,
+                              cr.opcode == URMA_CR_OPC_SEND_WITH_IMM ? cr.imm_data : 0,
+                              &sge, 1);
+    }
     if (zerocopy) {
         _rbuf[_rq_received].cutn(&read_buf, cr.completion_len);
     } else {
@@ -1157,8 +1191,29 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
     const int64_t received_us = butil::cpuwide_time_us();
     const int64_t base_realtime = butil::gettimeofday_us() - received_us;
     InputMessageClosure last_msg;
-    _input_processor.ProcessNewMessage(static_cast<ssize_t>(pending), false,
-                                       received_us, base_realtime, last_msg);
+    const int result = _input_processor.ProcessNewMessage(
+        static_cast<ssize_t>(pending), false, received_us, base_realtime, last_msg);
+    if (result < 0 && _stream_trace) {
+        char prefix[UrmaStreamTrace::PREFIX_SIZE];
+        const size_t copied = _input_processor.read_buf().copy_to(prefix, sizeof(prefix));
+        DumpStreamTrace("RPC parse failed", UrmaStreamTrace::HexPrefix(prefix, copied),
+                        _input_processor.read_buf().size());
+    }
+}
+
+void UrmaEndpoint::DumpStreamTrace(const char* reason, const std::string& prefix,
+                                  size_t buffered) {
+    if (!_stream_trace) {
+        return;
+    }
+    const int saved_errno = errno;
+    const std::string records = _stream_trace->DumpOnce();
+    if (!records.empty()) {
+        LOG(WARNING) << "URMA_TRACE reason=" << reason
+                     << " buffered=" << buffered << " parse_prefix=" << prefix
+                     << " on " << _socket->description() << '\n' << records;
+    }
+    errno = saved_errno;
 }
 
 void UrmaEndpoint::PollCq(Socket* m) {
@@ -1240,6 +1295,7 @@ void UrmaEndpoint::PollCq(Socket* m) {
         }
 
         if (completion_error != 0) {
+            ep->DumpStreamTrace("completion processing failed");
             if (!s->Failed()) {
                 s->SetFailed(completion_error, "URMA completion error");
             }
