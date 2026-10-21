@@ -1265,6 +1265,33 @@ static int RunUrmaMockTracedRpc() {
     return RunUrmaMockConcurrentRpc(false);
 }
 
+static int RunUrmaMockOrderedRpc(bool zerocopy) {
+    if (gflags::SetCommandLineOption(
+            "urma_mock_require_send_order", "true").empty()) {
+        return 20;
+    }
+    // Exercise the real posting paths, including credit-only SEND_IMM WRs,
+    // rather than just checking a separately constructed flag value.
+    // A rejected ACK can exhaust credits. Bound this isolated subprocess so
+    // a regression fails the test instead of hanging the test runner.
+    alarm(10);
+    const int result = RunUrmaMockConcurrentRpc(zerocopy);
+    alarm(0);
+    return result;
+}
+
+TEST_F(UrmaMockTest, copy_rpc_requests_ordered_data_and_credit_sends) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockOrderedRpc(false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, zerocopy_rpc_requests_ordered_data_and_credit_sends) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockOrderedRpc(true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
 TEST_F(UrmaMockTest, traced_rpc_dumps_bounded_history_on_teardown) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT(_exit(RunUrmaMockTracedRpc()),

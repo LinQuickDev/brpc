@@ -144,6 +144,14 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 `urma_sge_t`，无需逐消息注册（与 RDMA `block_pool` 设计一致）。用户注册
 内存通过 `urma::RegisterMemoryForUrma` / `DeregisterMemoryForUrma` 支持。
 
+### 字节流顺序约束
+
+每条连接通过 RM SEND 承载有序 RPC 字节流，一个 RPC 可以跨多个 WR；
+接收缓冲区的 slot 不是发送端的报文序号。业务 SEND 和纯信用 SEND_IMM
+均设置 `place_order=URMA_STRONG_ORDER`、`comp_order=1`，并关闭 JFS 完成乱序。
+不能仅依赖 provider 的默认 `order_type` 或接收 slot 排序来代替这些约束。
+provider 必须支持此顺序契约，不能退回无序模式继续解析 RPC。
+
 ## 配置
 
 所有 flag 使用 `urma_` 前缀（对标 RDMA 的 `rdma_` 前缀）：

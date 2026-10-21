@@ -145,6 +145,16 @@ Like RDMA / UBRing, the control plane is TCP and the data plane is URMA:
 6. On success, the TCP fd is kept only for the epoll lifecycle and fallback;
    payloads flow through URMA.
 
+### Stream ordering
+
+Each connection exposes an ordered RPC byte stream over RM SEND messages. An
+RPC can span multiple WRs; receive-buffer slot numbers are not wire sequence
+numbers. Both payload SENDs and credit-only SEND_IMM WRs request
+`place_order=URMA_STRONG_ORDER` and `comp_order=1`, with JFS out-of-order
+completion disabled. Do not replace these constraints with the provider's
+default `order_type` or receive-slot sorting alone. Providers must support this
+ordering contract; unordered operation is not a safe fallback for this stream.
+
 ### Memory management
 
 A single large region is `mmap`-ed and registered once with

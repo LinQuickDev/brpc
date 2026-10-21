@@ -463,6 +463,8 @@ int UrmaEndpoint::AllocateResources() {
         jetty_cfg.flag.bs.share_jfr = 1;
         jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(_sq_size);
         jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+        // WR placement/completion ordering requires an in-order JFS.
+        jetty_cfg.jfs_cfg.flag.bs.outorder_comp = 0;
         jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
         jetty_cfg.jfs_cfg.max_sge =
             static_cast<uint8_t>(GetUrmaMaxSge());
@@ -768,6 +770,13 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // Piggybacking credits turns every payload into SEND_IMM and can
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
+        // A WR may end in the middle of an RPC (e.g. a 229-byte prefix
+        // followed by a 2-byte payload). RM reliability alone is not a byte
+        // stream ordering contract: zero place_order/comp_order permits the
+        // later WR to be observed first. Keep placement and completions in
+        // posting order, including the intervening credit-only SEND_IMM WRs.
+        wr.flag.bs.place_order = URMA_STRONG_ORDER;
+        wr.flag.bs.comp_order = 1;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
@@ -940,6 +949,10 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     urma_jfs_wr_t wr{};
     std::memset(&wr, 0, sizeof(wr));
     wr.opcode = URMA_OPC_SEND_IMM;
+    // ACKs consume the same receive queue as data. They must participate in
+    // its ordering contract rather than allowing a later payload to overtake.
+    wr.flag.bs.place_order = URMA_STRONG_ORDER;
+    wr.flag.bs.comp_order = 1;
     wr.flag.bs.complete_enable = 1;
     wr.flag.bs.solicited_enable = 1;
     wr.tjetty = _resource->remote_jetty;
@@ -1952,6 +1965,7 @@ int UrmaEndpoint::GlobalInitialize() {
         jetty_cfg.flag.bs.share_jfr = 1;
         jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size);
         jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+        jetty_cfg.jfs_cfg.flag.bs.outorder_comp = 0;
         jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
         jetty_cfg.jfs_cfg.max_sge =
             static_cast<uint8_t>(GetUrmaMaxSge());
