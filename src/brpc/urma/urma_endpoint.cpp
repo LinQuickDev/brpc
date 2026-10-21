@@ -79,6 +79,9 @@ static const int WAIT_TIMEOUT_MS = 50;
 static const size_t HELLO_ACK_LEN = 4;
 static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
+// Match UMDK perftest's CTP SEND ceiling. This is a per-WR payload limit,
+// independent of the pool block size and the device's generic max_msg_size.
+static const size_t MAX_CTP_SEND_SIZE = 4096;
 
 // ---- Globals: prepared jetty pool + poller groups ----
 struct PreparedJetty {
@@ -744,6 +747,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         size_t max_len = _remote_recv_block_size > 0
                              ? _remote_recv_block_size
                              : GetUrmaRecvBlockSize();
+        // UrmaTransport advertises CTP in both hello versions. Limit the sum
+        // of all SGEs, not each SGE, while retaining larger receive buffers.
+        max_len = std::min(max_len, MAX_CTP_SEND_SIZE);
         while (sge_index < static_cast<size_t>(max_sge) &&
                this_len < max_len && current < ndata) {
             auto* data = reinterpret_cast<UrmaIOBuf*>(from[current]);

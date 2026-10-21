@@ -1298,6 +1298,99 @@ TEST_F(UrmaMockTest, traced_rpc_dumps_bounded_history_on_teardown) {
                 ::testing::ExitedWithCode(0), "URMA_TRACE");
 }
 
+static int RunUrmaMockCtpLargeRpc(bool zerocopy, bool polling) {
+    // Isolated by ASSERT_EXIT: bound failures that stop credit progress.
+    alarm(15);
+    urma::g_skip_urma_init = false;
+    if (gflags::SetCommandLineOption("urma_mock_max_send_size", "4096").empty()) {
+        return 20;
+    }
+    gflags::SetCommandLineOption("urma_buffer_size", "8192");
+    gflags::SetCommandLineOption("urma_buffer_count", "2048");
+    gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+    gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+    gflags::SetCommandLineOption("urma_use_polling", polling ? "true" : "false");
+    urma::GlobalUrmaInitializeOrDie();
+    // The fix must split sends, not silently shrink receive/IOBuf blocks.
+    if (!urma::GetUrmaContext() || urma::GetUrmaRecvBlockSize() <= 4096) {
+        return 21;
+    }
+    UrmaStreamEchoService service;
+    Server server;
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    if (server.AddService(&service, SERVER_DOESNT_OWN_SERVICE) != 0 ||
+        server.Start(0, &server_options) != 0) {
+        return 22;
+    }
+    Channel channel;
+    ChannelOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.protocol = "baidu_std";
+    options.connection_type = "single";
+    options.timeout_ms = 3000;
+    options.max_retry = 0;
+    if (channel.Init(server.listen_address(), &options) != 0) {
+        return 23;
+    }
+    test::EchoService::Stub stub(&channel);
+    bool ok = true;
+    for (size_t size : {size_t(0), size_t(4095), size_t(4096), size_t(4097),
+                        size_t(8192), size_t(1048576), size_t(1048577)}) {
+        // A varying pattern catches omissions/reordering hidden by all-'a'
+        // attachments. 1 MiB crosses the 125-WR send-credit window repeatedly.
+        std::string expected(size, '\0');
+        for (size_t i = 0; i < size; ++i) {
+            expected[i] = static_cast<char>((i * 37 + i / 4096) % 251);
+        }
+        Controller cntl;
+        test::EchoRequest request;
+        test::EchoResponse response;
+        request.set_message("ctp-large-" + std::to_string(size));
+        cntl.request_attachment().append(expected);
+        stub.Echo(&cntl, &request, &response, nullptr);
+        if (cntl.Failed() || response.message() != request.message() ||
+            cntl.response_attachment().to_string() != expected) {
+            ok = false;
+            break;
+        }
+    }
+    SocketUniquePtr socket;
+    if (Socket::Address(channel._server_id, &socket) != 0 ||
+        AdapterTransport::Get(socket.get())->handshake_phase() !=
+            handshake::ESTABLISHED) {
+        ok = false;
+    }
+    server.Stop(0);
+    server.Join();
+    alarm(0);
+    return ok ? 0 : 24;
+}
+
+TEST_F(UrmaMockTest, ctp_large_copy_rpc_with_default_buffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(false, false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_zerocopy_rpc_with_default_buffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(true, false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_copy_rpc_with_polling) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(false, true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_zerocopy_rpc_with_polling) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(true, true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
 static int RunUrmaMalformedResponseTrace() {
     GlobalInitializeOrDie();
     gflags::SetCommandLineOption("urma_trace_stream", "true");

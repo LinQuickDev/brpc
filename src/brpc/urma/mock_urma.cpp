@@ -54,6 +54,8 @@
 // message API tests, where unordered WRs are legal.
 DEFINE_bool(urma_mock_require_send_order, false,
             "Reject mock SEND WRs without stream placement/completion ordering");
+DEFINE_uint32(urma_mock_max_send_size, 0,
+              "Reject mock SEND WRs exceeding this total SGE size (0 disables)");
 
 namespace {
 
@@ -556,6 +558,18 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
     read_lock.unlock();
 
     for (urma_jfs_wr_t* current = wr; current; current = current->next) {
+        if (FLAGS_urma_mock_max_send_size != 0) {
+            uint64_t payload_size = 0;
+            for (uint32_t i = 0; i < current->send.src.num_sge; ++i) {
+                payload_size += current->send.src.sge[i].len;
+            }
+            if (payload_size > FLAGS_urma_mock_max_send_size) {
+                if (bad_wr) {
+                    *bad_wr = current;
+                }
+                return URMA_EINVAL;
+            }
+        }
         if (FLAGS_urma_mock_require_send_order &&
             (jetty->jetty_cfg.jfs_cfg.flag.bs.outorder_comp != 0 ||
              current->flag.bs.place_order != URMA_STRONG_ORDER ||

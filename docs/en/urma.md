@@ -155,6 +155,15 @@ completion disabled. Do not replace these constraints with the provider's
 default `order_type` or receive-slot sorting alone. Providers must support this
 ordering contract; unordered operation is not a safe fallback for this stream.
 
+### CTP SEND size
+
+The transport advertises CTP and caps each SEND payload at 4096 bytes, matching
+the UMDK performance tool's CTP limit. This ceiling applies to the sum of all
+SGEs in a WR, including RPC headers and attachments, not to each SGE separately.
+Larger RPCs are split across WRs and resume as send/receive credits return.
+The default 8192-byte pool blocks, advertised receive capacity and handshake
+wire format remain unchanged; shrinking `urma_buffer_size` is not required.
+
 ### Memory management
 
 A single large region is `mmap`-ed and registered once with

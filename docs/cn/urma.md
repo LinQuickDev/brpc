@@ -152,6 +152,14 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 不能仅依赖 provider 的默认 `order_type` 或接收 slot 排序来代替这些约束。
 provider 必须支持此顺序契约，不能退回无序模式继续解析 RPC。
 
+### CTP SEND 大小限制
+
+传输层使用 CTP，每个 SEND 的总载荷限制为 4096 字节，与 UMDK 性能工具
+的 CTP 限制一致。此上限针对一个 WR 内所有 SGE 的长度之和（包含 RPC
+头和附件），不是单个 SGE 的上限。更大的 RPC 会拆成多个 WR，随收发信用
+返还继续发送。默认 8192 字节缓冲块、握手中公布的接收容量及握手格式
+保持不变，无需缩小 `urma_buffer_size`。
+
 ## 配置
 
 所有 flag 使用 `urma_` 前缀（对标 RDMA 的 `rdma_` 前缀）：
