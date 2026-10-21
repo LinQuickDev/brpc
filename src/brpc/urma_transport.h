@@ -65,6 +65,7 @@ public:
     int NegotiateUpgradeResources(const urma::ParsedHello& remote,
                                   bool server_side);
     void ActivateUpgrade();
+    int StartUpgradeEvents();
     void DeactivateUpgrade();
     void SetHighSpeedAvailable(bool available);
 

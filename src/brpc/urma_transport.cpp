@@ -215,10 +215,10 @@ void UrmaTransport::ActivateUpgrade() {
     _urma_state.store(URMA_ON, butil::memory_order_release);
     _urma_ep->_state.store(urma::UrmaEndpoint::ESTABLISHED,
                            butil::memory_order_release);
-    SocketUniquePtr socket;
-    if (Socket::Address(_socket->id(), &socket) == 0) {
-        _urma_ep->DispatchReceivedBytes(socket, 0);
-    }
+}
+
+int UrmaTransport::StartUpgradeEvents() {
+    return _urma_ep ? _urma_ep->StartCqEvents() : -1;
 }
 
 void UrmaTransport::DeactivateUpgrade() {

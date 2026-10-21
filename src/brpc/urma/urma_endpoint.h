@@ -210,6 +210,8 @@ private:
     // Allocate / deallocate the per-connection URMA resources (JFCE/JFC/JFR/
     // Jetty, plus the CQ socket). Returns 0 on success.
     int AllocateResources();
+    // Register CQ callbacks only after the TCP handshake parser has returned.
+    int StartCqEvents();
     void DeallocateResources();
 
     // Import the peer's jetty and buffer-pool segment. CRITICAL:
@@ -239,12 +241,11 @@ private:
     // received
     // (0 for send completions), or -1 on error (errno set).
     ssize_t HandleCompletion(const urma_cr_t& cr);
+    ssize_t HandleRecvCompletion(const urma_cr_t& cr);
 
-    // Queue received bytes for InputMessenger. CQ receive completions can
-    // arrive while the server is still waiting for the final TCP handshake
-    // ACK. Keep those bytes in the URMA input processor and dispatch them only
-    // after ESTABLISHED, matching the connection-ready boundary seen by user
-    // code.
+    // Queue received bytes for InputMessenger after ESTABLISHED. Hardware can
+    // complete receives during the handshake, but StartCqEvents defers their
+    // processing until the TCP parser has returned.
     void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes);
 
     // Consume one async event from the JFCE fd (event mode only). The caller
@@ -297,6 +298,11 @@ private:
     // Per-WR recv buffers (zero-copy targets).
     std::vector<butil::IOBuf> _rbuf;
     std::vector<void*> _rbuf_data;
+    // A provider may report completions in a different order from posted
+    // receive WRs. Keep each completion with its owning slot and consume the
+    // stream only once all preceding receive WRs have completed.
+    std::vector<urma_cr_t> _recv_completions;
+    std::vector<bool> _recv_completed;
     // Peer's advertised recv buffer size (caps each WR's payload).
     uint32_t _remote_recv_block_size{0};
 

@@ -452,6 +452,13 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             transport, protocol.get(), socket, &connect_error);
         const handshake::StepResult result = adapter->_handshake.RunClient(
             protocol.get(), &participant);
+        if (result == handshake::STEP_OK &&
+            transport->StartUpgradeEvents() < 0) {
+            connect_error = errno != 0 ? errno : EIO;
+            transport->DeactivateUpgrade();
+            adapter->_handshake.MarkFailed();
+            socket->SetFailed(connect_error, "Fail to start URMA CQ events");
+        }
         if (result == handshake::STEP_ERROR && connect_error == 0) {
             connect_error = errno != 0 ? errno : EPROTO;
         }
@@ -714,6 +721,20 @@ void AdapterTransport::OnNewMessagesAfterUpgrade(Socket* socket) {
                 saved_errno,
                 "Fail to start RDMA CQ events from %s: %s",
                 socket->description().c_str(), berror(saved_errno));
+        }
+    }
+#endif
+#if BRPC_WITH_URMA
+    if (adapter->_mode == SOCKET_MODE_URMA &&
+        adapter->_handshake.phase() == handshake::ESTABLISHED) {
+        UrmaTransport* transport = static_cast<UrmaTransport*>(
+            adapter->_high_speed_transport.get());
+        if (transport->StartUpgradeEvents() < 0) {
+            const int saved_errno = errno != 0 ? errno : EIO;
+            transport->DeactivateUpgrade();
+            adapter->_handshake.MarkFailed();
+            adapter->CompleteConnection(handshake::FAILED);
+            socket->SetFailed(saved_errno, "Fail to start URMA CQ events");
         }
     }
 #endif

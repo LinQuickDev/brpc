@@ -185,6 +185,8 @@ void UrmaEndpoint::Reset() {
     _sbuf.clear();
     _rbuf.clear();
     _rbuf_data.clear();
+    _recv_completions.clear();
+    _recv_completed.clear();
     _read_butex->store(0, butil::memory_order_relaxed);
 }
 
@@ -470,15 +472,34 @@ int UrmaEndpoint::AllocateResources() {
     _sbuf.resize(_sq_size - RESERVED_WR_NUM);
     _rbuf.resize(_rq_size);
     _rbuf_data.resize(_rq_size, nullptr);
+    _recv_completions.resize(_rq_size);
+    _recv_completed.assign(_rq_size, false);
 
+    // Arm before advertising receives. Completions may queue during the TCP
+    // handshake, but must not be dispatched until its parser has returned.
+    if (!FLAGS_urma_use_polling && ReqNotifyCq() != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int UrmaEndpoint::StartCqEvents() {
+    if (_socket->parsing_stream_type() != InputMessengerProcessor::STREAM_NONE) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (_cq_sid != INVALID_SOCKET_ID) {
+        return 0;
+    }
+    if (!_resource || !_resource->jfc) {
+        errno = ENODEV;
+        return -1;
+    }
     // Wrap the JFCE fd in a brpc Socket so PollCq is driven by epoll.
     if (!FLAGS_urma_use_polling) {
         if (!_resource->jfce || _resource->jfce->fd < 0) {
             LOG(ERROR) << "Prepared URMA resource has no usable JFCE";
             errno = ENODEV;
-            return -1;
-        }
-        if (ReqNotifyCq() != 0) {
             return -1;
         }
         SocketOptions options;
@@ -821,7 +842,7 @@ int UrmaEndpoint::DoPostRecv(void* block, size_t block_size) {
     urma_sge_t sge{reinterpret_cast<uint64_t>(block),
                    static_cast<uint32_t>(block_size), tseg, nullptr};
     urma_sg_t sg{&sge, 1};
-    urma_jfr_wr_t wr{sg, 0, nullptr};
+    urma_jfr_wr_t wr{sg, static_cast<uint64_t>(_rq_received) + 1, nullptr};
     urma_jfr_wr_t* bad = nullptr;
     // Use the shared-JFR path on every device, including bonding. The bonding
     // provider owns physical receive scheduling for the JFR; a local
@@ -949,7 +970,6 @@ int UrmaEndpoint::SendAck(int num) {
 }
 
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
-    bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
         LOG(WARNING) << "URMA completion failed, status=" << cr.status
                      << " kind=" << (cr.flag.bs.s_r == 0 ? "send" : "recv")
@@ -1006,7 +1026,43 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         }
         return 0;
     }
-    // Recv completion.
+    // Identify the posted buffer rather than assuming CQ order equals RQ
+    // order. Otherwise an ACK completion can advance the ring past a data WR
+    // whose completion is still pending, corrupting the RPC byte stream.
+    if (cr.user_ctx == 0 || cr.user_ctx > _rq_size) {
+        LOG(WARNING) << "Invalid URMA receive slot: " << cr.user_ctx;
+        errno = EPROTO;
+        return -1;
+    }
+    const size_t slot = cr.user_ctx - 1;
+    if (_recv_completed[slot]) {
+        LOG(WARNING) << "Duplicate URMA receive completion: slot=" << slot;
+        errno = EPROTO;
+        return -1;
+    }
+    _recv_completions[slot] = cr;
+    _recv_completed[slot] = true;
+    if (slot != _rq_received) {
+        VLOG(1) << "URMA deferred receive completion: slot=" << slot
+                << " expected_slot=" << _rq_received
+                << " completion_len=" << cr.completion_len
+                << " on " << _socket->description();
+    }
+    ssize_t bytes = 0;
+    while (_recv_completed[_rq_received]) {
+        const urma_cr_t next = _recv_completions[_rq_received];
+        _recv_completed[_rq_received] = false;
+        const ssize_t received = HandleRecvCompletion(next);
+        if (received < 0) {
+            return -1;
+        }
+        bytes += received;
+    }
+    return bytes;
+}
+
+ssize_t UrmaEndpoint::HandleRecvCompletion(const urma_cr_t& cr) {
+    bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
         if (cr.imm_data > _local_window_capacity) {
             LOG(WARNING) << "Invalid URMA receive credit: " << cr.imm_data;
@@ -1411,7 +1467,10 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     }
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
-    ep->DispatchReceivedBytes(s, 0);
+    if (ep->StartCqEvents() < 0) {
+        ep->FailHandshake(tp, errno, "start client CQ events");
+        return nullptr;
+    }
     return nullptr;
 }
 
@@ -1496,7 +1555,10 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
-        ep->DispatchReceivedBytes(s, 0);
+        if (ep->StartCqEvents() < 0) {
+            ep->FailHandshake(tp, errno, "start server CQ events");
+            return nullptr;
+        }
     } else {
         ep->FallbackToTcp(tp, true);
     }
