@@ -209,7 +209,7 @@ const handshake::FrameSpec& UrmaV3FrameSpec() {
 
 const handshake::FrameSpec& UrmaAckFrameSpec() {
     static const handshake::FrameSpec spec(
-        NULL, 0, sizeof(uint32_t), sizeof(uint32_t),
+        nullptr, 0, sizeof(uint32_t), sizeof(uint32_t),
         handshake::FrameSpec::FIXED);
     return spec;
 }
@@ -258,7 +258,7 @@ handshake::StepResult UrmaHandshakeAdapter::BuildHello(
     if (_version == 3) {
         UrmaHello message;
         if (enabled) {
-            CHECK(_ep != NULL);
+            CHECK(_ep != nullptr);
             _ep->FillLocalHelloV3(&message);
         } else {
             message.set_buffer_size(0);
@@ -278,7 +278,7 @@ handshake::StepResult UrmaHandshakeAdapter::BuildHello(
     }
     v2_wire::HelloMessage message{};
     if (enabled) {
-        CHECK(_ep != NULL);
+        CHECK(_ep != nullptr);
         _ep->FillLocalHelloV2(&message);
     } else {
         message.msg_len = v2_wire::HELLO_PACKET_LEN;
@@ -523,7 +523,7 @@ class UrmaServerHandshakeTransport : public HandshakeTransport {
 public:
     UrmaServerHandshakeTransport(UrmaTransport* transport,
                                  butil::IOBuf* source)
-        : _transport(transport), _source(source), _protocol(NULL) {}
+        : _transport(transport), _source(source), _protocol(nullptr) {}
 
     void OnProtocolSelected(HandshakeProtocol* protocol) override {
         _protocol = static_cast<urma::UrmaHandshakeAdapter*>(protocol);
@@ -536,7 +536,7 @@ public:
         return STEP_FALLBACK;
     }
     StepResult NegotiateResources() override {
-        CHECK(_protocol != NULL);
+        CHECK(_protocol != nullptr);
         if (_transport->NegotiateUpgradeResources(
                 _protocol->remote(), true) == 0) {
             return STEP_OK;

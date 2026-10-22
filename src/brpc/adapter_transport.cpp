@@ -350,7 +350,7 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
         if (!matches_ub && !matches_rdma && !matches_urma) {
             result = ParseResult(PARSE_ERROR_TRY_OTHERS);
         } else {
-            handshake::HandshakeAdapter* adapter = NULL;
+            handshake::HandshakeAdapter* adapter = nullptr;
             if (matches_ub) {
                 adapter = handshake::GetUBShmServerHandshakeAdapter();
             } else if (matches_rdma) {
@@ -359,7 +359,7 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
             else {
                 adapter = handshake::GetUrmaServerHandshakeAdapter();
             }
-            CHECK(adapter != NULL);
+            CHECK(adapter != nullptr);
             result = adapter->ExecuteServerHandshake(source, _socket);
         }
     }
@@ -441,7 +441,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
             adapter->FallbackToTcp();
             adapter->CompleteConnection(handshake::FALLBACK_TCP);
             task->done(0, task->data);
-            return NULL;
+            return nullptr;
         }
         std::unique_ptr<urma::UrmaHandshakeAdapter> protocol =
             urma::CreateClientHandshakeAdapter(transport->GetUrmaEp());
@@ -462,7 +462,7 @@ void* AdapterTransport::ProcessClientHandshake(void* arg) {
         adapter->CompleteConnection(static_cast<handshake::Phase>(
             adapter->_handshake.phase(butil::memory_order_acquire)));
         task->done(connect_error, task->data);
-        return NULL;
+        return nullptr;
     }
 #endif
 

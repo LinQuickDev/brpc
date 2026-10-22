@@ -41,7 +41,7 @@ public:
         return _version == 3 ? v3 : v2;
     }
     const FrameSpec& AckFrameSpec() const override {
-        static const FrameSpec spec(NULL, 0, 4, 4, FrameSpec::FIXED);
+        static const FrameSpec spec(nullptr, 0, 4, 4, FrameSpec::FIXED);
         return spec;
     }
     StepResult ParseHello(const std::string& payload) override {

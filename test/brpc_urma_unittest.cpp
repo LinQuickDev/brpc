@@ -791,57 +791,32 @@ TEST(UrmaHandshakeTest, tcp_read_loop_stops_after_urma_upgrade) {
 }
 
 // ---------------------------------------------------------------------------
-// CreateServerHandshakeByMagic dispatches on the magic bytes.
+// Common server adapters support both URMA wire versions.
 // ---------------------------------------------------------------------------
-TEST(UrmaHandshakeTest, server_handshake_factory_dispatches_on_magic) {
-    // We cannot fully exercise the server handshake without a real socket +
-    // endpoint, but we can verify the factory returns the right protocol
-    // version for each magic, and nullptr for an unknown magic.
-    uint8_t magic_v2[4] = {'U', 'R', 'M', 'A'};
-    uint8_t magic_v3[4] = {'U', 'R', 'M', '3'};
-    uint8_t magic_bad[4] = {'P', 'R', 'P', 'C'};
-
-    // v2 magic -> protocol version 2
-    urma::UrmaHandshake* hs2 =
-        urma::CreateServerHandshakeByMagic(nullptr, magic_v2);
-    // Note: the factory dereferences the endpoint only inside SendLocalHello /
-    // ReceiveAndParseRemoteHello; passing nullptr is safe for the version query.
-    // (We delete immediately to avoid touching the endpoint.)
-    if (hs2) {
-        EXPECT_EQ(2, hs2->ProtocolVersion());
-        delete hs2;
+TEST(UrmaHandshakeTest, common_server_factory_supports_both_wire_versions) {
+    auto adapters = urma::CreateServerHandshakeAdapters(nullptr);
+    ASSERT_EQ(2u, adapters.size());
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        ASSERT_NE(nullptr, adapters[i]);
+        EXPECT_EQ(static_cast<int>(i) + 2, adapters[i]->ProtocolVersion());
+        const auto& spec = adapters[i]->HelloFrameSpec();
+        ASSERT_EQ(4u, spec.magic_len);
+        EXPECT_EQ(i == 0 ? "URMA" : "URM3",
+                  std::string(spec.magic, spec.magic_len));
     }
-    // v3 magic -> protocol version 3
-    urma::UrmaHandshake* hs3 =
-        urma::CreateServerHandshakeByMagic(nullptr, magic_v3);
-    if (hs3) {
-        EXPECT_EQ(3, hs3->ProtocolVersion());
-        delete hs3;
-    }
-    // unknown magic -> nullptr (caller falls back to TCP)
-    urma::UrmaHandshake* hsb =
-        urma::CreateServerHandshakeByMagic(nullptr, magic_bad);
-    EXPECT_EQ(nullptr, hsb);
 }
 
 // ---------------------------------------------------------------------------
-// CreateClientHandshake picks the version from the gflag.
+// The common client factory picks the version from the gflag.
 // ---------------------------------------------------------------------------
-TEST(UrmaHandshakeTest, client_handshake_factory_respects_flag) {
+TEST(UrmaHandshakeTest, common_client_factory_respects_flag) {
     GFLAGS_NAMESPACE::FlagSaver flag_saver;
 
-    urma::FLAGS_urma_client_handshake_version = 2;
-    urma::UrmaHandshake* hs2 = urma::CreateClientHandshake(nullptr);
-    if (hs2) {
-        EXPECT_EQ(2, hs2->ProtocolVersion());
-        delete hs2;
-    }
-
-    urma::FLAGS_urma_client_handshake_version = 3;
-    urma::UrmaHandshake* hs3 = urma::CreateClientHandshake(nullptr);
-    if (hs3) {
-        EXPECT_EQ(3, hs3->ProtocolVersion());
-        delete hs3;
+    for (int version : {2, 3, 0, 99}) {
+        urma::FLAGS_urma_client_handshake_version = version;
+        auto adapter = urma::CreateClientHandshakeAdapter(nullptr);
+        ASSERT_NE(nullptr, adapter);
+        EXPECT_EQ(version == 3 ? 3 : 2, adapter->ProtocolVersion());
     }
 }
 
