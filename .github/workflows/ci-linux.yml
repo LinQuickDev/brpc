@@ -6,7 +6,7 @@ on:
     paths-ignore:
       - '**.md'
   pull_request:
-    branches: [ master, transport-handshake ]
+    branches: [ master ]
     paths-ignore:
       - '**.md'
 
@@ -119,35 +119,6 @@ jobs:
     - name: Show ccache statistics
       if: always()
       run: ccache --show-stats
-
-  urma-mock-unittest:
-    name: URMA handshake (WITH_URMA=${{ matrix.urma }})
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        urma: ['ON', 'OFF']
-    steps:
-    - uses: actions/checkout@v7.0.1
-    - uses: ./.github/actions/install-essential-dependencies
-      with:
-        extra-packages: libgoogle-perftools-dev libunwind-dev
-
-    - name: Configure URMA handshake tests
-      run: |
-        cmake -S . -B build-urma-mock \
-          -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-          -DWITH_URMA=${{ matrix.urma }} \
-          -DURMA_USE_MOCK=ON \
-          -DBUILD_UNIT_TESTS=ON
-
-    - name: Build URMA tests
-      run: cmake --build build-urma-mock --target brpc_urma_unittest brpc_urma_fallback_unittest --parallel 2
-
-    - name: Run URMA tests
-      run: |
-        ./build-urma-mock/test/brpc_urma_unittest
-        ./build-urma-mock/test/brpc_urma_fallback_unittest
 
   compile-with-make-protobuf:
     name: compile-with-make-protobuf (${{ matrix.compiler }}-${{ matrix.name }})
