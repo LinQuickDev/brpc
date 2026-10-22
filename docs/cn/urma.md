@@ -8,7 +8,7 @@ UrmaTransport 基于 [URMA](https://atomgit.com/openeuler/umdk) SDK，在 Linux 
 
 ### CMake
 
-实机使用需安装 UMDK 头文件、provider 和 `liburma`：
+安装 UMDK 头文件、provider 和 `liburma` 后编译：
 
 ```bash
 cmake -S . -B build -DWITH_URMA=ON -DURMA_USE_MOCK=OFF \
@@ -22,9 +22,8 @@ cmake -S example/urma_performance -B build/urma-perf \
 cmake --build build/urma-perf --parallel 4
 ```
 
-`URMA_USE_MOCK` 可选 `AUTO`（默认）、`ON`、`OFF`。`AUTO` 在缺少 `liburma`
-时使用 mock，`OFF` 要求真实库。缺少头文件时会下载固定 commit 的 UMDK；
-设置 `DOWNLOAD_URMA_HEADERS=OFF` 可关闭下载。
+`URMA_USE_MOCK`：`AUTO`（默认）自动选择，`ON` 使用 mock，`OFF` 链接 `liburma`。
+缺少头文件时下载固定版本 UMDK；离线构建设置 `DOWNLOAD_URMA_HEADERS=OFF`。
 
 ### Make
 
@@ -33,8 +32,7 @@ sh config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-urma
 make -j4
 ```
 
-增加 `--with-urma-mock` 强制使用 mock，或 `--without-urma-mock` 要求
-`liburma`；未指定时自动选择。
+`--with-urma-mock` 使用 mock，`--without-urma-mock` 链接 `liburma`；默认自动选择。
 
 ### Bazel
 
@@ -45,9 +43,8 @@ bazel test --define=BRPC_WITH_URMA=true \
     --define=BRPC_URMA_USE_MOCK=true //test:brpc_unittests
 ```
 
-Bazel 默认使用 mock 和固定版本的 UMDK 头文件。实机构建需确保链接器能找到
-`-lurma`。离线使用时，设置 `BRPC_DOWNLOAD_URMA_HEADERS=false`，并通过
-工具链或本地 BUILD 目标声明头文件。
+Bazel 默认使用 mock 和固定版本的 UMDK 头文件；实机构建链接 `-lurma`。
+离线构建设置 `BRPC_DOWNLOAD_URMA_HEADERS=false`，由工具链或本地 BUILD 目标提供头文件。
 
 ## 使用
 
@@ -66,10 +63,9 @@ server.Start(port, &server_options);
 ```
 
 `AdapterTransport` 通过[公共握手](handshake_common_design.md)选择 TCP 或 URMA。
-资源不可用或协商拒绝时回退 TCP，握手帧畸形时关闭连接。
-普通 TCP 服务端（包括未编译 URMA 的版本）可回复禁用 Hello。禁用 Hello
-沿用旧 URMA 约定，不发送或等待 ACK；若客户端在接受 Hello 后导入失败，
-则发送禁用 ACK 通知服务端回退。已建立 URMA 后的错误会关闭连接，不切换数据通道。
+资源不可用或协商拒绝时回退 TCP；握手帧畸形或 URMA 建连后出错时关闭连接。
+TCP 服务端（含未编译 URMA 的版本）回复禁用 Hello，双方跳过 ACK；
+客户端接受 Hello 后导入失败则发送禁用 ACK，通知服务端回退。
 
 ## 实现
 
@@ -79,13 +75,14 @@ server.Start(port, &server_options);
    TCP 保留为控制连接。
 3. 通过 SEND 发送数据，通过 JFCE 事件（默认）或 JFC 轮询处理完成记录。
    本地 SQ 和对端 RQ 信用控制发送进度。
+4. CQ 回调先持有主 Socket 引用，再访问 endpoint。互斥锁同步回调与资源释放，
+   代际标记隔离 reset 前的旧回调。
 
 业务 SEND 和信用 SEND_IMM 均设置 `place_order=URMA_STRONG_ORDER`、
 `comp_order=1`，关闭 JFS 完成乱序。每个 SEND 内所有 SGE 的总载荷不超过
-4096 字节，包含 RPC 头和附件。大 RPC 拆成多个 WR，默认 8192 字节缓冲块
-和握手中公布的接收容量保持不变。
+4096 字节，包含 RPC 头和附件；大 RPC 拆成多个 WR。默认缓冲块为 8192 字节。
 
-缓冲池一次性注册并用于 IOBuf 分配，发送时直接构造 SGE，无需逐消息注册。
+缓冲池一次注册并用于 IOBuf 分配，发送时直接构造 SGE。
 用户内存通过 `RegisterMemoryForUrma` 注册、`DeregisterMemoryForUrma` 注销。
 
 ## 配置
@@ -111,45 +108,22 @@ server.Start(port, &server_options);
 | `--urma_client_handshake_version` | 2 | 2=二进制，3=protobuf |
 | `--urma_trace_stream` | false | 每连接保存最近 32 条流记录 |
 
-设备名以 `bonding` 开头时，在创建 context 后、segment 和队列前配置 provider。
-bonding 需要 `urma_ubagg.h`，默认使用 standalone+IODIE。
+`bonding*` 设备在创建 context 后、segment 和队列前配置 provider，
+使用 `urma_ubagg.h`，默认 standalone+IODIE。
 
-## 诊断
+## 测试与诊断
 
-### 握手互通回归
-
-URMA mock 测试通过 loopback TCP 连接保留的旧握手状态机与公共握手，
-覆盖两个方向、v2/v3 和 event/polling，并执行真实 baidu_std RPC、校验响应及附件。
-ACK 交接测试用屏障固定首包早于 ACK 最后一个字节、首包到达时 ACK 解析器尚未
-退出两种时序，覆盖 copy/zero-copy；每个场景验证 17 次 RPC 恰好执行一次。
+测试使用 loopback TCP、mock provider 和当前数据面，覆盖新旧握手双向互通、
+最终 ACK 与首包交接、CQ 并发关闭及 reset，组合 v2/v3、event/polling、
+copy/zero-copy，并校验 RPC 响应和附件。
 
 ```bash
 cmake -S . -B build-urma-mock -DWITH_URMA=ON -DURMA_USE_MOCK=ON -DBUILD_UNIT_TESTS=ON
 cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
 ./build-urma-mock/test/brpc_urma_unittest \
-  --gtest_filter='UrmaMockTest.*legacy*:UrmaMockTest.first_urma_packet*' \
   --gtest_repeat=100 --gtest_shuffle
 ```
 
-这些测试运行实际的新旧握手代码，共用当前 URMA 数据面和 mock provider，
-不等同于两台实机上的独立新旧二进制互通；后者仍需使用匹配 SDK 的双机环境验证。
-
-### CQ 生命周期回归
-
-`UrmaMockTest.cq_*` 覆盖 CQ 分发中关闭、回调释放最后一个主 Socket 引用，
-以及 reset 后执行旧 carrier 回调，分别运行 event/polling 和 copy/zero-copy。
-carrier 持有独立上下文，回调先固定主 Socket 引用，再用互斥锁和代际标记
-隔离关闭及重置。这是独立的数据面生命周期修复，不改变握手线协议。
-
-```bash
-./build-urma-mock/test/brpc_urma_unittest \
-  --gtest_filter='UrmaMockTest.cq_*' --gtest_repeat=100 --gtest_shuffle
-```
-
-### 流记录
-
-建连前在两端开启 `--urma_trace_stream=true`。失败或关闭连接时输出一次记录：
-`TX` 为提交尝试，`RX_CQ` 为完成到达，`RX_USE` 为交给输入流的数据，
-包含长度、偏移、槽位、摘要和载荷前 16 字节。
-
-Trace 会扫描载荷并输出部分 RPC 内容；性能测试和敏感业务流量应关闭此开关。
+`--urma_trace_stream=true` 在建连前开启，失败或关闭连接时输出最近 32 条记录：
+`TX`（提交尝试）、`RX_CQ`（完成到达）、`RX_USE`（输入流交付），
+包含长度、偏移、槽位、摘要和载荷前 16 字节。默认关闭，性能测试和敏感流量保持关闭。

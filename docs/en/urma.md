@@ -8,7 +8,7 @@ SDK using reliable-message (`URMA_TM_RM`) Jettys and CTP paths. It supports
 
 ### CMake
 
-For hardware use, install the UMDK headers, provider and `liburma`:
+Install the UMDK headers, provider and `liburma`, then build:
 
 ```bash
 cmake -S . -B build -DWITH_URMA=ON -DURMA_USE_MOCK=OFF \
@@ -22,9 +22,9 @@ cmake -S example/urma_performance -B build/urma-perf \
 cmake --build build/urma-perf --parallel 4
 ```
 
-`URMA_USE_MOCK` accepts `AUTO` (default), `ON` and `OFF`. `AUTO` selects the
-mock when `liburma` is absent; `OFF` requires the real library. Missing headers
-are downloaded at a pinned UMDK commit unless `DOWNLOAD_URMA_HEADERS=OFF`.
+`URMA_USE_MOCK`: `AUTO` (default) selects automatically, `ON` uses the mock,
+and `OFF` links `liburma`. Missing headers are downloaded at a pinned UMDK
+commit; set `DOWNLOAD_URMA_HEADERS=OFF` for offline builds.
 
 ### Make
 
@@ -33,8 +33,8 @@ sh config_brpc.sh --headers=/usr/include --libs=/usr/lib --with-urma
 make -j4
 ```
 
-Add `--with-urma-mock` to force the mock, or `--without-urma-mock` to require
-`liburma`. Without either option, selection is automatic.
+`--with-urma-mock` uses the mock; `--without-urma-mock` links `liburma`.
+The default is automatic selection.
 
 ### Bazel
 
@@ -45,10 +45,9 @@ bazel test --define=BRPC_WITH_URMA=true \
     --define=BRPC_URMA_USE_MOCK=true //test:brpc_unittests
 ```
 
-Bazel defaults to the mock and pinned UMDK headers. Hardware builds require
-`-lurma` on the linker search path. For offline headers, set
-`BRPC_DOWNLOAD_URMA_HEADERS=false` and declare them through the toolchain or
-a local BUILD target.
+Bazel defaults to the mock and pinned UMDK headers; hardware builds link `-lurma`.
+For offline builds, set `BRPC_DOWNLOAD_URMA_HEADERS=false` and provide headers
+through the toolchain or a local BUILD target.
 
 ## Usage
 
@@ -68,12 +67,11 @@ server.Start(port, &server_options);
 
 `AdapterTransport` selects TCP or URMA through the
 [common handshake](../cn/handshake_common_design.md). Unavailable resources or
-declined negotiation fall back to TCP; malformed handshake frames fail the
-connection.
-Plain TCP servers, including builds without URMA, can reply with a disabled
-Hello. Following the legacy URMA convention, a disabled Hello needs no ACK.
-A client import failure after accepting the Hello still sends a disabled ACK.
-Errors after URMA is established fail the connection rather than switch data paths.
+declined negotiation fall back to TCP. Malformed handshake frames or errors
+after URMA establishment close the connection. TCP servers, including builds
+without URMA, reply with a disabled Hello and skip the ACK exchange.
+A client import failure after accepting the Hello sends a disabled ACK to
+notify the server to fall back.
 
 ## Implementation
 
@@ -84,15 +82,18 @@ Errors after URMA is established fail the connection rather than switch data pat
    completion handling. TCP remains the control connection.
 3. Submit SENDs and consume JFC completions through JFCE events (default) or
    polling. Local SQ and peer RQ credits control send progress.
+4. CQ callbacks hold a main-Socket reference before accessing the endpoint.
+   A mutex synchronizes callbacks with teardown; a generation check isolates
+   callbacks from before reset.
 
 Payload SENDs and credit-only SEND_IMM WRs use
 `place_order=URMA_STRONG_ORDER` and `comp_order=1`, with JFS out-of-order
 completion disabled. Each SEND carries at most 4096 bytes across all SGEs,
-including RPC headers and attachments. Larger RPCs span multiple WRs; the
-default 8192-byte pool blocks and advertised receive capacity stay unchanged.
+including RPC headers and attachments. Larger RPCs span multiple WRs.
+Pool blocks default to 8192 bytes.
 
-The buffer pool is registered once and backs IOBuf allocations, so sends use
-SGEs without per-message registration. User memory can be registered with
+The buffer pool is registered once and backs IOBuf allocations and send SGEs.
+User memory is registered with
 `RegisterMemoryForUrma` and deregistered with `DeregisterMemoryForUrma`.
 
 ## Configuration
@@ -118,52 +119,25 @@ SGEs without per-message registration. User memory can be registered with
 | `--urma_client_handshake_version` | 2 | 2=binary, 3=protobuf |
 | `--urma_trace_stream` | false | Retain the last 32 stream events per connection |
 
-Devices named `bonding*` are configured after context creation, before segments
-and queues. Bonding requires `urma_ubagg.h`; standalone+IODIE is the default.
+`bonding*` devices configure the provider after context creation, before segments
+and queues, using `urma_ubagg.h`. The default is standalone+IODIE.
 
-## Diagnostics
+## Tests and diagnostics
 
-### Handshake interoperability regression
-
-The URMA mock tests connect the retained legacy state machines to the common
-handshake over loopback TCP, in both directions, with v2/v3 and event/polling.
-They execute baidu_std RPCs and verify response messages and attachments.
-Barrier-controlled tests queue the first URMA packet before the final ACK byte,
-or while the completed ACK's TCP parser is still active, with copy/zero-copy.
-Each scenario verifies exactly one execution of each of its 17 RPCs.
+Tests use loopback TCP, the mock provider and the current data path. They cover
+bidirectional legacy/common handshakes, final-ACK/first-packet handoff, concurrent
+CQ close and reset, across v2/v3, event/polling and copy/zero-copy, with RPC
+response and attachment checks.
 
 ```bash
 cmake -S . -B build-urma-mock -DWITH_URMA=ON -DURMA_USE_MOCK=ON -DBUILD_UNIT_TESTS=ON
 cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
 ./build-urma-mock/test/brpc_urma_unittest \
-  --gtest_filter='UrmaMockTest.*legacy*:UrmaMockTest.first_urma_packet*' \
   --gtest_repeat=100 --gtest_shuffle
 ```
 
-These tests run the actual legacy and common handshake code but share the
-current data path and mock provider. Independent old/new binaries on two real
-devices still require validation with a matching SDK and hardware environment.
-
-### CQ lifetime regression
-
-`UrmaMockTest.cq_*` covers close during CQ dispatch, release of the callback's
-last main-Socket reference, and a stale carrier callback after reset. Each runs
-with event/polling and copy/zero-copy. Callbacks use a carrier-owned context to
-pin the main Socket before endpoint access; a mutex and generation fence
-teardown/reset.
-This is a separate data-path lifecycle fix, not a handshake wire-format change.
-
-```bash
-./build-urma-mock/test/brpc_urma_unittest \
-  --gtest_filter='UrmaMockTest.cq_*' --gtest_repeat=100 --gtest_shuffle
-```
-
-### Stream trace
-
-Enable `--urma_trace_stream=true` on both peers before creating connections.
-The one-time dump on failure or teardown records `TX` (post attempts), `RX_CQ`
-(completion arrival) and `RX_USE` (delivery to the input stream), with lengths,
-offsets, slots, hashes and 16-byte payload prefixes.
-
-Trace scanning adds overhead and exposes partial RPC contents. Keep it disabled
-for performance measurements and sensitive traffic.
+Enable `--urma_trace_stream=true` on both peers before connecting to dump the
+last 32 records on failure or teardown: `TX` (post attempts), `RX_CQ` (completion
+arrival) and `RX_USE` (input delivery), with lengths, offsets, slots, hashes and
+16-byte payload prefixes. It defaults to off; keep it off for performance tests
+and sensitive traffic.
