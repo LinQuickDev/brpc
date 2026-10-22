@@ -1218,7 +1218,11 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
         InputMessenger::OnNewMessages(m);
         return;
     }
-    int progress = 0;
+    // Only the FALLBACK_TCP and ESTABLISHED branches consume the events
+    // themselves. Every other branch must reach MoreReadEvents() so _nevent
+    // drops back to 0; otherwise Socket::OnInputEvent never starts another
+    // read handler and a FIN from the peer is never read.
+    int progress = Socket::PROGRESS_INIT;
     while (true) {
         const State state =
             ep->_state.load(butil::memory_order_acquire);
@@ -1244,15 +1248,14 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
                 } else {
                     s.release();
                 }
-                return;
+            } else {
+                // The connection may be closed or reset before the client
+                // starts the handshake. ProcessHandshakeAtClient handles it.
             }
-            // Client side: handled by ProcessHandshakeAtClient.
-            return;
         } else if (state < ESTABLISHED) {
             // During handshake: wake the handshake bthread parked in ReadFromFd.
             ep->_read_butex->fetch_add(1, butil::memory_order_release);
             bthread::butex_wake(ep->_read_butex);
-            return;
         } else if (state == FALLBACK_TCP) {
             InputMessenger::OnNewMessages(m);
             return;
@@ -1266,9 +1269,20 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
     }
 }
 
+// Called by the handshake bthread once _state is FALLBACK_TCP or ESTABLISHED.
+// Events that arrived during the handshake were released by OnNewDataFromTcp
+// without reading the fd, so TCP data or a FIN may already be waiting with
+// no further edge to come. Take the read side the way Socket::OnInputEvent
+// does, so that at most one reader runs. If OnNewDataFromTcp still owns it,
+// the increment makes it loop once more and see the final state.
 inline void UrmaEndpoint::TryReadOnTcp() {
-    if (_state.load(butil::memory_order_acquire) == FALLBACK_TCP) {
-        InputMessenger::OnNewMessages(_socket);
+    if (_socket->_nevent.fetch_add(1, butil::memory_order_acq_rel) == 0) {
+        const State state = _state.load(butil::memory_order_acquire);
+        if (state == FALLBACK_TCP) {
+            InputMessenger::OnNewMessages(_socket);
+        } else if (state == ESTABLISHED) {
+            TryReadOnTcpDuringUrmaEst(_socket);
+        }
     }
 }
 
@@ -1386,6 +1400,8 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
     ep->DispatchReceivedBytes(s, 0);
+    // Read what arrived after the last handshake read, e.g. a FIN.
+    ep->TryReadOnTcp();
     return nullptr;
 }
 
@@ -1471,6 +1487,8 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
         ep->DispatchReceivedBytes(s, 0);
+        // Read what arrived after the last handshake read, e.g. a FIN.
+        ep->TryReadOnTcp();
     } else {
         ep->FallbackToTcp(tp, true);
     }
