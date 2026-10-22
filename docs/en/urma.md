@@ -143,7 +143,20 @@ cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
 These tests run the actual legacy and common handshake code but share the
 current data path and mock provider. Independent old/new binaries on two real
 devices still require validation with a matching SDK and hardware environment.
-The handoff tests do not cover CQ callback versus resource teardown lifetime races.
+
+### CQ lifetime regression
+
+`UrmaMockTest.cq_*` covers close during CQ dispatch, release of the callback's
+last main-Socket reference, and a stale carrier callback after reset. Each runs
+with event/polling and copy/zero-copy. Callbacks use a carrier-owned context to
+pin the main Socket before endpoint access; a mutex and generation fence
+teardown/reset.
+This is a separate data-path lifecycle fix, not a handshake wire-format change.
+
+```bash
+./build-urma-mock/test/brpc_urma_unittest \
+  --gtest_filter='UrmaMockTest.cq_*' --gtest_repeat=100 --gtest_shuffle
+```
 
 ### Stream trace
 

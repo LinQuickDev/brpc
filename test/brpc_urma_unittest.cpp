@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <errno.h>
+#include <fcntl.h>
 #include <future>
 #include <limits>
 #include <memory>
@@ -1378,6 +1379,241 @@ public:
 
 enum class UrmaInteropPeer { COMMON, LEGACY_CLIENT, LEGACY_SERVER };
 enum class UrmaFirstPacket { AFTER_ACK, BEFORE_LAST_ACK_BYTE, IN_ACK_PARSER };
+
+static ParseResult PauseUrmaCq(butil::IOBuf* source, Socket* socket, bool,
+                                const void* arg) {
+    auto* gate = static_cast<UrmaFinalAckGate*>(const_cast<void*>(arg));
+    gate->Pause(socket);
+    source->clear();
+    return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+}
+
+// A real endpoint/carrier and mock SEND-to-self give the CQ callback a receive
+// to dispatch. The parser barrier keeps that callback in flight during close.
+class UrmaCqCloseTest {
+public:
+    int Init(bool polling, bool zerocopy, UrmaFinalAckGate* gate,
+             bool start_poller = true) {
+        urma::g_skip_urma_init = false;
+        gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+        gflags::SetCommandLineOption("urma_buffer_count", "2048");
+        gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+        gflags::SetCommandLineOption("urma_zerocopy_min_size", "0");
+        gflags::SetCommandLineOption("urma_use_polling", polling ? "true" : "false");
+        urma::GlobalUrmaInitializeOrDie();
+        if (!urma::GetUrmaContext() ||
+            (polling && start_poller &&
+             !urma::InitPollingModeWithTag(bthread_self_tag()))) {
+            return 10;
+        }
+        InputMessageHandler handler{};
+        handler.parse = PauseUrmaCq;
+        handler.process = [](InputMessageBase* msg) { msg->Destroy(); };
+        handler.arg = gate;
+        handler.name = "urma_cq_close";
+        if (messenger.AddNonProtocolHandler(handler) != 0) {
+            return 11;
+        }
+        SocketOptions options;
+        options.socket_mode = SOCKET_MODE_URMA;
+        options.user = &messenger;
+        if (Socket::Create(options, &id) != 0 ||
+            Socket::Address(id, &socket) != 0) {
+            return 12;
+        }
+        endpoint = static_cast<UrmaTransport*>(
+            AdapterTransport::Get(socket.get())->high_speed_transport())->GetUrmaEp();
+        return Prepare(zerocopy);
+    }
+
+    int Prepare(bool zerocopy) {
+        if (endpoint->AllocateResources() != 0 ||
+            endpoint->PostRecv(endpoint->_rq_size, zerocopy) != 0) {
+            return 13;
+        }
+        urma::ParsedHello hello;
+        endpoint->MakeLocalParsedHello(&hello);
+        endpoint->ApplyRemoteHello(hello);
+        if (endpoint->ImportPeer(hello) != 0) {
+            return 14;
+        }
+        endpoint->_state = urma::UrmaEndpoint::ESTABLISHED;
+        if (endpoint->StartCqEvents() != 0 ||
+            Socket::Address(endpoint->_cq_sid, &carrier) != 0) {
+            return 15;
+        }
+        return 0;
+    }
+
+    bool Send() {
+        butil::IOBuf data;
+        data.append("cq-lifetime");
+        butil::IOBuf* list[] = {&data};
+        return endpoint->CutFromIOBufList(list, 1) == 11;
+    }
+
+    ~UrmaCqCloseTest() {
+        if (socket) {
+            socket->SetFailed();
+            socket.reset();
+        }
+    }
+
+    InputMessenger messenger;
+    SocketId id{INVALID_SOCKET_ID};
+    SocketUniquePtr socket;
+    SocketUniquePtr carrier;
+    urma::UrmaEndpoint* endpoint{nullptr};
+};
+
+static int RunUrmaCqConcurrentClose(bool polling, bool zerocopy,
+                                     bool release_last_reference) {
+    alarm(10);
+    UrmaFinalAckGate gate;
+    UrmaCqCloseTest test;
+    const int init = test.Init(polling, zerocopy, &gate);
+    if (init != 0) {
+        return init;
+    }
+    auto lifetime = test.endpoint->_cq_lifetime;
+    if (!test.Send()) {
+        return 16;
+    }
+    if (!gate.Wait()) {
+        return 17;
+    }
+    std::future<void> close;
+    std::promise<void> started;
+    if (release_last_reference) {
+        test.socket->SetFailed();
+        test.socket.reset();
+        // PollCq's reference must still keep the endpoint/resources alive.
+        if (lifetime->mutex.try_lock()) {
+            lifetime->mutex.unlock();
+            return 18;
+        }
+    } else {
+        auto ready = started.get_future();
+        close = std::async(std::launch::async, [&] {
+            started.set_value();
+            test.endpoint->DeallocateResources();
+        });
+        ready.wait();
+        if (close.wait_for(std::chrono::milliseconds(20)) !=
+            std::future_status::timeout) {
+            return 19;
+        }
+    }
+    gate.Release();
+    if (close.valid()) {
+        close.get();
+    }
+    // The event dispatcher / poller owns the callback. Wait for its final main
+    // reference to trigger endpoint teardown.
+    if (release_last_reference) {
+        for (;;) {
+            {
+                std::unique_lock<bthread::Mutex> lock(lifetime->mutex);
+                if (lifetime->closed) {
+                    break;
+                }
+            }
+            std::this_thread::yield();
+        }
+    }
+    {
+        std::unique_lock<bthread::Mutex> lock(lifetime->mutex);
+        if (!lifetime->closed || gate.timed_out.load()) {
+            return 20;
+        }
+    }
+    // Keep a queued carrier callback alive beyond close / endpoint deletion.
+    // It must not touch the old endpoint, even if the main Socket is gone.
+    urma::UrmaEndpoint::PollCq(test.carrier.get());
+    if (!release_last_reference &&
+        (test.endpoint->_resource != nullptr ||
+         test.endpoint->_cq_sid != INVALID_SOCKET_ID)) {
+        return 21;
+    }
+    std::weak_ptr<urma::UrmaEndpoint::CqLifetime> weak = lifetime;
+    lifetime.reset();
+    test.carrier.reset();
+    if (release_last_reference) {
+        while (!weak.expired()) {
+            std::this_thread::yield();
+        }
+    }
+    return 0;
+}
+
+static int RunUrmaCqCallbackAfterReset(bool polling, bool zerocopy) {
+    alarm(10);
+    UrmaFinalAckGate gate;
+    UrmaCqCloseTest test;
+    // Keep pollers stopped so the new CQ remains untouched by dispatchers.
+    const int init = test.Init(polling, zerocopy, &gate, false);
+    if (init != 0) {
+        return init;
+    }
+    SocketUniquePtr old_carrier = std::move(test.carrier);
+    const int old_fd = test.endpoint->_resource->jfce->fd;
+    test.endpoint->Reset();
+    if (test.Prepare(zerocopy) != 0) {
+        return 23;
+    }
+    // No dispatcher may drain the new generation before this assertion.
+    if (!polling) {
+        test.carrier->_io_event.RemoveConsumer(test.carrier->fd());
+    }
+    if (!test.Send()) {
+        return 24;
+    }
+    urma::UrmaEndpoint::PollCq(old_carrier.get());
+    urma_cr_t completions[2];
+    if (urma_poll_jfc(test.endpoint->_resource->jfc, 2, completions) != 2) {
+        return 25;
+    }
+    // Old carrier destruction must not close a JFCE fd reused by the reset.
+    old_carrier.reset();
+    if (old_fd == test.endpoint->_resource->jfce->fd &&
+        fcntl(old_fd, F_GETFD) < 0) {
+        return 26;
+    }
+    return 0;
+}
+
+TEST_F(UrmaMockTest, cq_close_waits_for_running_callback) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (bool polling : {false, true}) {
+        for (bool zerocopy : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << polling << ":" << zerocopy);
+            ASSERT_EXIT(_exit(RunUrmaCqConcurrentClose(polling, zerocopy, false)),
+                        ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, cq_callback_releases_last_socket_reference_before_teardown) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (bool polling : {false, true}) {
+        for (bool zerocopy : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << polling << ":" << zerocopy);
+            ASSERT_EXIT(_exit(RunUrmaCqConcurrentClose(polling, zerocopy, true)),
+                        ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, cq_callback_rejects_reset_generation) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (bool polling : {false, true}) {
+        for (bool zerocopy : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << polling << ":" << zerocopy);
+            ASSERT_EXIT(_exit(RunUrmaCqCallbackAfterReset(polling, zerocopy)),
+                        ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
 
 static int RunUrmaHandshakeInterop(int version, bool polling, bool zerocopy,
                                    UrmaInteropPeer peer, UrmaFirstPacket order) {

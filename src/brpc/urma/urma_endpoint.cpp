@@ -156,7 +156,8 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
     : _socket(s),
       _state(UNINIT),
       _handshake_version(0),
-      _resource(nullptr) {
+      _resource(nullptr),
+      _cq_lifetime(std::make_shared<CqLifetime>(s->id())) {
     _sq_size = static_cast<uint16_t>(
         std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
     _rq_size = static_cast<uint16_t>(
@@ -498,6 +499,7 @@ int UrmaEndpoint::AllocateResources() {
 }
 
 int UrmaEndpoint::StartCqEvents() {
+    std::unique_lock<bthread::Mutex> lock(_cq_lifetime->mutex);
     if (_socket->parsing_stream_type() != InputMessengerProcessor::STREAM_NONE) {
         errno = EPROTO;
         return -1;
@@ -509,55 +511,61 @@ int UrmaEndpoint::StartCqEvents() {
         errno = ENODEV;
         return -1;
     }
-    // Wrap the JFCE fd in a brpc Socket so PollCq is driven by epoll.
-    if (!FLAGS_urma_use_polling) {
+    const bool polling = FLAGS_urma_use_polling;
+    if (!polling) {
         if (!_resource->jfce || _resource->jfce->fd < 0) {
             LOG(ERROR) << "Prepared URMA resource has no usable JFCE";
             errno = ENODEV;
             return -1;
         }
-        SocketOptions options;
-        options.user = this;
-        options.keytable_pool = _socket->keytable_pool();
-        options.fd = _resource->jfce->fd;
-        options.on_edge_triggered_events = PollCq;
-        if (Socket::Create(options, &_cq_sid) < 0) {
-            PLOG(ERROR) << "Fail to create CQ socket";
-            return -1;
-        }
-    } else {
-        // Polling mode: synthetic carrier socket (no fd).
-        SocketOptions options;
-        options.user = this;
-        options.keytable_pool = _socket->keytable_pool();
-        options.on_edge_triggered_events = PollCq;
-        if (Socket::Create(options, &_cq_sid) < 0) {
-            PLOG(ERROR) << "Fail to create CQ socket (polling)";
-            return -1;
-        }
+    }
+    // Install the owned user only after Create succeeds, and before publishing
+    // the fd/id to a dispatcher. Create failures then cannot leak/double-delete
+    // the user or close the provider-owned JFCE fd.
+    SocketOptions options;
+    options.keytable_pool = _socket->keytable_pool();
+    options.on_edge_triggered_events = PollCq;
+    if (Socket::Create(options, &_cq_sid) < 0) {
+        PLOG(ERROR) << "Fail to create CQ socket";
+        return -1;
+    }
+    SocketUniquePtr carrier;
+    CHECK_EQ(0, Socket::Address(_cq_sid, &carrier));
+    carrier->_user = new CqSocketUser(_cq_lifetime, this, polling);
+    if (!polling && carrier->ResetFileDescriptor(_resource->jfce->fd) != 0) {
+        const int saved_errno = errno;
+        carrier->SetFailed();
+        _cq_sid = INVALID_SOCKET_ID;
+        errno = saved_errno;
+        return -1;
+    }
+    _cq_lifetime->closed = false;
+    if (polling) {
         PollerAddCqSid();
     }
     return 0;
 }
 
 void UrmaEndpoint::DeallocateResources() {
+    std::unique_lock<bthread::Mutex> lock(_cq_lifetime->mutex);
+    _cq_lifetime->closed = true;
+    ++_cq_lifetime->generation;
     if (!_resource) {
         return;
     }
     DumpStreamTrace("connection teardown");
 
-    if (FLAGS_urma_use_polling) {
-        PollerRemoveCqSid();
-    }
-
-    // Tear down the CQ socket so the EventDispatcher stops calling PollCq.
+    // epoll DEL and poller REMOVE do not drain callbacks. The lifetime mutex
+    // waits for an active callback; the closed generation rejects queued ones.
     if (_cq_sid != INVALID_SOCKET_ID) {
         SocketUniquePtr s;
-        if (Socket::Address(_cq_sid, &s) == 0) {
+        if (Socket::AddressFailedAsWell(_cq_sid, &s) >= 0) {
+            if (static_cast<CqSocketUser*>(s->user())->polling) {
+                PollerRemoveCqSid();
+            }
             if (s->fd() >= 0) {
                 s->_io_event.RemoveConsumer(s->_fd);
             }
-            s->_user = nullptr;  // Do not release user (this UrmaEndpoint).
             s->_fd = -1;  // Already removed fd from epoll.
             s->SetFailed();
         }
@@ -1236,19 +1244,27 @@ void UrmaEndpoint::DumpStreamTrace(const char* reason, const std::string& prefix
 }
 
 void UrmaEndpoint::PollCq(Socket* m) {
-    auto* ep = static_cast<UrmaEndpoint*>(m->user());
-    if (!ep || !ep->_resource || !ep->_resource->jfc) {
+    // The caller pins the carrier, not the endpoint. Its user/context remains
+    // alive even when the main Socket has already been recycled.
+    auto* user = static_cast<CqSocketUser*>(m->user());
+    if (!user) {
         return;
     }
+    const auto lifetime = user->lifetime;
     SocketUniquePtr s;
-    if (Socket::Address(ep->_socket->id(), &s) != 0) {
+    if (Socket::Address(lifetime->socket_id, &s) != 0) {
         return;
     }
-    if (s->Failed()) {
+    // Declare the lock after s: unlock before releasing the last main Socket
+    // reference, which can synchronously call DeallocateResources again.
+    std::unique_lock<bthread::Mutex> lock(lifetime->mutex);
+    if (lifetime->closed || user->generation != lifetime->generation ||
+        s->Failed()) {
         return;
     }
+    auto* ep = user->endpoint;
 
-    const bool event_mode = !FLAGS_urma_use_polling;
+    const bool event_mode = !user->polling;
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         urma_jfc_t* event_jfc = nullptr;

@@ -29,6 +29,7 @@
 #include "butil/iobuf.h"
 #include "butil/macros.h"
 #include "butil/synchronization/lock.h"
+#include "bthread/mutex.h"
 #include "bthread/types.h"
 
 #include "brpc/socket.h"
@@ -146,7 +147,7 @@ public:
     static void OnNewDataFromTcp(Socket* m);
 
     // CQ completion poller: the edge-triggered callback for the CQ socket
-    // (whose user is this endpoint). Drains urma_poll_jfc and feeds the
+    // (whose user owns a CQ lifetime context). Drains urma_poll_jfc and feeds the
     // completions into HandleCompletion, then calls InputMessenger. Event mode
     // also drains the aggregated JFCE until urma_wait_jfc reports no event,
     // then calls Socket::MoreReadEvents so later JFCE edges can start the
@@ -287,8 +288,28 @@ private:
     UrmaResource* _resource{nullptr};
     std::unique_ptr<UrmaStreamTrace> _stream_trace;
 
-    // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
-    // (polling mode). PollCq is the edge-triggered callback on this socket.
+    struct CqLifetime {
+        explicit CqLifetime(SocketId id) : socket_id(id) {}
+        const SocketId socket_id;
+        bthread::Mutex mutex;  // Serializes CQ dispatch, start and teardown.
+        uint64_t generation{0};
+        bool closed{true};
+    };
+    struct CqSocketUser : SocketUser {
+        CqSocketUser(const std::shared_ptr<CqLifetime>& lifetime,
+                     UrmaEndpoint* ep, bool use_polling)
+            : lifetime(lifetime), endpoint(ep),
+              generation(lifetime->generation), polling(use_polling) {}
+        void BeforeRecycle(Socket*) override { delete this; }
+        const std::shared_ptr<CqLifetime> lifetime;
+        UrmaEndpoint* const endpoint;  // Use only with main Socket pinned + mutex.
+        const uint64_t generation;
+        const bool polling;
+    };
+    // Shared with old carriers so queued callbacks can reject a closed/reset
+    // generation without dereferencing an endpoint that may already be gone.
+    const std::shared_ptr<CqLifetime> _cq_lifetime;
+    // Wraps the JFCE fd (event mode) or a synthetic carrier (polling mode).
     SocketId _cq_sid{INVALID_SOCKET_ID};
 
     // ---- Send / recv window bookkeeping ----

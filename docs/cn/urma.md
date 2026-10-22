@@ -133,7 +133,18 @@ cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
 
 这些测试运行实际的新旧握手代码，共用当前 URMA 数据面和 mock provider，
 不等同于两台实机上的独立新旧二进制互通；后者仍需使用匹配 SDK 的双机环境验证。
-握手交接测试也不覆盖 CQ 回调与资源释放之间的生命周期竞态。
+
+### CQ 生命周期回归
+
+`UrmaMockTest.cq_*` 覆盖 CQ 分发中关闭、回调释放最后一个主 Socket 引用，
+以及 reset 后执行旧 carrier 回调，分别运行 event/polling 和 copy/zero-copy。
+carrier 持有独立上下文，回调先固定主 Socket 引用，再用互斥锁和代际标记
+隔离关闭及重置。这是独立的数据面生命周期修复，不改变握手线协议。
+
+```bash
+./build-urma-mock/test/brpc_urma_unittest \
+  --gtest_filter='UrmaMockTest.cq_*' --gtest_repeat=100 --gtest_shuffle
+```
 
 ### 流记录
 
