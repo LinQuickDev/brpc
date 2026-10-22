@@ -542,6 +542,7 @@ brpc_proto_library(
 )
 
 URMA_SRC_PATTERNS = [
+    "src/brpc/handshake/urma_handshake.cpp",
     "src/brpc/urma/*.cpp",
     "src/brpc/urma/**/*.cpp",
 ]

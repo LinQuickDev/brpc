@@ -59,7 +59,7 @@ std::unique_ptr<Transport> TransportFactory::CreateTransport(SocketMode mode) {
 #endif
 #if BRPC_WITH_URMA
     if (mode == SOCKET_MODE_URMA) {
-        return std::unique_ptr<UrmaTransport>(new UrmaTransport());
+        return std::unique_ptr<Transport>(new AdapterTransport(mode));
     }
 #endif
 #if BRPC_WITH_UBRING
