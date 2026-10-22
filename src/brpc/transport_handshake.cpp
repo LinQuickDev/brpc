@@ -253,6 +253,9 @@ StepResult HandshakeSession::RunClient(HandshakeProtocol* protocol,
         return FinishWithFailure(this, transport);
     }
     bool enabled = result == STEP_OK;
+    if (!enabled && !protocol->AckDisabledHello()) {
+        return FinishWithFallback(this, transport);
+    }
 
     if (enabled && protocol->HasExtension()) {
         SetPhase(EXTENSION_SEND);
@@ -330,8 +333,8 @@ StepResult HandshakeSession::RunServer(
         transport->OnProtocolSelected(selected);
         if (result == STEP_FALLBACK) {
             // Publish the disabled transport state immediately. The server
-            // still sends a disabled hello and consumes the peer ACK before
-            // publishing the terminal FALLBACK_TCP phase.
+            // still sends a disabled hello and, if the protocol requires it,
+            // consumes the peer ACK before publishing FALLBACK_TCP.
             transport->OnFallback();
         }
         bool enabled = result == STEP_OK;
@@ -358,6 +361,9 @@ StepResult HandshakeSession::RunServer(
         _local_enabled = enabled;
         if (SendHello(selected, enabled) != STEP_OK) {
             return FinishWithFailure(this, transport);
+        }
+        if (!enabled && !selected->AckDisabledHello()) {
+            return FinishWithFallback(this, transport);
         }
         SetPhase(enabled && selected->HasExtension()
                      ? EXTENSION_WAIT

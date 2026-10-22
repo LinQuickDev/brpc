@@ -30,6 +30,7 @@ namespace brpc {
 namespace handshake {
 
 HandshakeAdapter* GetUrmaServerHandshakeAdapter();
+StepResult RunUrmaFallbackServerHandshake(butil::IOBuf* source, Socket* socket);
 
 }  // namespace handshake
 }  // namespace brpc
@@ -132,6 +133,7 @@ public:
         : _ep(ep), _version(version), _remote() {}
 
     int ProtocolVersion() const override { return _version; }
+    bool AckDisabledHello() const override { return false; }
     const handshake::FrameSpec& HelloFrameSpec() const override;
     const handshake::FrameSpec& AckFrameSpec() const override;
     handshake::StepResult BuildHello(bool enabled,

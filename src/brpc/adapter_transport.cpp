@@ -345,12 +345,8 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
             MatchesMagicPrefix(prefix, prefix_len, "RDMA", 4) ||
             MatchesMagicPrefix(prefix, prefix_len, "RDM3", 4);
         const bool matches_urma =
-#if BRPC_WITH_URMA
             MatchesMagicPrefix(prefix, prefix_len, "URMA", 4) ||
             MatchesMagicPrefix(prefix, prefix_len, "URM3", 4);
-#else
-            false;
-#endif
         if (!matches_ub && !matches_rdma && !matches_urma) {
             result = ParseResult(PARSE_ERROR_TRY_OTHERS);
         } else {
@@ -360,11 +356,9 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
             } else if (matches_rdma) {
                 adapter = handshake::GetRdmaServerHandshakeAdapter();
             }
-#if BRPC_WITH_URMA
             else {
                 adapter = handshake::GetUrmaServerHandshakeAdapter();
             }
-#endif
             CHECK(adapter != NULL);
             result = adapter->ExecuteServerHandshake(source, _socket);
         }

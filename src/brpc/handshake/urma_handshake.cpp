@@ -562,7 +562,7 @@ protected:
     StepResult RunServerStep(butil::IOBuf* source, Socket* socket) override {
         AdapterTransport* adapter = AdapterTransport::Get(socket);
         if (!adapter->upgrade_capable(SOCKET_MODE_URMA)) {
-            return STEP_NOT_MINE;
+            return RunUrmaFallbackServerHandshake(source, socket);
         }
         UrmaTransport* transport = static_cast<UrmaTransport*>(
             adapter->high_speed_transport());

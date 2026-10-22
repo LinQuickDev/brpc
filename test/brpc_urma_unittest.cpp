@@ -325,8 +325,6 @@ TEST(UrmaHandshakeTest, common_server_fallback_preserves_coalesced_rpc) {
 
     butil::IOBuf source;
     source.append(frame);
-    const uint32_t disabled_ack = 0;
-    source.append(&disabled_ack, sizeof(disabled_ack));
     source.append("RPC", 3);
     handshake::IOBufHandshakeInput input(&source);
     CapturingUrmaHandshakeIO io;
@@ -420,6 +418,112 @@ private:
         ++cleanup_count;
     }
 };
+
+class ScriptedUrmaHandshakeIO : public CapturingUrmaHandshakeIO {
+public:
+    int ReadExact(void* data, size_t len) override {
+        if (input.size() < len) {
+            return -1;
+        }
+        memcpy(data, input.data(), len);
+        input.erase(0, len);
+        return 0;
+    }
+    std::string input;
+};
+
+class RejectingUrmaImport : public TrackedUrmaTestResources {
+public:
+    handshake::StepResult NegotiateResources() override {
+        return handshake::STEP_FALLBACK;
+    }
+};
+
+class RejectingUrmaPreparation : public TrackedUrmaTestResources {
+public:
+    handshake::StepResult PrepareResources() override {
+        allocated = true;
+        return handshake::STEP_FALLBACK;
+    }
+};
+
+TEST(UrmaHandshakeTest, server_resource_failure_preserves_legacy_rpc_without_ack) {
+    for (int version : {2, 3}) {
+        for (bool reject_prepare : {false, true}) {
+            BufferedUrmaTestProtocol protocol(version);
+            std::string hello;
+            ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+                protocol.HelloFrameSpec(), protocol.local_payload, &hello));
+            butil::IOBuf source;
+            source.append(hello);
+            source.append("PRPC", 4);
+            handshake::IOBufHandshakeInput input(&source);
+            handshake::HandshakeSession session;
+            CapturingUrmaHandshakeIO io;
+            session.SetIOForTest(&io);
+            RejectingUrmaPreparation prepare;
+            RejectingUrmaImport negotiate;
+            TrackedUrmaTestResources* resources = reject_prepare
+                ? static_cast<TrackedUrmaTestResources*>(&prepare) : &negotiate;
+            std::vector<handshake::HandshakeProtocol*> protocols(1, &protocol);
+            EXPECT_EQ(handshake::STEP_FALLBACK,
+                      session.RunServer(protocols, &input, resources, false));
+            EXPECT_EQ(handshake::FALLBACK_TCP,
+                      session.phase(butil::memory_order_acquire));
+            EXPECT_EQ("PRPC", source.to_string());
+            EXPECT_FALSE(resources->allocated);
+            EXPECT_EQ(1, resources->cleanup_count);
+            std::string disabled;
+            ASSERT_EQ(handshake::STEP_OK, protocol.BuildHello(false, &disabled));
+            std::string expected;
+            ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+                protocol.HelloFrameSpec(), disabled, &expected));
+            EXPECT_EQ(expected, io.output);
+        }
+    }
+}
+
+TEST(UrmaHandshakeTest, disabled_server_hello_does_not_send_ack) {
+    for (int version : {2, 3}) {
+        BufferedUrmaTestProtocol protocol(version);
+        std::string disabled;
+        ASSERT_EQ(handshake::STEP_OK, protocol.BuildHello(false, &disabled));
+        ScriptedUrmaHandshakeIO io;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            protocol.HelloFrameSpec(), disabled, &io.input));
+        std::string expected;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            protocol.HelloFrameSpec(), protocol.local_payload, &expected));
+        handshake::HandshakeSession session;
+        session.SetIOForTest(&io);
+        TrackedUrmaTestResources resources;
+        EXPECT_EQ(handshake::STEP_FALLBACK,
+                  session.RunClient(&protocol, &resources));
+        EXPECT_EQ(expected, io.output);  // No ACK before ordinary RPC bytes.
+        EXPECT_FALSE(resources.allocated);
+        EXPECT_EQ(1, resources.cleanup_count);
+        EXPECT_EQ(handshake::FALLBACK_TCP,
+                  session.phase(butil::memory_order_acquire));
+    }
+}
+
+TEST(UrmaHandshakeTest, client_import_failure_still_sends_disabled_ack) {
+    for (int version : {2, 3}) {
+        BufferedUrmaTestProtocol protocol(version);
+        ScriptedUrmaHandshakeIO io;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            protocol.HelloFrameSpec(), protocol.local_payload, &io.input));
+        const std::string expected = io.input + std::string(4, '\0');
+        handshake::HandshakeSession session;
+        session.SetIOForTest(&io);
+        RejectingUrmaImport resources;
+        EXPECT_EQ(handshake::STEP_FALLBACK,
+                  session.RunClient(&protocol, &resources));
+        EXPECT_EQ(expected, io.output);
+        EXPECT_FALSE(resources.allocated);
+        EXPECT_EQ(1, resources.cleanup_count);
+    }
+}
 
 class BufferedUrmaTestAdapter : public handshake::StandardHandshakeAdapter {
 public:
@@ -1174,7 +1278,7 @@ public:
     }
 };
 
-static int RunUrmaMockConcurrentRpc(bool zerocopy) {
+static int RunUrmaMockConcurrentRpc(bool zerocopy, bool tcp_server = false) {
     urma::g_skip_urma_init = false;
     gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
     gflags::SetCommandLineOption("urma_buffer_count", "2048");
@@ -1186,7 +1290,7 @@ static int RunUrmaMockConcurrentRpc(bool zerocopy) {
     UrmaStreamEchoService service;
     Server server;
     ServerOptions server_options;
-    server_options.socket_mode = SOCKET_MODE_URMA;
+    server_options.socket_mode = tcp_server ? SOCKET_MODE_TCP : SOCKET_MODE_URMA;
     if (server.AddService(&service, SERVER_DOESNT_OWN_SERVICE) != 0 ||
         server.Start(0, &server_options) != 0) {
         return 11;
@@ -1238,7 +1342,7 @@ static int RunUrmaMockConcurrentRpc(bool zerocopy) {
     SocketUniquePtr main_socket;
     if (Socket::Address(channel._server_id, &main_socket) != 0 ||
         AdapterTransport::Get(main_socket.get())->handshake_phase() !=
-            handshake::ESTABLISHED) {
+            (tcp_server ? handshake::FALLBACK_TCP : handshake::ESTABLISHED)) {
         ++errors;
     }
     server.Stop(0);
@@ -1258,6 +1362,24 @@ TEST_F(UrmaMockTest, concurrent_copy_rpc_preserves_stream_boundaries) {
     ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     ASSERT_EXIT(_exit(RunUrmaMockConcurrentRpc(false)),
                 ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, v2_client_falls_back_to_plain_tcp_server) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({
+        alarm(15);
+        urma::FLAGS_urma_client_handshake_version = 2;
+        _exit(RunUrmaMockConcurrentRpc(false, true));
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, v3_client_falls_back_to_plain_tcp_server) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT({
+        alarm(15);
+        urma::FLAGS_urma_client_handshake_version = 3;
+        _exit(RunUrmaMockConcurrentRpc(false, true));
+    }, ::testing::ExitedWithCode(0), "");
 }
 
 static int RunUrmaMockTracedRpc() {

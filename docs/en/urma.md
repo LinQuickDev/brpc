@@ -70,6 +70,10 @@ server.Start(port, &server_options);
 [common handshake](../cn/handshake_common_design.md). Unavailable resources or
 declined negotiation fall back to TCP; malformed handshake frames fail the
 connection.
+Plain TCP servers, including builds without URMA, can reply with a disabled
+Hello. Following the legacy URMA convention, a disabled Hello needs no ACK.
+A client import failure after accepting the Hello still sends a disabled ACK.
+Errors after URMA is established fail the connection rather than switch data paths.
 
 ## Implementation
 

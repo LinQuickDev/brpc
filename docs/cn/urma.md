@@ -67,6 +67,9 @@ server.Start(port, &server_options);
 
 `AdapterTransport` 通过[公共握手](handshake_common_design.md)选择 TCP 或 URMA。
 资源不可用或协商拒绝时回退 TCP，握手帧畸形时关闭连接。
+普通 TCP 服务端（包括未编译 URMA 的版本）可回复禁用 Hello。禁用 Hello
+沿用旧 URMA 约定，不发送或等待 ACK；若客户端在接受 Hello 后导入失败，
+则发送禁用 ACK 通知服务端回退。已建立 URMA 后的错误会关闭连接，不切换数据通道。
 
 ## 实现
 

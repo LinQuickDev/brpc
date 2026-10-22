@@ -91,6 +91,10 @@ public:
     virtual StepResult BuildAck(bool enabled, std::string* payload);
     virtual StepResult ParseAck(const std::string& payload, bool* enabled);
 
+    // Legacy URMA peers switch directly to TCP after a disabled Hello.
+    // Other protocols complete their rejection with an ACK.
+    virtual bool AckDisabledHello() const { return true; }
+
     virtual bool HasExtension() const { return false; }
     virtual const FrameSpec& ExtensionFrameSpec() const;
     virtual StepResult BuildExtension(bool, std::string*) {
