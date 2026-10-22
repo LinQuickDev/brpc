@@ -17,13 +17,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <errno.h>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <unistd.h>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
@@ -44,6 +49,8 @@
 #include "echo.pb.h"
 #include "brpc/closure_guard.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/acceptor.h"
+#include "brpc/policy/transport_handshake_protocol.h"
 #include "brpc/urma/urma_stream_trace.h"
 #include "brpc/global.h"
 
@@ -1250,8 +1257,397 @@ public:
         response->set_message(request->message());
         auto* cntl = static_cast<Controller*>(controller);
         cntl->response_attachment().append(cntl->request_attachment());
+        calls.fetch_add(1, std::memory_order_release);
     }
+    std::atomic<int> calls{0};
 };
+
+// Use the retained legacy state machines/codecs, not a second common adapter
+// or a synthesized Hello. Only transport installation is reconstructed here:
+// production TransportFactory now always creates AdapterTransport.
+static void InstallLegacyUrmaTransport(Socket* socket, SocketUser* user) {
+    socket->_transport->Release();
+    SocketOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.user = user;
+    options.need_on_edge_trigger = true;
+    auto transport = std::unique_ptr<UrmaTransport>(new UrmaTransport);
+    transport->Init(socket, options);
+    transport->_on_edge_trigger = urma::UrmaEndpoint::OnNewDataFromTcp;
+    transport->_default_connect = std::make_shared<urma::UrmaConnect>();
+    socket->_app_connect = transport->_default_connect;
+    socket->_transport = std::move(transport);
+}
+
+static int CreateUrmaInteropTcpPair(int fds[2]) {
+    butil::fd_guard listener(socket(AF_INET, SOCK_STREAM, 0));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t size = sizeof(address);
+    if (listener < 0 || bind(listener, reinterpret_cast<sockaddr*>(&address), size) != 0 ||
+        listen(listener, 1) != 0 ||
+        getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+        return -1;
+    }
+    butil::fd_guard client(socket(AF_INET, SOCK_STREAM, 0));
+    if (client < 0 || connect(client, reinterpret_cast<sockaddr*>(&address), size) != 0) {
+        return -1;
+    }
+    butil::fd_guard accepted(accept(listener, nullptr, nullptr));
+    if (accepted < 0) {
+        return -1;
+    }
+    fds[0] = client.release();
+    fds[1] = accepted.release();
+    return 0;
+}
+
+class UrmaFinalAckGate {
+public:
+    void Pause(Socket* socket) {
+        std::unique_lock<std::mutex> lock(mutex);
+        tcp_parser_active = socket->parsing_stream_type() ==
+                            InputMessengerProcessor::STREAM_TCP_FD;
+        entered = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(3), [&] { return released; })) {
+            timed_out = true;
+        }
+    }
+    bool Wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(3), [&] { return entered; });
+    }
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false;
+    bool released = false;
+    bool tcp_parser_active = false;
+    std::atomic<bool> timed_out{false};
+};
+
+// Each scenario runs in an isolated subprocess; its server has one connection.
+static UrmaFinalAckGate* g_urma_final_ack_gate = nullptr;
+
+static ParseResult GateUrmaFinalAck(butil::IOBuf* source, Socket* socket,
+                                    bool eof, const void* arg) {
+    ParseResult result = policy::ParseTransportHandshake(source, socket, eof, arg);
+    if (socket->parsing_stream_type() == InputMessengerProcessor::STREAM_TCP_FD &&
+        AdapterTransport::Get(socket)->handshake_phase() == handshake::ESTABLISHED) {
+        g_urma_final_ack_gate->Pause(socket);
+    }
+    return result;
+}
+
+static ParseResult SkipLegacyUrmaHandshake(butil::IOBuf*, Socket*, bool,
+                                           const void*) {
+    // The old dedicated transport already consumed the TCP handshake. This is
+    // the baseline parser's URMA exclusion, before the common migration.
+    return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+}
+
+class UrmaDelayedAckIO : public handshake::HandshakeIO {
+public:
+    explicit UrmaDelayedAckIO(handshake::HandshakeIO* io) : delegate(io) {}
+    int ReadExact(void* data, size_t len) override {
+        return delegate->ReadExact(data, len);
+    }
+    int PushBack(const void* data, size_t len) override {
+        return delegate->PushBack(data, len);
+    }
+    int WriteAll(const void* data, size_t len) override {
+        if (len == sizeof(uint32_t)) {
+            const char* ack = static_cast<const char*>(data);
+            held.assign(ack + len - 1, 1);
+            // Model cross-channel delay: TCP's final ACK byte arrives after
+            // the URMA SEND, although the client's write has completed.
+            return delegate->WriteAll(data, len - 1);
+        }
+        return delegate->WriteAll(data, len);
+    }
+    int FlushAck() { return delegate->WriteAll(held.data(), held.size()); }
+    handshake::HandshakeIO* delegate;
+    std::string held;
+};
+
+enum class UrmaInteropPeer { COMMON, LEGACY_CLIENT, LEGACY_SERVER };
+enum class UrmaFirstPacket { AFTER_ACK, BEFORE_LAST_ACK_BYTE, IN_ACK_PARSER };
+
+static int RunUrmaHandshakeInterop(int version, bool polling, bool zerocopy,
+                                   UrmaInteropPeer peer, UrmaFirstPacket order) {
+    alarm(15);
+    urma::g_skip_urma_init = false;
+    gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+    gflags::SetCommandLineOption("urma_buffer_count", "2048");
+    gflags::SetCommandLineOption("urma_use_polling", polling ? "true" : "false");
+    gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+    urma::FLAGS_urma_client_handshake_version = version;
+    urma::GlobalUrmaInitializeOrDie();
+    if (!urma::GetUrmaContext()) {
+        return 30;
+    }
+    UrmaFinalAckGate gate;
+    UrmaStreamEchoService service;
+    Server server;
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    if (server.AddService(&service, SERVER_DOESNT_OWN_SERVICE) != 0 ||
+        server.Start(0, &server_options) != 0) {
+        return 31;
+    }
+    for (int i = 0; i <= server._am->_max_index.load(butil::memory_order_acquire); ++i) {
+        auto& handler = server._am->_handlers[i];
+        if (handler.parse == policy::ParseTransportHandshake) {
+            if (peer == UrmaInteropPeer::LEGACY_SERVER) {
+                handler.parse = SkipLegacyUrmaHandshake;
+            } else if (order == UrmaFirstPacket::IN_ACK_PARSER) {
+                g_urma_final_ack_gate = &gate;
+                handler.parse = GateUrmaFinalAck;
+            }
+        }
+    }
+    Channel channel;
+    ChannelOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.protocol = "baidu_std";
+    options.connection_type = "single";
+    options.timeout_ms = 3000;
+    options.max_retry = 0;
+    if (channel.Init(server.listen_address(), &options) != 0) {
+        return 32;
+    }
+    SocketUniquePtr client;
+    if (Socket::Address(channel._server_id, &client) != 0) {
+        return 33;
+    }
+    SocketOptions accepted_options;
+    accepted_options.socket_mode = SOCKET_MODE_URMA;
+    accepted_options.user = server._am;
+    accepted_options.need_on_edge_trigger = true;
+    SocketId accepted_id;
+    if (Socket::Create(accepted_options, &accepted_id) != 0) {
+        return 34;
+    }
+    SocketUniquePtr accepted;
+    if (Socket::Address(accepted_id, &accepted) != 0) {
+        return 35;
+    }
+    // Pin both main sockets throughout the handoff/RPC checks. CQ teardown
+    // lifetime races are a separate test and fix, not part of this scenario.
+    if (peer == UrmaInteropPeer::LEGACY_CLIENT) {
+        InstallLegacyUrmaTransport(client.get(), client->user());
+    } else if (peer == UrmaInteropPeer::LEGACY_SERVER) {
+        InstallLegacyUrmaTransport(accepted.get(), server._am);
+    }
+    int fds[2];
+    if (CreateUrmaInteropTcpPair(fds) != 0 ||
+        client->ResetFileDescriptor(fds[0]) != 0 ||
+        accepted->ResetFileDescriptor(fds[1]) != 0) {
+        return 36;
+    }
+    urma::UrmaEndpoint* accepted_ep = peer == UrmaInteropPeer::LEGACY_SERVER
+        ? static_cast<UrmaTransport*>(accepted->_transport.get())->GetUrmaEp()
+        : static_cast<UrmaTransport*>(AdapterTransport::Get(accepted.get())
+                                         ->high_speed_transport())->GetUrmaEp();
+    handshake::HandshakeSession* session = peer == UrmaInteropPeer::LEGACY_CLIENT
+        ? nullptr : AdapterTransport::Get(client.get())->handshake_session();
+    UrmaDelayedAckIO delayed(session ? &session->_socket_io : nullptr);
+    if (order == UrmaFirstPacket::BEFORE_LAST_ACK_BYTE) {
+        session->SetIOForTest(&delayed);
+    }
+    std::promise<int> connected;
+    auto ready = connected.get_future();
+    auto done = [](int error, void* data) {
+        static_cast<std::promise<int>*>(data)->set_value(error);
+    };
+    if (peer == UrmaInteropPeer::LEGACY_CLIENT) {
+        client->_app_connect->StartConnect(client.get(), done, &connected);
+    } else if (AdapterTransport::StartClientUpgrade(client.get(), done, &connected) != 0) {
+        return 37;
+    }
+    if (ready.wait_for(std::chrono::seconds(3)) != std::future_status::ready ||
+        ready.get() != 0) {
+        return 38;
+    }
+    if (peer == UrmaInteropPeer::LEGACY_CLIENT) {
+        auto* transport = static_cast<UrmaTransport*>(client->_transport.get());
+        if (transport->_urma_state != UrmaTransport::URMA_ON ||
+            transport->GetUrmaEp()->_handshake_version != version) {
+            return 39;
+        }
+    } else if (AdapterTransport::Get(client.get())->handshake_phase() !=
+                   handshake::ESTABLISHED ||
+               AdapterTransport::Get(client.get())->handshake_version() != version) {
+        return 40;
+    }
+    if (order == UrmaFirstPacket::IN_ACK_PARSER && !gate.Wait()) {
+        return 41;
+    }
+    if (order == UrmaFirstPacket::BEFORE_LAST_ACK_BYTE) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (AdapterTransport::Get(accepted.get())->handshake_phase() !=
+                   handshake::ACK_WAIT) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return 42;
+            }
+            std::this_thread::yield();
+        }
+    }
+    if (order == UrmaFirstPacket::AFTER_ACK) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (accepted_ep->_state.load(butil::memory_order_acquire) !=
+                   urma::UrmaEndpoint::ESTABLISHED) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return 42;
+            }
+            std::this_thread::yield();
+        }
+    }
+    test::EchoService::Stub stub(&channel);
+    test::EchoRequest request;
+    test::EchoResponse response;
+    Controller cntl;
+    request.set_message("first URMA RPC after final TCP ACK");
+    cntl.request_attachment().append(std::string(512, 'a'));
+    stub.Echo(&cntl, &request, &response, DoNothing());
+    if (order != UrmaFirstPacket::AFTER_ACK) {
+        pollfd cq_event{accepted_ep->_resource->jfce->fd, POLLIN, 0};
+        if (poll(&cq_event, 1, 3000) != 1 || !(cq_event.revents & POLLIN) ||
+            service.calls.load(std::memory_order_acquire) != 0) {
+            return 43;
+        }
+        // A real receive completion is queued, but no CQ consumer may run
+        // while ACK is incomplete or its TCP parser is still on the stack.
+        if (accepted_ep->_cq_sid != INVALID_SOCKET_ID) {
+            return 44;
+        }
+        if (order == UrmaFirstPacket::BEFORE_LAST_ACK_BYTE) {
+            if (AdapterTransport::Get(accepted.get())->handshake_phase() !=
+                    handshake::ACK_WAIT || delayed.held.size() != 1 ||
+                delayed.FlushAck() != 0) {
+                return 45;
+            }
+        } else {
+            if (!gate.tcp_parser_active) {
+                return 46;
+            }
+            gate.Release();
+        }
+    }
+    Join(cntl.call_id());
+    if (cntl.Failed() || response.message() != request.message() ||
+        cntl.response_attachment().to_string() != std::string(512, 'a')) {
+        return 47;
+    }
+    for (int i = 0; i < 16; ++i) {
+        Controller next;
+        test::EchoResponse reply;
+        request.set_message(std::to_string(i));
+        const std::string attachment(256 + i * 257, static_cast<char>('b' + i));
+        next.request_attachment().append(attachment);
+        stub.Echo(&next, &request, &reply, nullptr);
+        if (next.Failed() || reply.message() != request.message() ||
+            next.response_attachment().to_string() != attachment) {
+            return 48;
+        }
+    }
+    if (service.calls.load(std::memory_order_acquire) != 17 ||
+        gate.timed_out.load(std::memory_order_acquire)) {
+        return 49;
+    }
+    if (peer == UrmaInteropPeer::LEGACY_SERVER &&
+        accepted_ep->_handshake_version != version) {
+        return 50;
+    }
+    if (peer != UrmaInteropPeer::LEGACY_SERVER &&
+        (AdapterTransport::Get(accepted.get())->handshake_phase() !=
+             handshake::ESTABLISHED ||
+         AdapterTransport::Get(accepted.get())->handshake_version() != version)) {
+        return 51;
+    }
+    client->SetFailed();
+    accepted->SetFailed();
+    server.Stop(0);
+    server.Join();
+    return 0;
+}
+
+TEST_F(UrmaMockTest, legacy_client_exchanges_rpc_with_common_server) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int version : {2, 3}) {
+        for (bool polling : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "version=" << version
+                                              << " polling=" << polling);
+            ASSERT_EXIT(_exit(RunUrmaHandshakeInterop(version, polling, false,
+                UrmaInteropPeer::LEGACY_CLIENT, UrmaFirstPacket::AFTER_ACK)),
+                ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, common_client_exchanges_rpc_with_legacy_server) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int version : {2, 3}) {
+        for (bool polling : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "version=" << version
+                                              << " polling=" << polling);
+            ASSERT_EXIT(_exit(RunUrmaHandshakeInterop(version, polling, false,
+                UrmaInteropPeer::LEGACY_SERVER, UrmaFirstPacket::AFTER_ACK)),
+                ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, first_urma_packet_waits_for_final_ack_byte) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int version : {2, 3}) {
+        for (bool polling : {false, true}) {
+            for (bool zerocopy : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "version=" << version
+                    << " polling=" << polling << " zerocopy=" << zerocopy);
+                ASSERT_EXIT(_exit(RunUrmaHandshakeInterop(version, polling, zerocopy,
+                    UrmaInteropPeer::COMMON, UrmaFirstPacket::BEFORE_LAST_ACK_BYTE)),
+                    ::testing::ExitedWithCode(0), "");
+            }
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, first_urma_packet_after_ack_exchanges_rpc) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int version : {2, 3}) {
+        for (bool polling : {false, true}) {
+            for (bool zerocopy : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "version=" << version
+                    << " polling=" << polling << " zerocopy=" << zerocopy);
+                ASSERT_EXIT(_exit(RunUrmaHandshakeInterop(version, polling, zerocopy,
+                    UrmaInteropPeer::COMMON, UrmaFirstPacket::AFTER_ACK)),
+                    ::testing::ExitedWithCode(0), "");
+            }
+        }
+    }
+}
+
+TEST_F(UrmaMockTest, first_urma_packet_waits_for_ack_parser_to_exit) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (int version : {2, 3}) {
+        for (bool polling : {false, true}) {
+            for (bool zerocopy : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "version=" << version
+                    << " polling=" << polling << " zerocopy=" << zerocopy);
+                ASSERT_EXIT(_exit(RunUrmaHandshakeInterop(version, polling, zerocopy,
+                    UrmaInteropPeer::COMMON, UrmaFirstPacket::IN_ACK_PARSER)),
+                    ::testing::ExitedWithCode(0), "");
+            }
+        }
+    }
+}
 
 static int RunUrmaMockConcurrentRpc(bool zerocopy, bool tcp_server = false) {
     urma::g_skip_urma_init = false;

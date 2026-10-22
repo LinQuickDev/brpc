@@ -116,6 +116,27 @@ bonding 需要 `urma_ubagg.h`，默认使用 standalone+IODIE。
 
 ## 诊断
 
+### 握手互通回归
+
+URMA mock 测试通过 loopback TCP 连接保留的旧握手状态机与公共握手，
+覆盖两个方向、v2/v3 和 event/polling，并执行真实 baidu_std RPC、校验响应及附件。
+ACK 交接测试用屏障固定首包早于 ACK 最后一个字节、首包到达时 ACK 解析器尚未
+退出两种时序，覆盖 copy/zero-copy；每个场景验证 17 次 RPC 恰好执行一次。
+
+```bash
+cmake -S . -B build-urma-mock -DWITH_URMA=ON -DURMA_USE_MOCK=ON -DBUILD_UNIT_TESTS=ON
+cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
+./build-urma-mock/test/brpc_urma_unittest \
+  --gtest_filter='UrmaMockTest.*legacy*:UrmaMockTest.first_urma_packet*' \
+  --gtest_repeat=100 --gtest_shuffle
+```
+
+这些测试运行实际的新旧握手代码，共用当前 URMA 数据面和 mock provider，
+不等同于两台实机上的独立新旧二进制互通；后者仍需使用匹配 SDK 的双机环境验证。
+握手交接测试也不覆盖 CQ 回调与资源释放之间的生命周期竞态。
+
+### 流记录
+
 建连前在两端开启 `--urma_trace_stream=true`。失败或关闭连接时输出一次记录：
 `TX` 为提交尝试，`RX_CQ` 为完成到达，`RX_USE` 为交给输入流的数据，
 包含长度、偏移、槽位、摘要和载荷前 16 字节。

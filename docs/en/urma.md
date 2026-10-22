@@ -123,6 +123,30 @@ and queues. Bonding requires `urma_ubagg.h`; standalone+IODIE is the default.
 
 ## Diagnostics
 
+### Handshake interoperability regression
+
+The URMA mock tests connect the retained legacy state machines to the common
+handshake over loopback TCP, in both directions, with v2/v3 and event/polling.
+They execute baidu_std RPCs and verify response messages and attachments.
+Barrier-controlled tests queue the first URMA packet before the final ACK byte,
+or while the completed ACK's TCP parser is still active, with copy/zero-copy.
+Each scenario verifies exactly one execution of each of its 17 RPCs.
+
+```bash
+cmake -S . -B build-urma-mock -DWITH_URMA=ON -DURMA_USE_MOCK=ON -DBUILD_UNIT_TESTS=ON
+cmake --build build-urma-mock --target brpc_urma_unittest --parallel 4
+./build-urma-mock/test/brpc_urma_unittest \
+  --gtest_filter='UrmaMockTest.*legacy*:UrmaMockTest.first_urma_packet*' \
+  --gtest_repeat=100 --gtest_shuffle
+```
+
+These tests run the actual legacy and common handshake code but share the
+current data path and mock provider. Independent old/new binaries on two real
+devices still require validation with a matching SDK and hardware environment.
+The handoff tests do not cover CQ callback versus resource teardown lifetime races.
+
+### Stream trace
+
 Enable `--urma_trace_stream=true` on both peers before creating connections.
 The one-time dump on failure or teardown records `TX` (post attempts), `RX_CQ`
 (completion arrival) and `RX_USE` (delivery to the input stream), with lengths,
