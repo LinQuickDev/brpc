@@ -29,6 +29,7 @@
 
 #if BRPC_WITH_UBRING
 #include "brpc/ubshm/common/common.h"
+#include "brpc/handshake/ubshm_handshake.h"
 #include "brpc/ubshm/ub_endpoint.h"
 #include "brpc/ubshm/shm/shm_def.h"
 #include "brpc/ubshm/shm/shm_mgr.h"
@@ -691,6 +692,57 @@ TEST(HelloFormatExtensionTest, selects_only_matching_supported_format) {
               SelectDataFormat(static_cast<UbrDataFormat>(0x1234), 0x1234));
 }
 
+TEST(UBShmHandshakeAdapterTest, rejects_unsupported_format_extension) {
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.BuildExtension(true, &payload));
+    EXPECT_EQ(std::string("\0\4\0\1", 4), payload);
+    EXPECT_EQ(brpc::handshake::STEP_OK,
+              adapter.ParseExtension(payload));
+
+    payload[3] = 2;
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              adapter.ParseExtension(payload));
+    payload[3] = 0;
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              adapter.ParseExtension(payload));
+    payload[1] = 3;
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              adapter.ParseExtension(payload));
+}
+
+TEST(UBShmHandshakeAdapterTest, ipc_v2_extension_matches_backend_format) {
+    using namespace brpc::ubring;
+    UBShmHandshakeAdapter protocol(UBR_DATA_FORMAT_IPC_V2);
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              protocol.BuildExtension(true, &payload));
+    EXPECT_EQ(std::string("\0\4\0\2", 4), payload);
+    EXPECT_EQ(brpc::handshake::STEP_OK, protocol.ParseExtension(payload));
+
+    payload[3] = 1;
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              protocol.ParseExtension(payload));
+    payload[3] = 0;
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              protocol.ParseExtension(payload));
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              protocol.BuildExtension(false, &payload));
+    EXPECT_EQ(std::string("\0\4\0\0", 4), payload);
+}
+
+TEST(UBShmHandshakeAdapterTest, ipc_v2_extension_rejects_malformed_frame) {
+    using namespace brpc::ubring;
+    UBShmHandshakeAdapter protocol(UBR_DATA_FORMAT_IPC_V2);
+    EXPECT_EQ(brpc::handshake::STEP_ERROR,
+              protocol.ParseExtension(std::string(3, '\0')));
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              protocol.ParseExtension(std::string("\0\3\0\2", 4)));
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              protocol.ParseExtension(std::string("\0\4\x12\x34", 4)));
+}
+
 TEST_F(HelloMessageTest, serialize_deserialize_roundtrip) {
     msg.msg_len = 64;
     msg.hello_ver = 2;
@@ -781,6 +833,84 @@ TEST_F(HelloMessageTest, toString_contains_fields) {
     EXPECT_NE(std::string::npos, s.find("UBRING_test"));
 }
 
+TEST(UBShmHandshakeAdapterTest, codec_uses_v3_wire_format) {
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    char shm_name[SHM_MAX_NAME_BUFF_LEN] = {0};
+    memcpy(shm_name, "UBRING_test_C", 14);
+
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.BuildHello(true, 4 * 1024 * 1024,
+                                 shm_name, &payload));
+    brpc::ubring::HelloMessage decoded{};
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.ParseHello(payload, &decoded));
+    EXPECT_EQ(64, decoded.msg_len);
+    EXPECT_EQ(3, decoded.hello_ver);
+    EXPECT_EQ(1, decoded.impl_ver);
+    EXPECT_EQ(4 * 1024 * 1024, decoded.len);
+    EXPECT_EQ(0, memcmp(shm_name, decoded.shm_name,
+                        SHM_MAX_NAME_BUFF_LEN));
+
+    std::string frame;
+    ASSERT_EQ(brpc::handshake::FRAME_OK,
+              brpc::handshake::FrameCodec::Encode(
+                  adapter.HelloFrameSpec(), payload, &frame));
+    ASSERT_EQ(64, frame.size());
+    EXPECT_EQ("UB", frame.substr(0, 2));
+}
+
+TEST(UBShmHandshakeAdapterTest, short_name_is_zero_padded) {
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    char short_name[SHM_MAX_NAME_BUFF_LEN];
+    memset(short_name, 0x5a, sizeof(short_name));
+    short_name[0] = 'x';
+    short_name[1] = '\0';
+
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.BuildHello(true, 4096, short_name, &payload));
+
+    brpc::ubring::HelloMessage decoded{};
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.ParseHello(payload, &decoded));
+    EXPECT_EQ('x', decoded.shm_name[0]);
+    for (size_t i = 1; i < SHM_MAX_NAME_BUFF_LEN; ++i) {
+        EXPECT_EQ('\0', decoded.shm_name[i]) << "index=" << i;
+    }
+}
+
+TEST(UBShmHandshakeAdapterTest, rejects_unterminated_remote_name) {
+    brpc::ubring::HelloMessage message{};
+    message.msg_len = 64;
+    message.hello_ver = 3;
+    message.impl_ver = 1;
+    message.len = 4096;
+    memset(message.shm_name, 'A', SHM_MAX_NAME_BUFF_LEN);
+
+    std::string payload(
+        sizeof(HelloMessageLayout), '\0');
+    message.Serialize(&payload[0]);
+
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    brpc::ubring::HelloMessage decoded{};
+    errno = 0;
+    EXPECT_EQ(brpc::handshake::STEP_ERROR,
+              adapter.ParseHello(payload, &decoded));
+    EXPECT_EQ(EPROTO, errno);
+}
+
+TEST(UBShmHandshakeAdapterTest, disabled_hello_requests_tcp_fallback) {
+    brpc::ubring::UBShmHandshakeAdapter adapter;
+    std::string payload;
+    ASSERT_EQ(brpc::handshake::STEP_OK,
+              adapter.BuildHello(false, 0, NULL, &payload));
+    brpc::ubring::HelloMessage decoded{};
+    EXPECT_EQ(brpc::handshake::STEP_FALLBACK,
+              adapter.ParseHello(payload, &decoded));
+    EXPECT_EQ(64, decoded.msg_len);
+}
+
 TEST(UBRingConfigurationTest, time_flags_include_units_and_expected_defaults) {
     struct TimeFlagExpectation {
         const char* name;
@@ -863,16 +993,16 @@ using brpc::ubring::UBShmEndpointTest;
 TEST_F(UBShmEndpointTest, construct_initial_state) {
     ASSERT_NE(nullptr, _ep);
     EXPECT_EQ(brpc::ubring::UBR_DATA_FORMAT_NONE,
-              _ep->_negotiated_data_format);
+              _ep->negotiated_data_format());
 }
 
 TEST_F(UBShmEndpointTest, reset_clears_negotiated_data_format) {
-    _ep->_negotiated_data_format = brpc::ubring::UBR_DATA_FORMAT_LEGACY_64;
+    _ep->SetNegotiatedDataFormat(brpc::ubring::UBR_DATA_FORMAT_LEGACY_64);
 
     _ep->Reset();
 
     EXPECT_EQ(brpc::ubring::UBR_DATA_FORMAT_NONE,
-              _ep->_negotiated_data_format);
+              _ep->negotiated_data_format());
 }
 
 TEST_F(UBShmEndpointTest, allocate_client_resources_real_shm) {

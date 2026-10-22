@@ -15,19 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <errno.h>
 #include <limits>
+#include <memory>
+#include <thread>
+#include <vector>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 
 #if BRPC_WITH_URMA
 #include "butil/atomicops.h"
+#include "butil/fd_guard.h"
+#include "brpc/input_messenger.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
-#include "brpc/urma/urma_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
+#include "brpc/handshake/handshake_frame.h"
+#include "brpc/handshake/handshake_io.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma_transport.h"
 #include "urma_types.h"
+#include "echo.pb.h"
+#include "brpc/closure_guard.h"
+#include "brpc/adapter_transport.h"
+#include "brpc/urma/urma_stream_trace.h"
+#include "brpc/global.h"
 
 using namespace brpc;
 
@@ -35,6 +53,7 @@ namespace brpc {
 namespace urma {
 
 DECLARE_int32(urma_client_handshake_version);
+DECLARE_bool(urma_trace_stream);
 extern bool g_skip_urma_init;
 extern butil::atomic<bool> g_urma_available;
 
@@ -137,6 +156,534 @@ TEST(UrmaHandshakeTest, v3_protobuf_roundtrip) {
     EXPECT_EQ(msg.seg_va(), msg2.seg_va());
     EXPECT_EQ(msg.seg_len(), msg2.seg_len());
     EXPECT_EQ(msg.seg_token_id(), msg2.seg_token_id());
+}
+
+TEST(UrmaHandshakeTest, common_adapter_parses_v2_and_v3_hello) {
+    urma::v2_wire::HelloMessage v2{};
+    v2.msg_len = urma::v2_wire::HELLO_PACKET_LEN;
+    v2.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+    v2.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+    v2.buffer_size = 8192;
+    v2.recv_buffer_cnt = 127;
+    v2.jetty_id = 7;
+    v2.tp_type = URMA_CTP;
+    v2.seg_va = 0x1000;
+    v2.seg_len = 8192;
+    uint8_t v2_body[urma::v2_wire::HELLO_BODY_LEN];
+    v2.Serialize(v2_body);
+    const std::string v2_payload(
+        reinterpret_cast<const char*>(v2_body + sizeof(uint16_t)),
+        sizeof(v2_body) - sizeof(uint16_t));
+
+    urma::UrmaHandshakeAdapter v2_adapter(nullptr, 2);
+    ASSERT_EQ(handshake::STEP_OK, v2_adapter.ParseHello(v2_payload));
+    EXPECT_EQ(7u, v2_adapter.remote().jetty_id);
+    EXPECT_EQ(urma::v2_wire::HELLO_PACKET_LEN,
+              v2_adapter.HelloFrameSpec().min_frame_len);
+
+    urma::UrmaHello v3;
+    v3.set_buffer_size(8192);
+    v3.set_recv_buffer_cnt(127);
+    v3.set_jetty_id(9);
+    v3.set_eid(std::string(16, '\1'));
+    v3.set_uasid(1);
+    v3.set_tp_type(URMA_CTP);
+    v3.set_seg_eid(std::string(16, '\2'));
+    v3.set_seg_uasid(2);
+    v3.set_seg_va(0x2000);
+    v3.set_seg_len(8192);
+    v3.set_seg_token_id(3);
+    std::string v3_payload;
+    ASSERT_TRUE(v3.SerializeToString(&v3_payload));
+
+    urma::UrmaHandshakeAdapter v3_adapter(nullptr, 3);
+    ASSERT_EQ(handshake::STEP_OK, v3_adapter.ParseHello(v3_payload));
+    EXPECT_EQ(9u, v3_adapter.remote().jetty_id);
+    EXPECT_EQ(handshake::FrameSpec::U32_BODY_LENGTH,
+              v3_adapter.HelloFrameSpec().length_encoding);
+}
+
+TEST(UrmaHandshakeTest, common_adapter_rejects_oversized_v3_tp_type) {
+    urma::UrmaHello message;
+    message.set_buffer_size(8192);
+    message.set_recv_buffer_cnt(127);
+    message.set_jetty_id(9);
+    message.set_eid(std::string(16, '\1'));
+    message.set_uasid(1);
+    message.set_tp_type(256);
+    message.set_seg_eid(std::string(16, '\2'));
+    message.set_seg_uasid(2);
+    message.set_seg_va(0x2000);
+    message.set_seg_len(8192);
+    message.set_seg_token_id(3);
+    std::string payload;
+    ASSERT_TRUE(message.SerializeToString(&payload));
+
+    urma::UrmaHandshakeAdapter adapter(nullptr, 3);
+    EXPECT_EQ(handshake::STEP_FALLBACK, adapter.ParseHello(payload));
+}
+
+TEST(UrmaHandshakeTest, common_frames_preserve_fragmented_and_coalesced_data) {
+    for (int version = 2; version <= 3; ++version) {
+        urma::UrmaHandshakeAdapter adapter(nullptr, version);
+        std::string hello;
+        ASSERT_EQ(handshake::STEP_OK, adapter.BuildHello(false, &hello));
+        std::string frame;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            adapter.HelloFrameSpec(), hello, &frame));
+
+        butil::IOBuf source;
+        source.append(frame.data(), 3);
+        handshake::IOBufHandshakeInput input(&source);
+        std::string parsed;
+        EXPECT_EQ(handshake::FRAME_NEED_MORE,
+                  handshake::FrameCodec::ParseBufferedFrame(
+                      &input, adapter.HelloFrameSpec(), &parsed));
+        EXPECT_EQ(3u, source.size());
+
+        source.append(frame.data() + 3, frame.size() - 3);
+        source.append("RPC", 3);
+        ASSERT_EQ(handshake::FRAME_OK,
+                  handshake::FrameCodec::ParseBufferedFrame(
+                      &input, adapter.HelloFrameSpec(), &parsed));
+        EXPECT_EQ(hello, parsed);
+        EXPECT_EQ(3u, source.size());
+        EXPECT_EQ("RPC", source.to_string());
+    }
+}
+
+TEST(UrmaTransportTest, inactive_data_path_fails_without_tcp_delegate) {
+    UrmaTransport transport;
+    butil::IOBuf data;
+    butil::IOBuf* list[] = {&data};
+    errno = 0;
+    EXPECT_EQ(-1, transport.CutFromIOBuf(&data));
+    EXPECT_EQ(ENOTCONN, errno);
+    errno = 0;
+    EXPECT_EQ(-1, transport.CutFromIOBufList(list, 1));
+    EXPECT_EQ(ENOTCONN, errno);
+
+    butil::atomic<int> epollout_butex(0);
+    const timespec duetime = {};
+    errno = 0;
+    EXPECT_EQ(1, transport.WaitEpollOut(&epollout_butex, false, duetime));
+    EXPECT_EQ(ENOTCONN, errno);
+}
+
+class CapturingUrmaHandshakeIO : public handshake::HandshakeIO {
+public:
+    int ReadExact(void*, size_t) override { return -1; }
+    int WriteAll(const void* data, size_t len) override {
+        output.append(static_cast<const char*>(data), len);
+        return 0;
+    }
+    int PushBack(const void*, size_t) override { return -1; }
+
+    std::string output;
+};
+
+class FailingUrmaResources : public handshake::HandshakeTransport {
+public:
+    FailingUrmaResources() : version(0), fallback(false), failed(false) {}
+    void OnProtocolSelected(handshake::HandshakeProtocol* protocol) override {
+        version = protocol->ProtocolVersion();
+    }
+    handshake::StepResult PrepareResources() override {
+        return handshake::STEP_FALLBACK;
+    }
+    handshake::StepResult NegotiateResources() override {
+        return handshake::STEP_ERROR;
+    }
+    void OnEstablished() override { ADD_FAILURE() << "Unexpected upgrade"; }
+    void OnFallback() override { fallback = true; }
+    void OnFailed() override { failed = true; }
+
+    int version;
+    bool fallback;
+    bool failed;
+};
+
+TEST(UrmaHandshakeTest, common_server_fallback_preserves_coalesced_rpc) {
+    urma::v2_wire::HelloMessage hello{};
+    hello.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+    hello.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+    hello.buffer_size = 8192;
+    hello.recv_buffer_cnt = 127;
+    hello.jetty_id = 7;
+    hello.tp_type = URMA_CTP;
+    hello.seg_va = 0x1000;
+    hello.seg_len = 8192;
+    uint8_t body[urma::v2_wire::HELLO_BODY_LEN];
+    hello.Serialize(body);
+    const std::string payload(
+        reinterpret_cast<const char*>(body + sizeof(uint16_t)),
+        sizeof(body) - sizeof(uint16_t));
+    urma::UrmaHandshakeAdapter protocol(nullptr, 2);
+    std::string frame;
+    ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+        protocol.HelloFrameSpec(), payload, &frame));
+
+    butil::IOBuf source;
+    source.append(frame);
+    const uint32_t disabled_ack = 0;
+    source.append(&disabled_ack, sizeof(disabled_ack));
+    source.append("RPC", 3);
+    handshake::IOBufHandshakeInput input(&source);
+    CapturingUrmaHandshakeIO io;
+    handshake::HandshakeSession session;
+    session.SetIOForTest(&io);
+    FailingUrmaResources transport;
+    std::vector<handshake::HandshakeProtocol*> protocols(1, &protocol);
+
+    EXPECT_EQ(handshake::STEP_FALLBACK,
+              session.RunServer(protocols, &input, &transport, false));
+    EXPECT_EQ(handshake::FALLBACK_TCP, session.phase());
+    EXPECT_EQ(2, transport.version);
+    EXPECT_TRUE(transport.fallback);
+    EXPECT_FALSE(transport.failed);
+    EXPECT_EQ("RPC", source.to_string());
+    EXPECT_EQ(urma::v2_wire::HELLO_PACKET_LEN, io.output.size());
+    EXPECT_EQ("URMA", io.output.substr(0, 4));
+}
+
+// Exercise the real URMA field codec and common server driver without device
+// allocation. Only the local Hello and resource provider are test doubles.
+class BufferedUrmaTestProtocol : public urma::UrmaHandshakeAdapter {
+public:
+    explicit BufferedUrmaTestProtocol(int version)
+        : urma::UrmaHandshakeAdapter(nullptr, version) {
+        if (version == 2) {
+            urma::v2_wire::HelloMessage hello{};
+            hello.msg_len = urma::v2_wire::HELLO_PACKET_LEN;
+            hello.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+            hello.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+            hello.buffer_size = 8192;
+            hello.recv_buffer_cnt = 127;
+            hello.jetty_id = 7;
+            hello.tp_type = URMA_CTP;
+            hello.seg_va = 0x1000;
+            hello.seg_len = 8192;
+            uint8_t body[urma::v2_wire::HELLO_BODY_LEN];
+            hello.Serialize(body);
+            local_payload.assign(
+                reinterpret_cast<const char*>(body + sizeof(uint16_t)),
+                sizeof(body) - sizeof(uint16_t));
+        } else {
+            urma::UrmaHello hello;
+            hello.set_buffer_size(8192);
+            hello.set_recv_buffer_cnt(127);
+            hello.set_jetty_id(7);
+            hello.set_tp_type(URMA_CTP);
+            hello.set_eid(std::string(16, '\0'));
+            hello.set_uasid(0);
+            hello.set_seg_eid(std::string(16, '\0'));
+            hello.set_seg_uasid(0);
+            hello.set_seg_token_id(0);
+            hello.set_seg_va(0x1000);
+            hello.set_seg_len(8192);
+            hello.SerializeToString(&local_payload);
+        }
+    }
+    handshake::StepResult BuildHello(bool enabled, std::string* payload) override {
+        if (!enabled) {
+            return urma::UrmaHandshakeAdapter::BuildHello(false, payload);
+        }
+        *payload = local_payload;
+        return handshake::STEP_OK;
+    }
+    std::string local_payload;
+};
+
+class TrackedUrmaTestResources : public handshake::HandshakeTransport {
+public:
+    butil::IOBuf* source = nullptr;
+    bool allocated = false;
+    bool active = false;
+    int cleanup_count = 0;
+    handshake::StepResult PrepareResources() override {
+        allocated = true;
+        return handshake::STEP_OK;
+    }
+    handshake::StepResult NegotiateResources() override {
+        return handshake::STEP_OK;
+    }
+    handshake::StepResult ValidateEstablished() override {
+        return source->empty() ? handshake::STEP_OK : handshake::STEP_ERROR;
+    }
+    void OnEstablished() override { active = true; }
+    void OnFallback() override { Cleanup(); }
+    void OnFailed() override { Cleanup(); }
+private:
+    void Cleanup() {
+        allocated = false;
+        active = false;
+        ++cleanup_count;
+    }
+};
+
+class BufferedUrmaTestAdapter : public handshake::StandardHandshakeAdapter {
+public:
+    explicit BufferedUrmaTestAdapter(int version) : protocol(version) {
+        session.SetIOForTest(&io);
+    }
+    BufferedUrmaTestProtocol protocol;
+    TrackedUrmaTestResources resources;
+    CapturingUrmaHandshakeIO io;
+    mutable handshake::HandshakeSession session;
+protected:
+    handshake::StepResult RunServerStep(butil::IOBuf* source, Socket*) override {
+        resources.source = source;
+        handshake::IOBufHandshakeInput input(source);
+        std::vector<handshake::HandshakeProtocol*> protocols(1, &protocol);
+        return session.RunServer(protocols, &input, &resources, false);
+    }
+    handshake::HandshakeSession* GetSession(Socket*) const override {
+        return &session;
+    }
+};
+
+class UrmaCommonServerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        int fds[2];
+        ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+        peer_fd.reset(fds[1]);
+        SocketOptions options;
+        options.fd = fds[0];
+        SocketId id;
+        ASSERT_EQ(0, Socket::Create(options, &id));
+        ASSERT_EQ(0, Socket::Address(id, &socket));
+    }
+    void TearDown() override {
+        if (socket) {
+            socket->reset_parsing_context(nullptr);
+            socket->SetFailed();
+        }
+    }
+    SocketUniquePtr socket;
+    butil::fd_guard peer_fd;
+};
+
+TEST_F(UrmaCommonServerTest, reclaims_send_buffer_before_publishing_sq_credit) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    const uint16_t capacity = 8;
+    endpoint._sq_size = capacity + urma::UrmaEndpoint::RESERVED_WR_NUM;
+    endpoint._local_window_capacity = capacity;
+    endpoint._sbuf.resize(capacity);
+    endpoint._sq_window_size.store(0, butil::memory_order_relaxed);
+    int reclaimed = 0;
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.flag.bs.s_r = 0;
+    completion.user_ctx = 1;
+    for (int round = 0; round < 4 * capacity; ++round) {
+        const uint16_t slot = round % capacity;
+        ASSERT_EQ(slot, endpoint._sq_sent);
+        ASSERT_EQ(0, endpoint._sbuf[slot].append_user_data(
+            new char('x'), 1, [&](void* data) {
+                // Deterministically inspect the publication boundary from
+                // inside clear(), before the slot can be reused by a writer.
+                EXPECT_EQ(0u, endpoint._sq_window_size.load(
+                                  butil::memory_order_acquire));
+                ++reclaimed;
+                delete static_cast<char*>(data);
+            }));
+        ASSERT_EQ(0, endpoint.HandleCompletion(completion));
+        EXPECT_TRUE(endpoint._sbuf[slot].empty());
+        EXPECT_EQ((slot + 1) % capacity, endpoint._sq_sent);
+        EXPECT_EQ(1u, endpoint._sq_window_size.fetch_sub(
+                          1, butil::memory_order_acquire));
+    }
+    EXPECT_EQ(4 * capacity, reclaimed);
+}
+
+TEST_F(UrmaCommonServerTest, excess_send_completion_keeps_buffer_owned) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._local_window_capacity = 8;
+    endpoint._sq_window_size.store(8, butil::memory_order_relaxed);
+    endpoint._sbuf.resize(8);
+    endpoint._sbuf[0].append("still owned");
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.flag.bs.s_r = 0;
+    completion.user_ctx = 1;
+    errno = 0;
+    EXPECT_EQ(-1, endpoint.HandleCompletion(completion));
+    EXPECT_EQ(EPROTO, errno);
+    EXPECT_EQ("still owned", endpoint._sbuf[0].to_string());
+    EXPECT_EQ(0u, endpoint._sq_sent);
+    EXPECT_EQ(8u, endpoint._sq_window_size.load(butil::memory_order_acquire));
+}
+
+TEST_F(UrmaCommonServerTest, cq_events_cannot_start_inside_tcp_parser) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    socket->set_parsing_stream_type(InputMessengerProcessor::STREAM_TCP_FD);
+    EXPECT_EQ(-1, endpoint.StartCqEvents());
+    EXPECT_EQ(EPROTO, errno);
+    EXPECT_EQ(INVALID_SOCKET_ID, endpoint._cq_sid);
+    socket->set_parsing_stream_type(InputMessengerProcessor::STREAM_NONE);
+}
+
+TEST_F(UrmaCommonServerTest, rejects_unidentified_receive_completion) {
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._rq_size = 4;
+    endpoint._recv_completions.resize(4);
+    endpoint._recv_completed.assign(4, false);
+    urma_cr_t cr{};
+    cr.status = URMA_CR_SUCCESS;
+    cr.flag.bs.s_r = 1;
+    cr.opcode = URMA_CR_OPC_SEND;
+    cr.completion_len = 4;
+    for (uint64_t slot : {0u, 5u}) {
+        cr.user_ctx = slot;
+        EXPECT_EQ(-1, endpoint.HandleCompletion(cr));
+        EXPECT_EQ(EPROTO, errno);
+        EXPECT_EQ(0u, endpoint._rq_received);
+        EXPECT_TRUE(endpoint._input_processor.read_buf().empty());
+    }
+}
+
+TEST_F(UrmaCommonServerTest, resumes_fragmented_hello_and_ack_without_rpc_handoff) {
+    for (int version : {2, 3}) {
+        BufferedUrmaTestAdapter adapter(version);
+        std::string hello;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            adapter.protocol.HelloFrameSpec(), adapter.protocol.local_payload,
+            &hello));
+        butil::IOBuf source;
+        source.append(hello.data(), 3);
+        ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        EXPECT_FALSE(adapter.resources.allocated);
+        source.append(hello.data() + 3, hello.size() - 3);
+        ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        ASSERT_NE(nullptr, socket->parsing_context());
+        EXPECT_TRUE(adapter.resources.allocated);
+        const uint32_t ack = butil::HostToNet32(0x1);
+        source.append(&ack, 2);
+        ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        EXPECT_FALSE(adapter.resources.active);
+        source.append(reinterpret_cast<const char*>(&ack) + 2, 2);
+        ASSERT_EQ(PARSE_ERROR_NOT_ENOUGH_DATA,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        EXPECT_EQ(handshake::ESTABLISHED,
+                  adapter.session.phase(butil::memory_order_acquire));
+        EXPECT_TRUE(adapter.resources.active);
+        EXPECT_EQ(0, adapter.resources.cleanup_count);
+        EXPECT_EQ(nullptr, socket->parsing_context());
+        EXPECT_TRUE(source.empty());
+    }
+}
+
+TEST_F(UrmaCommonServerTest, rejects_coalesced_tcp_data_and_cleans_failed_resources) {
+    for (int version : {2, 3}) {
+        BufferedUrmaTestAdapter adapter(version);
+        std::string hello;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            adapter.protocol.HelloFrameSpec(), adapter.protocol.local_payload,
+            &hello));
+        butil::IOBuf source;
+        source.append(hello);
+        const uint32_t ack = butil::HostToNet32(0x1);
+        source.append(&ack, sizeof(ack));
+        source.append("RPC", 3);
+        EXPECT_EQ(PARSE_ERROR_ABSOLUTELY_WRONG,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        EXPECT_EQ(handshake::FAILED,
+                  adapter.session.phase(butil::memory_order_acquire));
+        EXPECT_FALSE(adapter.resources.allocated);
+        EXPECT_FALSE(adapter.resources.active);
+        EXPECT_EQ(1, adapter.resources.cleanup_count);
+        EXPECT_EQ("RPC", source.to_string());
+    }
+}
+
+TEST_F(UrmaCommonServerTest, disabled_ack_cleans_resources_and_preserves_rpc) {
+    for (int version : {2, 3}) {
+        BufferedUrmaTestAdapter adapter(version);
+        std::string hello;
+        ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+            adapter.protocol.HelloFrameSpec(), adapter.protocol.local_payload,
+            &hello));
+        butil::IOBuf source;
+        source.append(hello);
+        const uint32_t ack = 0;
+        source.append(&ack, sizeof(ack));
+        source.append("RPC", 3);
+        EXPECT_EQ(PARSE_ERROR_TRY_OTHERS,
+                  adapter.ExecuteServerHandshake(&source, socket.get()).error());
+        EXPECT_EQ(handshake::FALLBACK_TCP,
+                  adapter.session.phase(butil::memory_order_acquire));
+        EXPECT_FALSE(adapter.resources.allocated);
+        EXPECT_FALSE(adapter.resources.active);
+        EXPECT_EQ(1, adapter.resources.cleanup_count);
+        EXPECT_EQ("RPC", source.to_string());
+    }
+}
+
+class UrmaUpgradeTestMessenger : public InputMessenger {
+public:
+    using InputMessenger::OnNewMessagesUntil;
+    BufferedUrmaTestAdapter adapter{3};
+    int peer_fd = -1;
+    int parse_calls = 0;
+    int write_result = -1;
+    static ParseResult Parse(butil::IOBuf* source, Socket* socket,
+                             bool, const void*) {
+        auto* messenger = static_cast<UrmaUpgradeTestMessenger*>(socket->user());
+        ++messenger->parse_calls;
+        ParseResult result = messenger->adapter.ExecuteServerHandshake(
+            source, socket);
+        if (messenger->adapter.resources.active) {
+            messenger->write_result = write(messenger->peer_fd, "RPC", 3);
+        }
+        return result;
+    }
+    static void Process(InputMessageBase*) {}
+    static bool StopReading(Socket* socket) {
+        return static_cast<UrmaUpgradeTestMessenger*>(socket->user())
+            ->adapter.session.phase(butil::memory_order_acquire) ==
+                handshake::ESTABLISHED;
+    }
+};
+
+TEST(UrmaHandshakeTest, tcp_read_loop_stops_after_urma_upgrade) {
+    UrmaUpgradeTestMessenger messenger;
+    InputMessageHandler handler{};
+    handler.parse = UrmaUpgradeTestMessenger::Parse;
+    handler.process = UrmaUpgradeTestMessenger::Process;
+    handler.name = "test_urma_upgrade";
+    ASSERT_EQ(0, messenger.AddNonProtocolHandler(handler));
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer_fd(fds[1]);
+    messenger.peer_fd = peer_fd;
+    SocketOptions options;
+    options.fd = fds[0];
+    options.user = &messenger;
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+    std::string hello;
+    ASSERT_EQ(handshake::FRAME_OK, handshake::FrameCodec::Encode(
+        messenger.adapter.protocol.HelloFrameSpec(),
+        messenger.adapter.protocol.local_payload, &hello));
+    const uint32_t ack = butil::HostToNet32(0x1);
+    hello.append(reinterpret_cast<const char*>(&ack), sizeof(ack));
+    ASSERT_EQ(static_cast<ssize_t>(hello.size()),
+              write(peer_fd, hello.data(), hello.size()));
+    messenger.OnNewMessagesUntil(socket.get(),
+                                 UrmaUpgradeTestMessenger::StopReading);
+    EXPECT_EQ(1, messenger.parse_calls);
+    EXPECT_EQ(3, messenger.write_result);
+    EXPECT_TRUE(messenger.adapter.resources.active);
+    char remaining[3];
+    ASSERT_EQ(3, recv(socket->fd(), remaining, sizeof(remaining), MSG_DONTWAIT));
+    EXPECT_EQ(0, memcmp(remaining, "RPC", 3));
+    socket->SetFailed();
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +800,80 @@ TEST(UrmaHandshakeTest, rejects_invalid_resource_and_window_values) {
     EXPECT_FALSE(urma::ValidHello(hello));
 }
 
+TEST(UrmaTraceTest, fingerprints_ignore_sge_boundaries) {
+    const std::string payload = "hello";
+    urma_sge_t whole{reinterpret_cast<uint64_t>(payload.data()), 5, nullptr, nullptr};
+    urma_sge_t parts[] = {
+        {reinterpret_cast<uint64_t>(payload.data()), 2, nullptr, nullptr},
+        {reinterpret_cast<uint64_t>(payload.data() + 2), 3, nullptr, nullptr}};
+    const auto a = urma::UrmaStreamTrace::Summarize(&whole, 1);
+    const auto b = urma::UrmaStreamTrace::Summarize(parts, 2);
+    EXPECT_EQ(UINT64_C(0xa430d84680aabd0b), a.hash);
+    EXPECT_EQ(a.hash, b.hash);
+    EXPECT_EQ(a.length, b.length);
+    EXPECT_EQ("68656c6c6f", a.prefix);
+    EXPECT_EQ(a.prefix, b.prefix);
+}
+
+TEST(UrmaTraceTest, bounds_payload_prefix_and_dump_history) {
+    const std::string payload(64, 'a');
+    urma_sge_t sge{reinterpret_cast<uint64_t>(payload.data()), 64, nullptr, nullptr};
+    const auto summary = urma::UrmaStreamTrace::Summarize(&sge, 1);
+    EXPECT_EQ(64u, summary.length);
+    EXPECT_EQ(2 * urma::UrmaStreamTrace::PREFIX_SIZE, summary.prefix.size());
+    urma::UrmaStreamTrace trace;
+    EXPECT_TRUE(trace.DumpOnce().empty());
+    for (size_t i = 0; i < urma::UrmaStreamTrace::CAPACITY + 8; ++i) {
+        trace.Record(urma::UrmaStreamTrace::TX, i, 1, 0, &sge, 1);
+    }
+    const std::string dump = trace.DumpOnce();
+    EXPECT_NE(std::string::npos, dump.find("records=32 total=40"));
+    EXPECT_EQ(std::string::npos, dump.find(" seq=7 "));
+    EXPECT_NE(std::string::npos, dump.find(" seq=8 offset=512 len=64"));
+    EXPECT_NE(std::string::npos, dump.find(" seq=39 offset=2496 len=64"));
+    EXPECT_TRUE(trace.DumpOnce().empty());
+}
+
+TEST(UrmaTraceTest, concurrent_directions_keep_independent_offsets) {
+    const std::string payload = "xy";
+    urma_sge_t sge{reinterpret_cast<uint64_t>(payload.data()), 2, nullptr, nullptr};
+    urma::UrmaStreamTrace trace;
+    auto record = [&](urma::UrmaStreamTrace::Stage stage) {
+        for (size_t i = 0; i < 50; ++i) {
+            trace.Record(stage, i, 1, 0, &sge, 1);
+        }
+    };
+    std::thread sender(record, urma::UrmaStreamTrace::TX);
+    std::thread receiver(record, urma::UrmaStreamTrace::RX_CQ);
+    sender.join();
+    receiver.join();
+    const std::string dump = trace.DumpOnce();
+    EXPECT_NE(std::string::npos, dump.find("records=32 total=100"));
+    EXPECT_NE(std::string::npos, dump.find("seq=49 offset=98 len=2"));
+}
+
+TEST_F(UrmaCommonServerTest, stream_trace_is_opt_in) {
+    const bool saved = urma::FLAGS_urma_trace_stream;
+    urma::FLAGS_urma_trace_stream = false;
+    urma::UrmaEndpoint disabled(socket.get());
+    urma::FLAGS_urma_trace_stream = true;
+    urma::UrmaEndpoint enabled(socket.get());
+    urma::FLAGS_urma_trace_stream = saved;
+    EXPECT_EQ(nullptr, disabled._stream_trace.get());
+    EXPECT_NE(nullptr, enabled._stream_trace.get());
+}
+
+TEST(UrmaHelperTest, standalone_bonding_uses_regular_jetty_import) {
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, 0));
+    EXPECT_TRUE(urma::NeedsUrmaBondingJettyExtension(true, 1));
+    EXPECT_TRUE(urma::NeedsUrmaBondingJettyExtension(true, 2));
+    for (int mode = 0; mode <= 2; ++mode) {
+        EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(false, mode));
+    }
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, -1));
+    EXPECT_FALSE(urma::NeedsUrmaBondingJettyExtension(true, 3));
+}
+
 TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
     urma_device_attr_t attr{};
     attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
@@ -315,6 +936,589 @@ protected:
 private:
     bool _owns_urma_init{false};
 };
+
+TEST_F(UrmaMockTest, send_completion_releases_source_only_after_copy) {
+    int device_count = 0;
+    urma_device_t** devices = urma_get_device_list(&device_count);
+    ASSERT_NE(nullptr, devices);
+    urma_context_t* raw_context = urma_create_context(devices[0], 0);
+    urma_free_device_list(devices);
+    std::unique_ptr<urma_context_t, decltype(&urma_delete_context)> context(
+        raw_context, urma_delete_context);
+    ASSERT_NE(nullptr, context.get());
+    urma::UrmaResource resource;
+    resource.jfce = urma_create_jfce(context.get());
+    ASSERT_NE(nullptr, resource.jfce);
+    urma_jfc_cfg_t jfc_cfg{};
+    jfc_cfg.depth = 8;
+    jfc_cfg.jfce = resource.jfce;
+    resource.jfc = urma_create_jfc(context.get(), &jfc_cfg);
+    ASSERT_NE(nullptr, resource.jfc);
+    urma_jfr_cfg_t jfr_cfg{};
+    jfr_cfg.depth = 4;
+    jfr_cfg.trans_mode = URMA_TM_RM;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.jfc = resource.jfc;
+    resource.jfr = urma_create_jfr(context.get(), &jfr_cfg);
+    ASSERT_NE(nullptr, resource.jfr);
+    urma_jetty_cfg_t jetty_cfg{};
+    jetty_cfg.flag.bs.share_jfr = 1;
+    jetty_cfg.jfs_cfg.depth = 4;
+    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+    jetty_cfg.jfs_cfg.max_sge = 1;
+    jetty_cfg.jfs_cfg.jfc = resource.jfc;
+    jetty_cfg.shared.jfr = resource.jfr;
+    jetty_cfg.shared.jfc = resource.jfc;
+    resource.jetty = urma_create_jetty(context.get(), &jetty_cfg);
+    ASSERT_NE(nullptr, resource.jetty);
+    urma_rjetty_t remote{};
+    remote.jetty_id = resource.jetty->jetty_id;
+    remote.trans_mode = URMA_TM_RM;
+    remote.type = URMA_JETTY;
+    remote.tp_type = URMA_CTP;
+    urma_token_t token{};
+    resource.remote_jetty = urma_import_jetty(context.get(), &remote, &token);
+    ASSERT_NE(nullptr, resource.remote_jetty);
+
+    const std::string expected(1024 * 1024, 'x');
+    std::string payload(expected);
+    std::string received(expected.size(), '\0');
+    for (int round = 0; round < 8; ++round) {
+        payload = expected;
+        urma_sge_t receive_sge{reinterpret_cast<uint64_t>(&received[0]),
+            static_cast<uint32_t>(received.size()), nullptr, nullptr};
+        urma_jfr_wr_t receive_wr{{&receive_sge, 1}, 0, nullptr};
+        urma_jfr_wr_t* bad_receive = nullptr;
+        ASSERT_EQ(URMA_SUCCESS, urma_post_jfr_wr(
+            resource.jfr, &receive_wr, &bad_receive));
+        urma_sge_t send_sge{reinterpret_cast<uint64_t>(&payload[0]),
+            static_cast<uint32_t>(payload.size()), nullptr, nullptr};
+        urma_jfs_wr_t send_wr{};
+        send_wr.opcode = URMA_OPC_SEND;
+        send_wr.flag.bs.complete_enable = 1;
+        send_wr.tjetty = resource.remote_jetty;
+        send_wr.send.src = {&send_sge, 1};
+        std::atomic<bool> ready(false);
+        std::atomic<bool> stop(false);
+        int completions = 0;
+        std::thread poller([&]() {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            ready.store(true, std::memory_order_release);
+            while (completions < 2 && !stop.load(std::memory_order_relaxed) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                urma_cr_t completion{};
+                if (urma_poll_jfc(resource.jfc, 1, &completion) == 1) {
+                    if (completion.flag.bs.s_r == 0) {
+                        // A real caller may reuse the source immediately
+                        // after observing the send completion.
+                        memset(&payload[0], 'z', payload.size());
+                    }
+                    ++completions;
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+        while (!ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        urma_jfs_wr_t* bad_send = nullptr;
+        const urma_status_t status = urma_post_jetty_send_wr(
+            resource.jetty, &send_wr, &bad_send);
+        if (status != URMA_SUCCESS) {
+            stop.store(true, std::memory_order_relaxed);
+        }
+        poller.join();
+        ASSERT_EQ(URMA_SUCCESS, status);
+        ASSERT_EQ(2, completions);
+        EXPECT_EQ(0, memcmp(expected.data(), received.data(), expected.size()));
+    }
+}
+
+TEST_F(UrmaMockTest, segmented_stream_survives_send_queue_wraparound) {
+    int device_count = 0;
+    urma_device_t** devices = urma_get_device_list(&device_count);
+    ASSERT_NE(nullptr, devices);
+    urma_context_t* raw_context = urma_create_context(devices[0], 0);
+    urma_free_device_list(devices);
+    std::unique_ptr<urma_context_t, decltype(&urma_delete_context)> context(
+        raw_context, urma_delete_context);
+    ASSERT_NE(nullptr, context.get());
+
+    int fds[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    butil::fd_guard peer(fds[1]);
+    SocketOptions options;
+    options.fd = fds[0];
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(options, &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+    struct FailSocket {
+        Socket* socket;
+        ~FailSocket() { socket->SetFailed(); }
+    } fail_socket{socket.get()};
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._resource = new urma::UrmaResource;
+    auto* resource = endpoint._resource;
+    resource->jfce = urma_create_jfce(context.get());
+    ASSERT_NE(nullptr, resource->jfce);
+    urma_jfc_cfg_t jfc_cfg{};
+    jfc_cfg.depth = 32;
+    jfc_cfg.jfce = resource->jfce;
+    resource->jfc = urma_create_jfc(context.get(), &jfc_cfg);
+    ASSERT_NE(nullptr, resource->jfc);
+    urma_jfr_cfg_t jfr_cfg{};
+    jfr_cfg.depth = 8;
+    jfr_cfg.trans_mode = URMA_TM_RM;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.jfc = resource->jfc;
+    resource->jfr = urma_create_jfr(context.get(), &jfr_cfg);
+    ASSERT_NE(nullptr, resource->jfr);
+    urma_jetty_cfg_t jetty_cfg{};
+    jetty_cfg.flag.bs.share_jfr = 1;
+    jetty_cfg.jfs_cfg.depth = 8;
+    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
+    jetty_cfg.jfs_cfg.max_sge = 13;
+    jetty_cfg.jfs_cfg.jfc = resource->jfc;
+    jetty_cfg.shared.jfr = resource->jfr;
+    jetty_cfg.shared.jfc = resource->jfc;
+    resource->jetty = urma_create_jetty(context.get(), &jetty_cfg);
+    ASSERT_NE(nullptr, resource->jetty);
+    urma_rjetty_t remote{};
+    remote.jetty_id = resource->jetty->jetty_id;
+    remote.trans_mode = URMA_TM_RM;
+    remote.type = URMA_JETTY;
+    urma_token_t token{};
+    resource->remote_jetty = urma_import_jetty(context.get(), &remote, &token);
+    ASSERT_NE(nullptr, resource->remote_jetty);
+
+    const uint16_t capacity = 5;
+    const size_t block_size = 128;
+    endpoint._sq_size = capacity + urma::UrmaEndpoint::RESERVED_WR_NUM;
+    endpoint._local_window_capacity = capacity;
+    endpoint._sbuf.resize(capacity);
+    endpoint._remote_recv_block_size = block_size;
+    std::vector<std::vector<char>> receive_buffers(
+        capacity, std::vector<char>(block_size));
+    auto post_receive = [&](size_t slot) {
+        urma_sge_t sge{reinterpret_cast<uint64_t>(receive_buffers[slot].data()),
+            static_cast<uint32_t>(block_size), nullptr, nullptr};
+        urma_jfr_wr_t wr{{&sge, 1}, slot + 1, nullptr};
+        urma_jfr_wr_t* bad = nullptr;
+        return urma_post_jfr_wr(resource->jfr, &wr, &bad);
+    };
+    for (size_t slot = 0; slot < capacity; ++slot) {
+        ASSERT_EQ(URMA_SUCCESS, post_receive(slot));
+    }
+
+    // The link-time mock does not DMA, so a synthetic registered segment is
+    // sufficient. Each part owns separate storage to force real SGE boundaries.
+    urma_target_seg_t segment{};
+    segment.seg.len = std::numeric_limits<uint64_t>::max();
+    for (int round = 0; round < 64; ++round) {
+        endpoint._sq_window_size.store(capacity, butil::memory_order_relaxed);
+        endpoint._remote_rq_window_size.store(capacity, butil::memory_order_relaxed);
+        std::vector<butil::IOBuf> messages(64);
+        std::vector<butil::IOBuf*> list;
+        std::string expected;
+        for (size_t i = 0; i < messages.size(); ++i) {
+            for (const std::string& part : {
+                     std::string("PRPC:") + std::to_string(round) + ":" +
+                         std::to_string(i) + std::string(i % 37, 'x'),
+                     std::string("\x08\0", 2)}) {
+                char* data = new char[part.size()];
+                memcpy(data, part.data(), part.size());
+                ASSERT_EQ(0, messages[i].append_user_data_with_meta(
+                    data, part.size(), [](void* p) { delete[] static_cast<char*>(p); },
+                    reinterpret_cast<uint64_t>(&segment)));
+                expected.append(part);
+            }
+            list.push_back(&messages[i]);
+        }
+        std::string received;
+        size_t sent = 0;
+        while (sent < expected.size()) {
+            const ssize_t bytes = endpoint.CutFromIOBufList(list.data(), list.size());
+            ASSERT_GT(bytes, 0);
+            sent += bytes;
+            urma_cr_t cr{};
+            while (urma_poll_jfc(resource->jfc, 1, &cr) == 1) {
+                if (cr.flag.bs.s_r == 0) {
+                    ASSERT_EQ(0, endpoint.HandleCompletion(cr));
+                } else {
+                    ASSERT_GE(cr.user_ctx, 1u);
+                    ASSERT_LE(cr.user_ctx, capacity);
+                    const size_t slot = cr.user_ctx - 1;
+                    received.append(receive_buffers[slot].data(), cr.completion_len);
+                    ASSERT_EQ(URMA_SUCCESS, post_receive(slot));
+                    endpoint._remote_rq_window_size.fetch_add(
+                        1, butil::memory_order_relaxed);
+                }
+            }
+        }
+        ASSERT_EQ(expected, received) << "round=" << round;
+    }
+}
+
+class UrmaStreamEchoService : public test::EchoService {
+public:
+    void Echo(google::protobuf::RpcController* controller,
+              const test::EchoRequest* request, test::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        ClosureGuard guard(done);
+        response->set_message(request->message());
+        auto* cntl = static_cast<Controller*>(controller);
+        cntl->response_attachment().append(cntl->request_attachment());
+    }
+};
+
+static int RunUrmaMockConcurrentRpc(bool zerocopy) {
+    urma::g_skip_urma_init = false;
+    gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+    gflags::SetCommandLineOption("urma_buffer_count", "2048");
+    gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+    urma::GlobalUrmaInitializeOrDie();
+    if (!urma::GetUrmaContext()) {
+        return 10;
+    }
+    UrmaStreamEchoService service;
+    Server server;
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    if (server.AddService(&service, SERVER_DOESNT_OWN_SERVICE) != 0 ||
+        server.Start(0, &server_options) != 0) {
+        return 11;
+    }
+    Channel channel;
+    ChannelOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.protocol = "baidu_std";
+    options.timeout_ms = 3000;
+    options.max_retry = 0;
+    options.connection_type = "single";
+    if (channel.Init(server.listen_address(), &options) != 0) {
+        return 12;
+    }
+    std::atomic<int> errors(0);
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 4; ++worker) {
+        workers.emplace_back([&, worker]() {
+            test::EchoService::Stub stub(&channel);
+            for (int round = 0; round < 8; ++round) {
+                const size_t depth = 16;
+                std::vector<Controller> cntls(depth);
+                std::vector<test::EchoRequest> requests(depth);
+                std::vector<test::EchoResponse> responses(depth);
+                for (size_t i = 0; i < depth; ++i) {
+                    requests[i].set_message(std::to_string(worker) + ":" +
+                        std::to_string(round) + ":" + std::to_string(i));
+                    cntls[i].request_attachment().append(std::string(i * 13, 'x'));
+                    stub.Echo(&cntls[i], &requests[i], &responses[i], DoNothing());
+                }
+                for (size_t i = 0; i < depth; ++i) {
+                    Join(cntls[i].call_id());
+                    if (cntls[i].Failed() ||
+                        responses[i].message() != requests[i].message() ||
+                        cntls[i].response_attachment().to_string() !=
+                            cntls[i].request_attachment().to_string()) {
+                        ++errors;
+                    }
+                }
+                if (errors.load() != 0) {
+                    break;
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    SocketUniquePtr main_socket;
+    if (Socket::Address(channel._server_id, &main_socket) != 0 ||
+        AdapterTransport::Get(main_socket.get())->handshake_phase() !=
+            handshake::ESTABLISHED) {
+        ++errors;
+    }
+    server.Stop(0);
+    server.Join();
+    return errors.load() == 0 ? 0 : 13;
+}
+
+TEST_F(UrmaMockTest, concurrent_rpc_preserves_stream_boundaries) {
+    // Isolate the process-global pool/IOBuf hooks from tests which intentionally
+    // bypass URMA initialization. Threadsafe death tests exec a fresh process.
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockConcurrentRpc(true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, concurrent_copy_rpc_preserves_stream_boundaries) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockConcurrentRpc(false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+static int RunUrmaMockTracedRpc() {
+    gflags::SetCommandLineOption("urma_trace_stream", "true");
+    return RunUrmaMockConcurrentRpc(false);
+}
+
+static int RunUrmaMockOrderedRpc(bool zerocopy) {
+    if (gflags::SetCommandLineOption(
+            "urma_mock_require_send_order", "true").empty()) {
+        return 20;
+    }
+    // Exercise the real posting paths, including credit-only SEND_IMM WRs,
+    // rather than just checking a separately constructed flag value.
+    // A rejected ACK can exhaust credits. Bound this isolated subprocess so
+    // a regression fails the test instead of hanging the test runner.
+    alarm(10);
+    const int result = RunUrmaMockConcurrentRpc(zerocopy);
+    alarm(0);
+    return result;
+}
+
+TEST_F(UrmaMockTest, copy_rpc_requests_ordered_data_and_credit_sends) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockOrderedRpc(false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, zerocopy_rpc_requests_ordered_data_and_credit_sends) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockOrderedRpc(true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, traced_rpc_dumps_bounded_history_on_teardown) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockTracedRpc()),
+                ::testing::ExitedWithCode(0), "URMA_TRACE");
+}
+
+static int RunUrmaMockCtpLargeRpc(bool zerocopy, bool polling) {
+    // Isolated by ASSERT_EXIT: bound failures that stop credit progress.
+    alarm(15);
+    urma::g_skip_urma_init = false;
+    if (gflags::SetCommandLineOption("urma_mock_max_send_size", "4096").empty()) {
+        return 20;
+    }
+    gflags::SetCommandLineOption("urma_buffer_size", "8192");
+    gflags::SetCommandLineOption("urma_buffer_count", "2048");
+    gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+    gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+    gflags::SetCommandLineOption("urma_use_polling", polling ? "true" : "false");
+    urma::GlobalUrmaInitializeOrDie();
+    // The fix must split sends, not silently shrink receive/IOBuf blocks.
+    if (!urma::GetUrmaContext() || urma::GetUrmaRecvBlockSize() <= 4096) {
+        return 21;
+    }
+    UrmaStreamEchoService service;
+    Server server;
+    ServerOptions server_options;
+    server_options.socket_mode = SOCKET_MODE_URMA;
+    if (server.AddService(&service, SERVER_DOESNT_OWN_SERVICE) != 0 ||
+        server.Start(0, &server_options) != 0) {
+        return 22;
+    }
+    Channel channel;
+    ChannelOptions options;
+    options.socket_mode = SOCKET_MODE_URMA;
+    options.protocol = "baidu_std";
+    options.connection_type = "single";
+    options.timeout_ms = 3000;
+    options.max_retry = 0;
+    if (channel.Init(server.listen_address(), &options) != 0) {
+        return 23;
+    }
+    test::EchoService::Stub stub(&channel);
+    bool ok = true;
+    for (size_t size : {size_t(0), size_t(4095), size_t(4096), size_t(4097),
+                        size_t(8192), size_t(1048576), size_t(1048577)}) {
+        // A varying pattern catches omissions/reordering hidden by all-'a'
+        // attachments. 1 MiB crosses the 125-WR send-credit window repeatedly.
+        std::string expected(size, '\0');
+        for (size_t i = 0; i < size; ++i) {
+            expected[i] = static_cast<char>((i * 37 + i / 4096) % 251);
+        }
+        Controller cntl;
+        test::EchoRequest request;
+        test::EchoResponse response;
+        request.set_message("ctp-large-" + std::to_string(size));
+        cntl.request_attachment().append(expected);
+        stub.Echo(&cntl, &request, &response, nullptr);
+        if (cntl.Failed() || response.message() != request.message() ||
+            cntl.response_attachment().to_string() != expected) {
+            ok = false;
+            break;
+        }
+    }
+    SocketUniquePtr socket;
+    if (Socket::Address(channel._server_id, &socket) != 0 ||
+        AdapterTransport::Get(socket.get())->handshake_phase() !=
+            handshake::ESTABLISHED) {
+        ok = false;
+    }
+    server.Stop(0);
+    server.Join();
+    alarm(0);
+    return ok ? 0 : 24;
+}
+
+TEST_F(UrmaMockTest, ctp_large_copy_rpc_with_default_buffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(false, false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_zerocopy_rpc_with_default_buffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(true, false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_copy_rpc_with_polling) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(false, true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, ctp_large_zerocopy_rpc_with_polling) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockCtpLargeRpc(true, true)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+static int RunUrmaMalformedResponseTrace() {
+    GlobalInitializeOrDie();
+    gflags::SetCommandLineOption("urma_trace_stream", "true");
+    SocketOptions options;
+    options.user = get_or_new_client_side_messenger();
+    SocketId id;
+    if (Socket::Create(options, &id) != 0) {
+        return 10;
+    }
+    SocketUniquePtr socket;
+    if (Socket::Address(id, &socket) != 0) {
+        return 11;
+    }
+    struct FailSocket {
+        Socket* socket;
+        ~FailSocket() { socket->SetFailed(); }
+    } fail_socket{socket.get()};
+    socket->set_preferred_index(PROTOCOL_BAIDU_STD);
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._state.store(urma::UrmaEndpoint::ESTABLISHED,
+                          butil::memory_order_release);
+    const std::string bad = "BAD!";
+    urma_sge_t sge{reinterpret_cast<uint64_t>(bad.data()), 4, nullptr, nullptr};
+    endpoint._stream_trace->Record(urma::UrmaStreamTrace::RX_USE, 0, 1, 0, &sge, 1);
+    endpoint._input_processor.read_buf().append(bad);
+    endpoint.DispatchReceivedBytes(socket, bad.size());
+    return socket->Failed() ? 0 : 12;
+}
+
+TEST_F(UrmaMockTest, malformed_response_dumps_exact_bounded_prefix) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMalformedResponseTrace()),
+                ::testing::ExitedWithCode(0),
+                "reason=RPC parse failed buffered=4 parse_prefix=42414421");
+}
+
+static int RunUrmaMockReorderedReceives(bool zerocopy) {
+    urma::g_skip_urma_init = false;
+    gflags::SetCommandLineOption("urma_prepared_jetty_cnt", "0");
+    gflags::SetCommandLineOption("urma_buffer_count", "2048");
+    gflags::SetCommandLineOption("urma_recv_zerocopy", zerocopy ? "true" : "false");
+    gflags::SetCommandLineOption("urma_zerocopy_min_size", "0");
+    urma::GlobalUrmaInitializeOrDie();
+    if (!urma::GetUrmaContext()) {
+        return 10;
+    }
+    SocketId id;
+    SocketOptions options;
+    if (Socket::Create(options, &id) != 0) {
+        return 11;
+    }
+    SocketUniquePtr socket;
+    if (Socket::Address(id, &socket) != 0) {
+        return 12;
+    }
+    struct FailSocket {
+        Socket* socket;
+        ~FailSocket() { socket->SetFailed(); }
+    } fail_socket{socket.get()};
+    urma::UrmaEndpoint endpoint(socket.get());
+    endpoint._rq_size = 4;
+    endpoint._remote_window_capacity = 16;
+    endpoint._local_window_capacity = 16;
+    if (endpoint.AllocateResources() != 0 ||
+        endpoint.PostRecv(endpoint._rq_size, zerocopy) != 0) {
+        return 13;
+    }
+    const std::string payloads[] = {"PRPC", std::string("\x08\0", 2)};
+    for (int round = 0; round < 32; ++round) {
+        const size_t first = endpoint._rq_received;
+        const size_t ack_slot = (first + 1) % endpoint._rq_size;
+        const size_t second = (first + 2) % endpoint._rq_size;
+        memcpy(endpoint._rbuf_data[first], payloads[0].data(), payloads[0].size());
+        memcpy(endpoint._rbuf_data[second], payloads[1].data(), payloads[1].size());
+        urma_cr_t later{};
+        later.status = URMA_CR_SUCCESS;
+        later.flag.bs.s_r = 1;
+        later.opcode = URMA_CR_OPC_SEND;
+        later.user_ctx = second + 1;
+        later.completion_len = payloads[1].size();
+        // Let the pure credit ACK and the later payload complete before the
+        // first payload. Neither may consume the first payload's buffer.
+        urma_cr_t ack = later;
+        ack.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+        ack.user_ctx = ack_slot + 1;
+        ack.completion_len = 0;
+        ack.imm_data = 1;
+        endpoint._remote_rq_window_size.store(15, butil::memory_order_relaxed);
+        if (endpoint.HandleCompletion(ack) != 0 ||
+            endpoint._remote_rq_window_size.load(butil::memory_order_relaxed) != 15) {
+            return 17;
+        }
+        if (endpoint.HandleCompletion(later) != 0 ||
+            !endpoint._input_processor.read_buf().empty() ||
+            endpoint._rq_received != first) {
+            return 14;
+        }
+        // A duplicate must be rejected without consuming the queued payload.
+        if (endpoint.HandleCompletion(later) != -1 || errno != EPROTO) {
+            return 15;
+        }
+        urma_cr_t earlier = later;
+        earlier.user_ctx = first + 1;
+        earlier.completion_len = payloads[0].size();
+        if (endpoint.HandleCompletion(earlier) != 6 ||
+            endpoint._input_processor.read_buf().to_string() !=
+                payloads[0] + payloads[1] ||
+            endpoint._remote_rq_window_size.load(butil::memory_order_relaxed) != 16) {
+            return 16;
+        }
+        endpoint._input_processor.read_buf().clear();
+        // This test does not connect a peer; suppress credit-ACK posting.
+        endpoint._new_rq_wrs.store(0, butil::memory_order_relaxed);
+    }
+    return 0;
+}
+
+TEST_F(UrmaMockTest, reordered_receives_preserve_copy_stream) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockReorderedReceives(false)),
+                ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(UrmaMockTest, reordered_receives_preserve_zerocopy_stream) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(_exit(RunUrmaMockReorderedReceives(true)),
+                ::testing::ExitedWithCode(0), "");
+}
 
 TEST_F(UrmaMockTest, init_and_enumerate_device) {
     urma_init_attr_t init_attr{};
