@@ -18,6 +18,7 @@
 #ifndef BRPC_URMA_STREAM_TRACE_H
 #define BRPC_URMA_STREAM_TRACE_H
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -61,14 +62,16 @@ public:
     static Summary Summarize(const urma_sge_t* sges, size_t count) {
         Summary summary;
         for (size_t i = 0; i < count; ++i) {
-            const auto* bytes = reinterpret_cast<const unsigned char*>(sges[i].addr);
+            const auto* bytes =
+                reinterpret_cast<const unsigned char*>(sges[i].addr);
             for (uint32_t j = 0; j < sges[i].len; ++j) {
                 summary.hash ^= bytes[j];
                 summary.hash *= UINT64_C(1099511628211);
             }
             if (summary.length < PREFIX_SIZE) {
                 const size_t room = PREFIX_SIZE - summary.length;
-                summary.prefix += HexPrefix(bytes, sges[i].len < room ? sges[i].len : room);
+                const size_t prefix_len = std::min<size_t>(sges[i].len, room);
+                summary.prefix += HexPrefix(bytes, prefix_len);
             }
             summary.length += sges[i].len;
         }
