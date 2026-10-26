@@ -30,6 +30,7 @@
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma/rdma_helper.h"
+#include "brpc/rdma/rdma_recovery_policy.h"
 
 
 namespace butil {
@@ -313,8 +314,10 @@ static void OnRdmaAsyncEvent(Socket* m) {
         }
         case IBV_EVENT_PORT_ACTIVE:
         case IBV_EVENT_PORT_ERR: {
-            // Port up/down will lead these two events.
-            // The port error is recoverable.
+            if (event.element.port_num == g_port_num) {
+                GlobalRdmaRecoveryPolicy().ReportPortState(
+                    event.event_type == IBV_EVENT_PORT_ACTIVE);
+            }
             IbvAckAsyncEvent(&event);
             break;
         }
@@ -697,6 +700,11 @@ uint8_t GetRdmaPortNum() {
 
 bool IsRdmaAvailable() {
     return g_rdma_available.load(butil::memory_order_acquire);
+}
+
+bool IsRdmaPathFailure(ibv_wc_status status) {
+    return status == IBV_WC_RETRY_EXC_ERR ||
+           status == IBV_WC_RNR_RETRY_EXC_ERR;
 }
 
 void GlobalDisableRdma() {

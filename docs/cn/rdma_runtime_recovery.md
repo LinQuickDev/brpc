@@ -19,7 +19,33 @@ under the License.
 
 # RDMA 运行期故障恢复与 TCP 降级设计
 
-设计提案，基于 LinQuickDev/brpc master 的 `87d498dd62d8b3b3562407cdf38ac0c475d312b3`。
+基于 LinQuickDev/brpc master 的 `87d498dd62d8b3b3562407cdf38ac0c475d312b3`。
+
+## 首版实现
+
+`RdmaRecoveryPolicy` 已接入客户端和服务端握手入口，控制新连接的 RDMA 准入：
+
+- LEGACY 为默认模式，沿用现有行为；TCP_ONLY 让新连接使用 TCP。
+- AUTO 下，客户端收到 RETRY_EXC / RNR_RETRY_EXC 后，按远端地址冷却 5 秒。
+- 当前设备的 PORT_ERR 阻止新 RDMA 建链，端口恢复且冷却结束后重新准入。
+- 对端冷却缓存最多 1024 项，满时淘汰最早到期项；模式切换用 epoch 过滤旧连接错误。
+
+通过进程级 API 配置：
+
+```cpp
+#include "brpc/rdma/rdma_recovery_policy.h"
+
+brpc::rdma::SetRdmaRecoveryCooldownMs(5000);
+brpc::rdma::SetRdmaRecoveryMode(brpc::rdma::RdmaRecoveryMode::AUTO);
+// 运维降级
+brpc::rdma::SetRdmaRecoveryMode(brpc::rdma::RdmaRecoveryMode::TCP_ONLY);
+```
+
+当前模式切换作用于新建连接，存量连接继续使用已协商的传输。
+冷却到期后重新开放准入，TCP 连接沿用现有复用与重建机制。
+后续迭代增加存量连接退休、单连接探测、指数退避、发送 watchdog 和多端口主备。
+
+以下为完整方案。
 
 ## 当前问题
 

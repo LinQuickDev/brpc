@@ -29,6 +29,7 @@
 #include "brpc/reloadable_flags.h"
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_helper.h"
+#include "brpc/rdma/rdma_recovery_policy.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma_transport.h"
 #include "brpc/rdma/rdma_handshake.h"
@@ -131,6 +132,7 @@ RdmaEndpoint::RdmaEndpoint(Socket* s)
     : _socket(s)
     , _state(UNINIT)
     , _handshake_version(0)
+    , _recovery_epoch(0)
     , _resource(nullptr)
     , _send_cq_events(0)
     , _recv_cq_events(0)
@@ -178,6 +180,7 @@ void RdmaEndpoint::Reset() {
 
     _state.store(UNINIT, butil::memory_order_relaxed);
     _handshake_version = 0;
+    _recovery_epoch = 0;
     _outgoing_ece.reset();
     _resource = nullptr;
     _send_cq_events = 0;
@@ -212,7 +215,10 @@ void RdmaConnect::StartConnect(const Socket* socket,
     if (Socket::Address(socket->id(), &s) != 0) {
         return;
     }
-    if (!IsRdmaAvailable()) {
+    if (!IsRdmaAvailable() ||
+        !GlobalRdmaRecoveryPolicy().AllowNewConnection(
+            butil::endpoint2str(socket->remote_side()).c_str(),
+            &rdma_transport->_rdma_ep->_recovery_epoch)) {
         rdma_transport->_rdma_state = RdmaTransport::RDMA_OFF;
         rdma_transport->_rdma_ep->_state.store(
             RdmaEndpoint::FALLBACK_TCP, butil::memory_order_release);
@@ -683,7 +689,9 @@ ParseResult RdmaEndpoint::ExecuteServerHandshake(butil::IOBuf* source, Socket* s
         }
 
         // Negotiate + allocate resources.
-        bool negotiated = r == RemoteHelloResult::NEGOTIATED;
+        bool negotiated = r == RemoteHelloResult::NEGOTIATED &&
+            GlobalRdmaRecoveryPolicy().AllowNewConnection(
+                "", &ep->_recovery_epoch);
         if (negotiated) {
             ep->ApplyRemoteHello(remote);
             ep->_state.store(S_ALLOC_QPCQ, butil::memory_order_relaxed);
@@ -1812,6 +1820,11 @@ void RdmaEndpoint::PollCq(Socket* m) {
             }
 
             if (wc[i].status != IBV_WC_SUCCESS) {
+                if (s->CreatedByConnect() && IsRdmaPathFailure(wc[i].status)) {
+                    GlobalRdmaRecoveryPolicy().ReportPeerFailure(
+                        butil::endpoint2str(s->remote_side()).c_str(),
+                        ep->_recovery_epoch);
+                }
                 PLOG(WARNING) << "Fail to handle RDMA completion, error status("
                               << wc[i].status << "): " << s->description();
                 s->SetFailed(ERDMA, "RDMA completion error(%d) from %s: %s",

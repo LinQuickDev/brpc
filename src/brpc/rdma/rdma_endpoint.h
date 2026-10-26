@@ -307,6 +307,9 @@ private:
     //   3 = v3 "RDM3"
     int _handshake_version;
 
+    // Admission epoch used to discard failures from an earlier recovery mode.
+    uint64_t _recovery_epoch;
+
     // ECE payload to advertise in the next local hello:
     //   Client: the locally queried ECE capabilities (filled
     //           before C_HELLO_SEND);
