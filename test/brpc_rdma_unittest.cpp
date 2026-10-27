@@ -3426,6 +3426,11 @@ TEST_F(RdmaAdmissionTest, rnr_completion_cools_peer_before_tcp_rpc) {
     rdma::FLAGS_rdma_use_polling = true;
 
     rdma::RdmaEndpoint::PollCq(cq_socket.get());
+    const auto first_report = rdma::GetRdmaRecoveryStatus();
+    ep->ReportFailure(rdma::RdmaFailureReason::QP_FATAL);
+    EXPECT_EQ(first_report.failures[static_cast<size_t>(rdma::RdmaFailureReason::QP_FATAL)],
+              rdma::GetRdmaRecoveryStatus().failures[
+                  static_cast<size_t>(rdma::RdmaFailureReason::QP_FATAL)]);
     EXPECT_TRUE(delivered);
     EXPECT_TRUE(socket->Failed());
     EXPECT_FALSE(policy.AllowNewConnection(peer));
@@ -3477,6 +3482,108 @@ TEST(RdmaCompletionRecoveryTest, classifies_path_failures) {
     EXPECT_FALSE(rdma::IsRdmaPathFailure(IBV_WC_WR_FLUSH_ERR));
     EXPECT_FALSE(rdma::IsRdmaPathFailure(IBV_WC_LOC_PROT_ERR));
     EXPECT_FALSE(rdma::IsRdmaPathFailure(IBV_WC_REM_ACCESS_ERR));
+}
+
+TEST_F(RdmaAdmissionTest, async_errors_validate_owner_and_report_once) {
+    for (ibv_event_type type : {IBV_EVENT_QP_FATAL, IBV_EVENT_CQ_ERR,
+                               IBV_EVENT_QP_ACCESS_ERR}) {
+        rdma::SetRdmaRecoveryMode(rdma::RdmaRecoveryMode::LEGACY);
+        rdma::SetRdmaRecoveryMode(rdma::RdmaRecoveryMode::AUTO);
+        SocketOptions options;
+        options.socket_mode = SOCKET_MODE_RDMA;
+        options.remote_side = g_ep;
+        options.user = get_client_side_messenger();
+        SocketId sid;
+        ASSERT_EQ(0, Socket::Create(options, &sid));
+        SocketUniquePtr socket;
+        ASSERT_EQ(0, Socket::Address(sid, &socket));
+        auto* ep = RdmaTransportOf(socket)->_rdma_ep;
+        auto& policy = rdma::GlobalRdmaRecoveryPolicy();
+        const std::string peer = butil::endpoint2str(g_ep).c_str();
+        ASSERT_TRUE(policy.AllowNewConnection(peer, &ep->_recovery_epoch));
+        ibv_qp qp{};
+        ibv_qp other_qp{};
+        ibv_cq cq{};
+        ibv_cq other_cq{};
+        rdma::RdmaResource resource;
+        resource.qp = &qp;
+        resource.polling_cq = &cq;
+        ep->_resource = &resource;
+        ep->BindResourceToSocket();
+        EXPECT_EQ(sid, reinterpret_cast<SocketId>(qp.qp_context));
+        EXPECT_EQ(sid, reinterpret_cast<SocketId>(cq.cq_context));
+        ep->_state.store(rdma::RdmaEndpoint::ESTABLISHED);
+        const auto before = policy.GetStatus();
+        ibv_async_event event{};
+        event.event_type = type;
+        if (type == IBV_EVENT_CQ_ERR) {
+            event.element.cq = &other_cq;
+        } else {
+            event.element.qp = &other_qp;
+        }
+        rdma::RdmaEndpoint::OnAsyncError(socket.get(), event);
+        EXPECT_FALSE(socket->Failed());
+        if (type == IBV_EVENT_CQ_ERR) {
+            event.element.cq = &cq;
+        } else {
+            event.element.qp = &qp;
+        }
+        rdma::RdmaEndpoint::OnAsyncError(socket.get(), event);
+        EXPECT_TRUE(socket->Failed());
+        const auto reason = type == IBV_EVENT_CQ_ERR ? rdma::RdmaFailureReason::CQ_ERROR :
+            type == IBV_EVENT_QP_FATAL ? rdma::RdmaFailureReason::QP_FATAL :
+                                      rdma::RdmaFailureReason::ACCESS_ERROR;
+        EXPECT_EQ(before.failures[static_cast<size_t>(reason)] + 1,
+                  policy.GetStatus().failures[static_cast<size_t>(reason)]);
+        EXPECT_EQ(type == IBV_EVENT_QP_ACCESS_ERR, policy.AllowNewConnection(peer));
+        ep->ReportFailure(rdma::RdmaFailureReason::RNR);
+        EXPECT_EQ(before.failures[static_cast<size_t>(rdma::RdmaFailureReason::RNR)],
+                  policy.GetStatus().failures[static_cast<size_t>(rdma::RdmaFailureReason::RNR)]);
+        const std::string exposed = bvar::Variable::describe_exposed("rdma_recovery_status");
+        EXPECT_NE(std::string::npos, exposed.find("failures"));
+        EXPECT_NE(std::string::npos, exposed.find("qp_fatal"));
+        ep->_resource = nullptr;
+        resource.qp = nullptr;
+        resource.polling_cq = nullptr;
+    }
+}
+
+static int FailAckPost(ibv_qp*, ibv_send_wr*, ibv_send_wr**) {
+    return EIO;
+}
+
+TEST_F(RdmaAdmissionTest, ack_post_error_propagates_and_cools_peer) {
+    SocketOptions options;
+    options.socket_mode = SOCKET_MODE_RDMA;
+    options.remote_side = g_ep;
+    options.user = get_client_side_messenger();
+    SocketId sid;
+    ASSERT_EQ(0, Socket::Create(options, &sid));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(sid, &socket));
+    auto* ep = RdmaTransportOf(socket)->_rdma_ep;
+    auto& policy = rdma::GlobalRdmaRecoveryPolicy();
+    const std::string peer = butil::endpoint2str(g_ep).c_str();
+    ASSERT_TRUE(policy.AllowNewConnection(peer, &ep->_recovery_epoch));
+    ibv_context context{};
+    context.ops.post_send = FailAckPost;
+    ibv_qp qp{};
+    qp.context = &context;
+    rdma::RdmaResource resource;
+    resource.qp = &qp;
+    ep->_resource = &resource;
+    ep->_state.store(rdma::RdmaEndpoint::ESTABLISHED);
+    ep->_remote_window_capacity = 0;
+    ep->_new_rq_wrs.store(1);
+    ibv_wc wc{};
+    wc.opcode = IBV_WC_SEND;
+    EXPECT_EQ(-1, ep->HandleCompletion(wc));
+    EXPECT_EQ(EIO, errno);
+    EXPECT_FALSE(policy.AllowNewConnection(peer));
+    EXPECT_EQ(rdma::RdmaFailureReason::SEND_POST, ep->_runtime_failure.load());
+    ep->_resource = nullptr;
+    resource.qp = nullptr;
+    socket->SetFailed();
 }
 
 #endif  // if BRPC_WITH_RDMA

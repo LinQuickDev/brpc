@@ -29,6 +29,12 @@ under the License.
 - AUTO 下，客户端收到 RETRY_EXC / RNR_RETRY_EXC 后，按远端地址冷却 5 秒。
 - 当前设备的 PORT_ERR 阻止新 RDMA 建链，端口恢复且冷却结束后重新准入。
 - 对端冷却缓存最多 1024 项，满时淘汰最早到期项；模式切换用 epoch 过滤旧连接错误。
+- 故障上报覆盖 QP/CQ 异步错误、CQ 轮询/事件/通知错误及链路类发送错误，同一连接只计一次。
+- QP/CQ 绑定所属 socket，异步事件核对当前资源；发生运行期错误的资源直接释放。
+
+`GetRdmaRecoveryStatus()` 和 `/vars/rdma_recovery_*` 暴露冷却状态、分原因故障计数、
+TCP 回落准入数及 RDMA 协商数。实机步骤见
+[RDMA 双机故障恢复测试](../../example/rdma_performance/RECOVERY.md)。
 
 通过进程级 API 配置：
 

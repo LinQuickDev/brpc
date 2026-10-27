@@ -269,7 +269,7 @@ static void OnRdmaAsyncEvent(Socket* m) {
             SocketId sid = (SocketId)event.element.qp->qp_context;
             SocketUniquePtr s;
             if (Socket::Address(sid, &s) == 0) {
-                s->SetFailed(ERDMA, "QP fatal error");
+                RdmaEndpoint::OnAsyncError(s.get(), event);
                 LOG(WARNING) << "Receive a QP fatal error on " << s->description();
             }
             // NOTE:
@@ -281,7 +281,11 @@ static void OnRdmaAsyncEvent(Socket* m) {
             break;
         }
         case IBV_EVENT_CQ_ERR: {
-            LOG(WARNING) << "CQ overruns, the connection will be stopped.";
+            SocketUniquePtr s;
+            const SocketId sid = reinterpret_cast<SocketId>(event.element.cq->cq_context);
+            if (Socket::Address(sid, &s) == 0) {
+                RdmaEndpoint::OnAsyncError(s.get(), event);
+            }
             IbvAckAsyncEvent(&event);
             break;
         }

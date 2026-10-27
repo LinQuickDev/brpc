@@ -151,6 +151,36 @@ TEST_F(RdmaRecoveryTest, concurrent_admission_failure_and_mode_change) {
     EXPECT_FALSE(policy.AllowNewConnection(""));
 }
 
+TEST_F(RdmaRecoveryTest, reports_reasons_and_admission_counters) {
+    policy.SetMode(RdmaRecoveryMode::AUTO);
+    uint64_t epoch;
+    policy.AllowNewConnection("a", &epoch);
+    policy.RecordNegotiatedConnection(epoch);
+    policy.ReportPeerFailure("a", epoch, RdmaFailureReason::QP_FATAL);
+    EXPECT_FALSE(policy.AllowNewConnection("a"));
+    auto status = policy.GetStatus();
+    EXPECT_EQ(1u, status.cooled_peers);
+    EXPECT_EQ(1u, status.negotiated_connections);
+    EXPECT_EQ(1u, status.peer_cooldown_admissions);
+    EXPECT_EQ(1u, status.failures[static_cast<size_t>(RdmaFailureReason::QP_FATAL)]);
+    policy.ReportPeerFailure("b", epoch, RdmaFailureReason::ACCESS_ERROR);
+    EXPECT_TRUE(policy.AllowNewConnection("b"));
+    policy.ReportPortState(false);
+    EXPECT_FALSE(policy.AllowNewConnection("b"));
+    status = policy.GetStatus();
+    EXPECT_FALSE(status.port_active);
+    EXPECT_EQ(5000, status.port_cooldown_ms);
+    EXPECT_EQ(1u, status.port_errors);
+    EXPECT_EQ(1u, status.port_cooldown_admissions);
+    now_us += 5000000;
+    EXPECT_EQ(0u, policy.GetStatus().cooled_peers);
+    policy.SetMode(RdmaRecoveryMode::TCP_ONLY);
+    EXPECT_FALSE(policy.AllowNewConnection("b"));
+    EXPECT_EQ(1u, policy.GetStatus().tcp_only_admissions);
+    policy.ReportPeerFailure("b", epoch, RdmaFailureReason::CQ_ERROR);
+    EXPECT_EQ(0u, policy.GetStatus().failures[static_cast<size_t>(RdmaFailureReason::CQ_ERROR)]);
+}
+
 }  // namespace
 }  // namespace rdma
 }  // namespace brpc

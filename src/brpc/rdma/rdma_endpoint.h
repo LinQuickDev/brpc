@@ -32,6 +32,7 @@
 #include "butil/containers/optional.h"
 #include "brpc/socket.h"
 #include "brpc/rdma/rdma_handshake_server.h"
+#include "brpc/rdma/rdma_recovery_policy.h"
 
 
 namespace brpc {
@@ -136,6 +137,9 @@ public:
     // Real handshake for RDMA-mode sockets.
     static ParseResult ExecuteServerHandshake(butil::IOBuf* source, Socket* socket);
 
+    // Called with an addressed Socket held until its async event is acknowledged.
+    static void OnAsyncError(Socket* socket, const ibv_async_event& event);
+
     // Initialize polling mode
     static int PollingModeInitialize(bthread_tag_t tag,
                                      std::function<void(void)> callback,
@@ -145,6 +149,9 @@ public:
     static void PollingModeRelease(bthread_tag_t tag);
 
 private:
+    void ReportFailure(RdmaFailureReason reason);
+    void BindResourceToSocket();
+
     enum State {
         UNINIT = 0x0,
         C_ALLOC_QPCQ = 0x1,
@@ -309,6 +316,7 @@ private:
 
     // Admission epoch used to discard failures from an earlier recovery mode.
     uint64_t _recovery_epoch;
+    butil::atomic<RdmaFailureReason> _runtime_failure;
 
     // ECE payload to advertise in the next local hello:
     //   Client: the locally queried ECE capabilities (filled
