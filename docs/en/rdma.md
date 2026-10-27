@@ -1,3 +1,21 @@
+# Business-level QoS
+
+Set `ChannelOptions.rdma_qos.service_level` (0–15) and
+`ChannelOptions.rdma_qos.traffic_class` (0–255) for outbound requests.
+Both default to 0. Traffic Class is the full GRH/IP byte, including DSCP and ECN.
+Set `ServerOptions.rdma_qos` independently for outbound responses.
+
+Different SL or Traffic Class values use separate connections and QPs, while equal
+settings can share connections. Settings follow pooled and short sockets and are
+applied whenever the QP is brought up. V2/V3 handshake formats stay the same.
+TCP transports retain their existing settings.
+
+The fabric defines how SL maps to VLs and scheduling priority. For RoCE, configure
+the NIC and switch PCP/DSCP mappings to match the deployment. The performance
+client/server accept `--rdma_sl` and `--rdma_traffic_class`; socket diagnostics show
+both applied values. Validate QP attributes and packet markings on hardware before
+comparing throughput and P99 under competing workloads.
+
 # Build
 
 Since RDMA requires driver and hardware support, only the build on linux is verified.

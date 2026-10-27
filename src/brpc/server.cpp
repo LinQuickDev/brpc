@@ -875,6 +875,11 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
     const ServerOptions default_opt;
     const ServerOptions& real_opt = opt ? *opt : default_opt;
 
+    if (real_opt.socket_mode == SOCKET_MODE_RDMA && !real_opt.rdma_qos.IsValid()) {
+        LOG(ERROR) << "RDMA SL must be in [0,15] and traffic class in [0,255]";
+        return -1;
+    }
+
     if (!real_opt.h2_settings.IsValid(true/*log_error*/)) {
         LOG(ERROR) << "Invalid h2_settings";
         return -1;
@@ -1162,6 +1167,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
             _am->_socket_mode = _options.socket_mode;
             _am->_bthread_tag = _options.bthread_tag;
         }
+        _am->_rdma_qos = _options.rdma_qos;
         // Set `_status' to RUNNING before accepting connections
         // to prevent requests being rejected as ELOGOFF
         _status = RUNNING;

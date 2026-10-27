@@ -78,7 +78,8 @@ ChannelSSLOptions* ChannelOptions::mutable_ssl_options() {
 }
 
 static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
-    if (opt.auth == nullptr &&
+    if (opt.socket_mode == SOCKET_MODE_TCP &&
+        opt.auth == nullptr &&
         !opt.has_ssl_options() &&
         opt.client_host.empty() &&
         opt.device_name.empty() &&
@@ -139,6 +140,8 @@ static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
         }
         if (opt.socket_mode == SOCKET_MODE_RDMA) {
             buf.append("|rdma");
+            buf.append("|sl=").append(std::to_string(opt.rdma_qos.service_level));
+            buf.append("|tc=").append(std::to_string(opt.rdma_qos.traffic_class));
         } else if (opt.socket_mode == SOCKET_MODE_URMA) {
             buf.append("|urma");
         }
@@ -186,6 +189,10 @@ Channel::~Channel() {
 int Channel::InitChannelOptions(const ChannelOptions* options) {
     if (options) {  // Override default options if user provided one.
         _options = *options;
+    }
+    if (_options.socket_mode == SOCKET_MODE_RDMA && !_options.rdma_qos.IsValid()) {
+        LOG(ERROR) << "RDMA SL must be in [0,15] and traffic class in [0,255]";
+        return -1;
     }
     const Protocol* protocol = FindProtocol(_options.protocol);
     if (nullptr == protocol || !protocol->support_client()) {
@@ -407,6 +414,7 @@ int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
     opt.local_side = client_endpoint;
     opt.initial_ssl_ctx = ssl_ctx;
     opt.socket_mode = _options.socket_mode;
+    opt.rdma_qos = _options.rdma_qos;
     opt.hc_option = _options.hc_option;
     opt.device_name = _options.device_name;
     if (SocketMapInsert(SocketMapKey(server_addr_and_port, sig),
@@ -453,6 +461,7 @@ int Channel::Init(const char* ns_url,
     ns_opt.succeed_without_server = _options.succeed_without_server;
     ns_opt.log_succeed_without_server = _options.log_succeed_without_server;
     ns_opt.socket_option.socket_mode = _options.socket_mode;
+    ns_opt.socket_option.rdma_qos = _options.rdma_qos;
     ns_opt.channel_signature = ComputeChannelSignature(_options);
     ns_opt.socket_option.hc_option =  _options.hc_option;
     ns_opt.socket_option.local_side = client_endpoint;
