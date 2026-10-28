@@ -31,7 +31,7 @@ enum class RdmaRecoveryMode { LEGACY, AUTO, TCP_ONLY };
 
 enum class RdmaFailureReason {
     NONE, RETRY_EXHAUSTED, RNR, QP_FATAL, CQ_ERROR, CQ_POLL,
-    CQ_EVENT, CQ_NOTIFY, SEND_POST, ACCESS_ERROR, COUNT
+    CQ_EVENT, CQ_NOTIFY, SEND_POST, ACCESS_ERROR, TRANSPORT_ERROR, RECV_POST, COUNT
 };
 
 const char* RdmaFailureReasonName(RdmaFailureReason reason);

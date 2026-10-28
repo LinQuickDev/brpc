@@ -92,3 +92,11 @@ RNR 测试需要接收端故障注入，暂停补充接收 WR 并突破接收 cr
 使用 `--use_rdma=false` 与 TCP 服务端可做无网卡烟测。
 客户端退出码 0 表示至少一次 RPC 成功，2 表示整个测试均失败；故障窗口内的失败数单独查看。
 验收记录故障前后成功率、恢复时延和各原因计数；性能基线使用原 performance client。
+
+## URMA
+
+链接启用 URMA 的 brpc，服务端配置 `ServerOptions.socket_mode = SOCKET_MODE_URMA`，
+客户端增加 `--transport=urma`。`--mode`、`--mode_file`、`--cooldown_ms` 和连接类型沿用上述配置。
+CSV 的 `transport_negotiated` 记录选定传输的协商数，诊断入口使用 `/vars/urma_recovery_*`。
+断开 URMA 数据路径并保持 TCP 可达，观察重试耗尽或 RNR 计数、对端冷却和后续 TCP 调用；
+冷却到期后使用 short 连接验证 URMA 重新准入。

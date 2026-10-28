@@ -207,3 +207,32 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+## Runtime recovery
+
+Configure admission for new connections with the process-level API:
+
+```cpp
+#include "brpc/urma/urma_recovery_policy.h"
+
+brpc::urma::SetUrmaRecoveryCooldownMs(5000);
+brpc::urma::SetUrmaRecoveryMode(brpc::urma::UrmaRecoveryMode::AUTO);
+```
+
+LEGACY is the default. AUTO cools a client peer for five seconds after retry
+exhaustion, RNR, JFC errors or WR submission failures. New connections use TCP
+during cooldown. TCP_ONLY selects TCP for new connections. Servers decline
+URMA through the v2/v3 hello and continue processing TCP requests.
+
+URMA and RDMA keep separate modes, epochs, cooldown caches and metrics.
+Each connection reports its first runtime failure; mode changes filter reports
+from older epochs. Access errors are counted separately, flush completions do
+not add a root cause, and exhausted SQ/receive credits retain EAGAIN backpressure.
+ACK submission failures propagate to connection error handling.
+
+GetUrmaRecoveryStatus() and /vars/urma_recovery_status expose failure reasons,
+cooldown state and negotiation counts. /vars/urma_recovery_tcp_fallback_admissions
+counts TCP admissions. Mode changes apply to new connections. Existing connections
+keep their negotiated transport; URMA admission resumes after cooldown.
+
+`example/rdma_performance/recovery_client --transport=urma` supports `--mode`, `--mode_file` and CSV statistics for two-host fault injection.

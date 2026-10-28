@@ -16,6 +16,7 @@
 // under the License.
 
 #include "brpc/rdma/rdma_recovery_policy.h"
+#include "brpc/urma/urma_recovery_policy.h"
 #include "butil/time.h"
 #include "bvar/passive_status.h"
 
@@ -34,6 +35,8 @@ const char* RdmaFailureReasonName(RdmaFailureReason reason) {
     case RdmaFailureReason::CQ_NOTIFY: return "cq_notify";
     case RdmaFailureReason::SEND_POST: return "send_post";
     case RdmaFailureReason::ACCESS_ERROR: return "access_error";
+    case RdmaFailureReason::TRANSPORT_ERROR: return "transport_error";
+    case RdmaFailureReason::RECV_POST: return "recv_post";
     default: return "unknown";
     }
 }
@@ -198,9 +201,10 @@ static void DescribeRecovery(std::ostream& os, void* arg) {
 }
 
 struct RecoveryMetrics {
-    explicit RecoveryMetrics(RdmaRecoveryPolicy* policy)
-        : status("rdma_recovery_status", DescribeRecovery, policy)
-        , fallbacks("rdma_recovery_tcp_fallback_admissions", [](void* arg) {
+    RecoveryMetrics(RdmaRecoveryPolicy* policy, const char* status_name,
+                    const char* fallback_name)
+        : status(status_name, DescribeRecovery, policy)
+        , fallbacks(fallback_name, [](void* arg) {
             const auto s = static_cast<RdmaRecoveryPolicy*>(arg)->GetStatus();
             return s.tcp_only_admissions + s.port_cooldown_admissions +
                    s.peer_cooldown_admissions;
@@ -214,7 +218,8 @@ RdmaRecoveryPolicy& GlobalRdmaRecoveryPolicy() {
     // Async event callbacks may outlive ordinary static destructors.
     static RdmaRecoveryPolicy* policy =
         new RdmaRecoveryPolicy(butil::monotonic_time_us);
-    static RecoveryMetrics* metrics = new RecoveryMetrics(policy);
+    static RecoveryMetrics* metrics = new RecoveryMetrics(
+        policy, "rdma_recovery_status", "rdma_recovery_tcp_fallback_admissions");
     (void)metrics;
     return *policy;
 }
@@ -236,4 +241,33 @@ RdmaRecoveryStatus GetRdmaRecoveryStatus() {
 }
 
 }  // namespace rdma
+
+namespace urma {
+
+UrmaRecoveryPolicy& GlobalUrmaRecoveryPolicy() {
+    static UrmaRecoveryPolicy* policy =
+        new UrmaRecoveryPolicy(butil::monotonic_time_us);
+    static rdma::RecoveryMetrics* metrics = new rdma::RecoveryMetrics(
+        policy, "urma_recovery_status", "urma_recovery_tcp_fallback_admissions");
+    (void)metrics;
+    return *policy;
+}
+
+bool SetUrmaRecoveryMode(UrmaRecoveryMode mode) {
+    return GlobalUrmaRecoveryPolicy().SetMode(mode);
+}
+
+UrmaRecoveryMode GetUrmaRecoveryMode() {
+    return GlobalUrmaRecoveryPolicy().GetMode();
+}
+
+bool SetUrmaRecoveryCooldownMs(int64_t cooldown_ms) {
+    return GlobalUrmaRecoveryPolicy().SetCooldownMs(cooldown_ms);
+}
+
+UrmaRecoveryStatus GetUrmaRecoveryStatus() {
+    return GlobalUrmaRecoveryPolicy().GetStatus();
+}
+
+}  // namespace urma
 }  // namespace brpc

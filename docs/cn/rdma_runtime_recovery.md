@@ -51,6 +51,12 @@ brpc::rdma::SetRdmaRecoveryMode(brpc::rdma::RdmaRecoveryMode::TCP_ONLY);
 冷却到期后重新开放准入，TCP 连接沿用现有复用与重建机制。
 后续迭代增加存量连接退休、单连接探测、指数退避、发送 watchdog 和多端口主备。
 
+## URMA 适配
+
+URMA 复用准入算法，独立维护模式、epoch、对端缓存和 `urma_recovery_*` 指标。
+接入完成错误、JFC 轮询/事件/通知错误及 WR 提交失败，支持 v2/v3 服务端协商降级。
+配置与行为见 [URMA 运行期故障恢复](urma.md#运行期故障恢复)。
+
 以下为完整方案。
 
 ## 当前问题

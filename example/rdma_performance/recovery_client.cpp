@@ -24,6 +24,7 @@
 #include "brpc/controller.h"
 #include "brpc/server.h"
 #include "brpc/rdma/rdma_recovery_policy.h"
+#include "brpc/urma/urma_recovery_policy.h"
 #include "butil/time.h"
 #include "test.pb.h"
 
@@ -32,6 +33,7 @@ DEFINE_string(mode, "auto", "Initial mode: legacy, auto, tcp_only");
 DEFINE_string(mode_file, "", "Read a recovery mode from this file while running");
 DEFINE_string(connection_type, "short", "short exercises new admission on each RPC");
 DEFINE_bool(use_rdma, true, "Use RDMA; false runs a TCP smoke test");
+DEFINE_string(transport, "", "rdma, urma or tcp; empty uses --use_rdma");
 DEFINE_int32(seconds, 60, "Duration of the fault-injection run");
 DEFINE_int32(interval_ms, 100, "Pause between RPCs");
 DEFINE_int32(timeout_ms, 1000, "RPC deadline");
@@ -40,29 +42,43 @@ DEFINE_int32(dummy_port, 8001, "Local /vars port; 0 disables it");
 
 static bool SetMode(const std::string& value) {
     using brpc::rdma::RdmaRecoveryMode;
+    RdmaRecoveryMode mode;
     if (value == "legacy") {
-        return brpc::rdma::SetRdmaRecoveryMode(RdmaRecoveryMode::LEGACY);
+        mode = RdmaRecoveryMode::LEGACY;
+    } else if (value == "auto") {
+        mode = RdmaRecoveryMode::AUTO;
+    } else if (value == "tcp_only") {
+        mode = RdmaRecoveryMode::TCP_ONLY;
+    } else {
+        return false;
     }
-    if (value == "auto") {
-        return brpc::rdma::SetRdmaRecoveryMode(RdmaRecoveryMode::AUTO);
-    }
-    if (value == "tcp_only") {
-        return brpc::rdma::SetRdmaRecoveryMode(RdmaRecoveryMode::TCP_ONLY);
-    }
-    return false;
+    return FLAGS_transport == "urma" ? brpc::urma::SetUrmaRecoveryMode(mode) :
+                                       brpc::rdma::SetRdmaRecoveryMode(mode);
 }
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    if (FLAGS_transport.empty()) {
+        FLAGS_transport = FLAGS_use_rdma ? "rdma" : "tcp";
+    }
+    if (FLAGS_transport != "rdma" && FLAGS_transport != "urma" &&
+        FLAGS_transport != "tcp") {
+        std::cerr << "Invalid transport\n";
+        return 1;
+    }
+    const bool cooldown_ok = FLAGS_transport == "urma" ?
+        brpc::urma::SetUrmaRecoveryCooldownMs(FLAGS_cooldown_ms) :
+        brpc::rdma::SetRdmaRecoveryCooldownMs(FLAGS_cooldown_ms);
     if (FLAGS_seconds <= 0 || FLAGS_interval_ms < 0 || FLAGS_timeout_ms <= 0 ||
-        !brpc::rdma::SetRdmaRecoveryCooldownMs(FLAGS_cooldown_ms) ||
+        !cooldown_ok ||
         !SetMode(FLAGS_mode)) {
         std::cerr << "Invalid duration, interval, timeout, cooldown or mode\n";
         return 1;
     }
     brpc::Channel channel;
     brpc::ChannelOptions options;
-    options.socket_mode = FLAGS_use_rdma ? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
+    options.socket_mode = FLAGS_transport == "urma" ? brpc::SOCKET_MODE_URMA :
+        FLAGS_transport == "rdma" ? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
     options.connection_type = FLAGS_connection_type;
     options.timeout_ms = FLAGS_timeout_ms;
     options.connect_timeout_ms = FLAGS_timeout_ms;
@@ -78,7 +94,7 @@ int main(int argc, char* argv[]) {
     uint64_t failed = 0;
     const int64_t start = butil::monotonic_time_us();
     int64_t next_report = start;
-    std::cout << "seconds,mode,success,failure,rdma_negotiated,tcp_fallback_admissions,"
+    std::cout << "seconds,mode,success,failure,transport_negotiated,tcp_fallback_admissions,"
                  "cooled_peers,port_active,port_cooldown_ms\n";
     while (!brpc::IsAskedToQuit() &&
            butil::monotonic_time_us() - start < static_cast<int64_t>(FLAGS_seconds) * 1000000) {
@@ -106,7 +122,8 @@ int main(int argc, char* argv[]) {
         }
         const int64_t now = butil::monotonic_time_us();
         if (now >= next_report) {
-            const auto s = brpc::rdma::GetRdmaRecoveryStatus();
+            const auto s = FLAGS_transport == "urma" ?
+                brpc::urma::GetUrmaRecoveryStatus() : brpc::rdma::GetRdmaRecoveryStatus();
             std::cout << (now - start) / 1000000 << ',' << mode << ',' << succeeded
                       << ',' << failed << ',' << s.negotiated_connections << ','
                       << s.tcp_only_admissions + s.port_cooldown_admissions +

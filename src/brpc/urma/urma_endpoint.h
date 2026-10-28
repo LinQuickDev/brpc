@@ -18,6 +18,8 @@
 #ifndef BRPC_URMA_ENDPOINT_H
 #define BRPC_URMA_ENDPOINT_H
 
+#include "brpc/urma/urma_recovery_policy.h"
+
 #include <cstdint>
 #include <functional>
 #include <ostream>
@@ -100,6 +102,7 @@ struct UrmaResource {
 // windows, and the registered buffer bookkeeping. Cache-line padded to avoid
 // false sharing between connections.
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
+    friend class UrmaRecoveryTestPeer;
     friend class UrmaConnect;
     friend class Socket;
     friend class UrmaTransport;
@@ -261,6 +264,7 @@ private:
 
     inline void TryReadOnTcp();
     void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
+    void ReportFailure(UrmaFailureReason reason);
     void FailHandshake(UrmaTransport* transport, int error,
                        const char* reason);
 
@@ -271,6 +275,9 @@ private:
 
     // Not owned.
     Socket* _socket;
+
+    uint64_t _recovery_epoch{0};
+    butil::atomic<UrmaFailureReason> _runtime_failure{UrmaFailureReason::NONE};
 
     // Handshake state.
     butil::atomic<State> _state{UNINIT};

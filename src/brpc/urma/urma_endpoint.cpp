@@ -168,6 +168,8 @@ UrmaEndpoint::~UrmaEndpoint() {
 void UrmaEndpoint::Reset() {
     DeallocateResources();
     _state = UNINIT;
+    _recovery_epoch = 0;
+    _runtime_failure.store(UrmaFailureReason::NONE, butil::memory_order_relaxed);
     _handshake_version = 0;
     _remote_recv_block_size = 0;
     _local_window_capacity = 0;
@@ -770,6 +772,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                          << ", configured_max_sge=" << GetUrmaMaxSge()
                          << ", payload_size=" << this_len
                          << " on " << _socket->description();
+            ReportFailure(UrmaFailureReason::SEND_POST);
             errno = rc;
             return -1;
         }
@@ -815,6 +818,7 @@ int UrmaEndpoint::DoPostRecv(void* block, size_t block_size) {
                             _resource->jetty->remote_jetty)
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
+        ReportFailure(UrmaFailureReason::RECV_POST);
         errno = status;
         return -1;
     }
@@ -908,6 +912,7 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
                      << _resource->remote_jetty->id.id
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
+        ReportFailure(UrmaFailureReason::SEND_POST);
         errno = status;
         return -1;
     }
@@ -928,6 +933,26 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
         LOG(WARNING) << "URMA completion failed, status=" << cr.status;
+        switch (cr.status) {
+        case URMA_CR_ACK_TIMEOUT_ERR:
+            ReportFailure(UrmaFailureReason::RETRY_EXHAUSTED);
+            break;
+        case URMA_CR_RNR_RETRY_CNT_EXC_ERR:
+            ReportFailure(UrmaFailureReason::RNR);
+            break;
+        case URMA_CR_LOC_ACCESS_ERR:
+        case URMA_CR_REM_ACCESS_ABORT_ERR:
+            ReportFailure(UrmaFailureReason::ACCESS_ERROR);
+            break;
+        case URMA_CR_WR_FLUSH_ERR:
+        case URMA_CR_WR_FLUSH_ERR_DONE:
+        case URMA_CR_WR_SUSPEND_DONE:
+        case URMA_CR_WR_UNHANDLED:
+            break;
+        default:
+            ReportFailure(UrmaFailureReason::TRANSPORT_ERROR);
+            break;
+        }
         errno = EIO;
         return -1;
     }
@@ -946,8 +971,7 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                 return -1;
             }
             _sq_imm_window_size += 1;
-            SendAck(0);
-            return 0;
+            return SendAck(0);
         }
         uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
         uint16_t old =
@@ -1035,8 +1059,8 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     if (PostRecv(1, zerocopy) < 0) {
         return -1;
     }
-    if (cr.completion_len > 0) {
-        SendAck(1);
+    if (cr.completion_len > 0 && SendAck(1) < 0) {
+        return -1;
     }
     return static_cast<ssize_t>(cr.completion_len);
 }
@@ -1118,6 +1142,7 @@ void UrmaEndpoint::PollCq(Socket* m) {
                 const int cnt =
                     urma_poll_jfc(ep->_resource->jfc, n, crs);
                 if (cnt < 0) {
+                    ep->ReportFailure(UrmaFailureReason::CQ_POLL);
                     return EIO;
                 }
                 if (cnt == 0) {
@@ -1307,6 +1332,21 @@ void UrmaEndpoint::FallbackToTcp(UrmaTransport* transport, bool process_tcp) {
     }
 }
 
+void UrmaEndpoint::ReportFailure(UrmaFailureReason reason) {
+    if (_state.load(butil::memory_order_acquire) != ESTABLISHED) {
+        return;
+    }
+    UrmaFailureReason expected = UrmaFailureReason::NONE;
+    if (reason == UrmaFailureReason::NONE ||
+        !_runtime_failure.compare_exchange_strong(expected, reason)) {
+        return;
+    }
+    GlobalUrmaRecoveryPolicy().ReportPeerFailure(
+        _socket->CreatedByConnect() ?
+            butil::endpoint2str(_socket->remote_side()).c_str() : "",
+        _recovery_epoch, reason);
+}
+
 void UrmaEndpoint::FailHandshake(UrmaTransport* transport, int error,
                                  const char* reason) {
     LOG(ERROR) << "URMA handshake failed in state=" << GetStateStr()
@@ -1333,7 +1373,9 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     SocketUniquePtr s(ep->_socket);
     auto* tp = static_cast<UrmaTransport*>(s->_transport.get());
     UrmaConnect::RunGuard guard(static_cast<UrmaConnect*>(s->_app_connect.get()));
-    if (!IsUrmaAvailable()) {
+    if (!IsUrmaAvailable() ||
+        !GlobalUrmaRecoveryPolicy().AllowNewConnection(
+            butil::endpoint2str(s->remote_side()).c_str(), &ep->_recovery_epoch)) {
         ep->FallbackToTcp(tp, true);
         return nullptr;
     }
@@ -1385,6 +1427,7 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     }
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
+    GlobalUrmaRecoveryPolicy().RecordNegotiatedConnection(ep->_recovery_epoch);
     ep->DispatchReceivedBytes(s, 0);
     return nullptr;
 }
@@ -1418,6 +1461,16 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
     }
     if (!negotiated) {
         ep->FailHandshake(tp, EPROTO, "invalid client hello");
+        return nullptr;
+    }
+    if (!IsUrmaAvailable() ||
+        !GlobalUrmaRecoveryPolicy().AllowNewConnection("", &ep->_recovery_epoch)) {
+        tp->_urma_state = UrmaTransport::URMA_OFF;
+        if (hs->SendLocalHello() < 0) {
+            ep->FailHandshake(tp, errno ? errno : EIO, "send TCP fallback hello");
+            return nullptr;
+        }
+        ep->FallbackToTcp(tp, true);
         return nullptr;
     }
     ep->_state = S_ALLOC_RES;
@@ -1470,6 +1523,7 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
+        GlobalUrmaRecoveryPolicy().RecordNegotiatedConnection(ep->_recovery_epoch);
         ep->DispatchReceivedBytes(s, 0);
     } else {
         ep->FallbackToTcp(tp, true);
@@ -1560,6 +1614,8 @@ void UrmaEndpoint::DebugInfo(std::ostream& os, butil::StringPiece) const {
        << " remote_recv_block_size=" << _remote_recv_block_size
        << " sq_window=" << _sq_window_size.load(butil::memory_order_relaxed)
        << " remote_rq_window=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
+       << " recovery_epoch=" << _recovery_epoch
+       << " runtime_failure=" << rdma::RdmaFailureReasonName(_runtime_failure.load())
        << " handshake_version=" << _handshake_version
        << " read_buf=" << _input_processor.read_buf().size();
 }
@@ -1579,6 +1635,7 @@ int UrmaEndpoint::WaitCqEvent(SocketUniquePtr& s,
         const int saved_errno = errno;
         PLOG(ERROR) << "Fail to wait URMA JFC event from "
                     << s->description();
+        ReportFailure(UrmaFailureReason::CQ_EVENT);
         s->SetFailed(saved_errno, "Fail to wait URMA JFC event: %s",
                      berror(saved_errno));
         return -1;
@@ -1589,6 +1646,7 @@ int UrmaEndpoint::WaitCqEvent(SocketUniquePtr& s,
     if (*event_jfc != _resource->jfc) {
         LOG(ERROR) << "Unexpected URMA JFC event on " << s->description();
         errno = EPROTO;
+        ReportFailure(UrmaFailureReason::CQ_EVENT);
         s->SetFailed(EPROTO, "Unexpected URMA JFC event");
         return -1;
     }
@@ -1604,6 +1662,7 @@ int UrmaEndpoint::ReqNotifyCq() {
     if (rc != URMA_SUCCESS) {
         errno = rc;
         PLOG(WARNING) << "Fail to rearm URMA JFC";
+        ReportFailure(UrmaFailureReason::CQ_NOTIFY);
         _socket->SetFailed(rc, "Fail to rearm URMA JFC: %s", berror(rc));
         return -1;
     }

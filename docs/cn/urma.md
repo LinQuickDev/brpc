@@ -193,3 +193,28 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+## 运行期故障恢复
+
+通过进程级 API 控制新连接的传输选择：
+
+```cpp
+#include "brpc/urma/urma_recovery_policy.h"
+
+brpc::urma::SetUrmaRecoveryCooldownMs(5000);
+brpc::urma::SetUrmaRecoveryMode(brpc::urma::UrmaRecoveryMode::AUTO);
+```
+
+默认 LEGACY 沿用现有行为；AUTO 在重试耗尽、RNR、JFC 错误或 WR 提交失败后，
+将客户端对端地址冷却 5 秒，期间新连接使用 TCP。TCP_ONLY 让新连接直接选择 TCP。
+服务端通过 v2/v3 hello 拒绝 URMA 协商，随后处理 TCP 请求。
+
+URMA 和 RDMA 分别维护模式、epoch、冷却缓存和指标。同一连接只上报首个运行期故障；
+模式切换过滤旧 epoch 的错误。访问错误单独计数，WR flush 不重复归因，
+SQ/接收 credit 耗尽保留 EAGAIN 背压，ACK 提交失败向连接错误处理传播。
+
+`GetUrmaRecoveryStatus()` 和 `/vars/urma_recovery_status` 提供故障原因、冷却状态和协商数，
+`/vars/urma_recovery_tcp_fallback_admissions` 提供 TCP 准入次数。
+模式切换作用于新连接；存量连接使用已协商的传输，冷却到期后重新准入 URMA。
+
+`example/rdma_performance/recovery_client` 支持 `--transport=urma`，沿用 `--mode`、`--mode_file` 和 CSV 统计，可用于双机故障注入。

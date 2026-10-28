@@ -16,6 +16,8 @@
 // under the License.
 
 #include <cstring>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <limits>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
@@ -28,6 +30,15 @@
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
 #include "urma_types.h"
+#include "brpc/channel.h"
+#include "brpc/controller.h"
+#include "brpc/server.h"
+#include "brpc/input_messenger.h"
+#include "brpc/urma/urma_endpoint.h"
+#include "brpc/urma/urma_recovery_policy.h"
+#include "butil/fd_guard.h"
+#include "bvar/variable.h"
+#include "echo.pb.h"
 
 using namespace brpc;
 
@@ -591,6 +602,331 @@ TEST_F(UrmaMockTest,
     urma_delete_jfce(sender_jfce);
     urma_delete_context(ctx);
     urma_free_device_list(devices);
+}
+
+
+namespace brpc {
+namespace urma {
+
+class UrmaRecoveryTestPeer {
+public:
+    static void Establish(UrmaEndpoint* ep) {
+        GlobalUrmaRecoveryPolicy().AllowNewConnection("", &ep->_recovery_epoch);
+        ep->_state = UrmaEndpoint::ESTABLISHED;
+    }
+    static ssize_t Complete(UrmaEndpoint* ep, urma_cr_status_t status) {
+        urma_cr_t cr{};
+        cr.status = status;
+        return ep->HandleCompletion(cr);
+    }
+    static void Report(UrmaEndpoint* ep, UrmaFailureReason reason) {
+        ep->ReportFailure(reason);
+    }
+    static void PollFailure(UrmaEndpoint* ep) {
+        UrmaResource resource;
+        urma_jfc_t invalid_jfc{};
+        resource.jfc = &invalid_jfc;
+        ep->_resource = &resource;
+        SocketOptions options;
+        options.user = ep;
+        SocketId sid;
+        if (Socket::Create(options, &sid) == 0) {
+            SocketUniquePtr carrier;
+            if (Socket::Address(sid, &carrier) == 0) {
+                const bool polling = FLAGS_urma_use_polling;
+                FLAGS_urma_use_polling = true;
+                UrmaEndpoint::PollCq(carrier.get());
+                FLAGS_urma_use_polling = polling;
+                carrier->SetFailed();
+            }
+        }
+        ep->_resource = nullptr;
+        resource.jfc = nullptr;
+    }
+    static bool Backpressure(UrmaEndpoint* ep) {
+        UrmaResource resource;
+        urma_jetty_t jetty{};
+        urma_target_jetty_t remote{};
+        resource.jetty = &jetty;
+        resource.remote_jetty = &remote;
+        ep->_resource = &resource;
+        ep->_sq_window_size = 0;
+        ep->_remote_rq_window_size = 1;
+        butil::IOBuf data;
+        data.append("payload");
+        butil::IOBuf* buf = &data;
+        const ssize_t rc = ep->CutFromIOBufList(&buf, 1);
+        const bool ok = rc == -1 && errno == EAGAIN && data.size() == 7;
+        ep->_resource = nullptr;
+        resource.jetty = nullptr;
+        resource.remote_jetty = nullptr;
+        return ok;
+    }
+    static int FailedAck(UrmaEndpoint* ep) {
+        // A Jetty without an imported target fails provider submission.
+        UrmaResource resource;
+        urma_jetty_t jetty{};
+        urma_target_jetty_t remote{};
+        resource.jetty = &jetty;
+        resource.remote_jetty = &remote;
+        ep->_resource = &resource;
+        ep->_sq_imm_window_size = 1;
+        ep->_remote_window_capacity = 2;
+        ep->_new_rq_wrs = 2;
+        urma_cr_t cr{};
+        cr.status = URMA_CR_SUCCESS;
+        cr.user_ctx = 0;
+        const int rc = ep->HandleCompletion(cr);
+        ep->_resource = nullptr;
+        resource.jetty = nullptr;
+        resource.remote_jetty = nullptr;
+        return rc;
+    }
+};
+
+}  // namespace urma
+}  // namespace brpc
+
+class UrmaRecoveryTest : public UrmaMockTest {
+protected:
+    void SetUp() override {
+        UrmaMockTest::SetUp();
+        if (IsSkipped() || HasFatalFailure()) {
+            return;
+        }
+        urma::g_skip_urma_init = true;
+        urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::LEGACY);
+        urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::AUTO);
+        rdma::SetRdmaRecoveryMode(rdma::RdmaRecoveryMode::LEGACY);
+        urma::GlobalUrmaRecoveryPolicy().ReportPortState(true);
+    }
+    void TearDown() override {
+        urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::LEGACY);
+        rdma::SetRdmaRecoveryMode(rdma::RdmaRecoveryMode::LEGACY);
+        UrmaMockTest::TearDown();
+    }
+    void CreateSocket(SocketUniquePtr* socket) {
+        SocketOptions opt;
+        butil::str2endpoint("127.0.0.1:8123", &opt.remote_side);
+        opt.user = get_client_side_messenger();
+        SocketId sid;
+        ASSERT_EQ(0, Socket::Create(opt, &sid));
+        ASSERT_EQ(0, Socket::Address(sid, socket));
+    }
+};
+
+TEST_F(UrmaRecoveryTest, independent_transport_modes_and_metrics) {
+    ASSERT_TRUE(urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::TCP_ONLY));
+    EXPECT_FALSE(urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("peer"));
+    EXPECT_TRUE(rdma::GlobalRdmaRecoveryPolicy().AllowNewConnection("peer"));
+    EXPECT_EQ(rdma::RdmaRecoveryMode::LEGACY, rdma::GetRdmaRecoveryMode());
+    EXPECT_FALSE(urma::SetUrmaRecoveryCooldownMs(0));
+    EXPECT_TRUE(urma::SetUrmaRecoveryCooldownMs(5000));
+    EXPECT_NE(std::string::npos,
+              bvar::Variable::describe_exposed("urma_recovery_status").find("tcp_only"));
+    EXPECT_FALSE(bvar::Variable::describe_exposed(
+        "urma_recovery_tcp_fallback_admissions").empty());
+}
+
+TEST_F(UrmaRecoveryTest, completion_errors_cool_peer_once) {
+    for (auto status : {URMA_CR_ACK_TIMEOUT_ERR, URMA_CR_RNR_RETRY_CNT_EXC_ERR,
+                        URMA_CR_LOC_ACCESS_ERR, URMA_CR_REM_OPERATION_ERR}) {
+        urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::LEGACY);
+        urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::AUTO);
+        SocketUniquePtr socket;
+        ASSERT_NO_FATAL_FAILURE(CreateSocket(&socket));
+        urma::UrmaEndpoint ep(socket.get());
+        urma::UrmaRecoveryTestPeer::Establish(&ep);
+        const auto before = urma::GetUrmaRecoveryStatus();
+        EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::Complete(&ep, status));
+        const auto reason = status == URMA_CR_ACK_TIMEOUT_ERR ?
+            urma::UrmaFailureReason::RETRY_EXHAUSTED :
+            status == URMA_CR_RNR_RETRY_CNT_EXC_ERR ? urma::UrmaFailureReason::RNR :
+            status == URMA_CR_LOC_ACCESS_ERR ? urma::UrmaFailureReason::ACCESS_ERROR :
+                                             urma::UrmaFailureReason::TRANSPORT_ERROR;
+        EXPECT_EQ(before.failures[static_cast<size_t>(reason)] + 1,
+                  urma::GetUrmaRecoveryStatus().failures[static_cast<size_t>(reason)]);
+        EXPECT_EQ(status == URMA_CR_LOC_ACCESS_ERR,
+                  urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("127.0.0.1:8123"));
+        urma::UrmaRecoveryTestPeer::Report(&ep, urma::UrmaFailureReason::CQ_POLL);
+        EXPECT_EQ(before.failures[static_cast<size_t>(urma::UrmaFailureReason::CQ_POLL)],
+                  urma::GetUrmaRecoveryStatus().failures[
+                      static_cast<size_t>(urma::UrmaFailureReason::CQ_POLL)]);
+        socket->SetFailed();
+    }
+}
+
+TEST_F(UrmaRecoveryTest, flush_backpressure_and_old_epoch_do_not_cool_peer) {
+    SocketUniquePtr socket;
+    ASSERT_NO_FATAL_FAILURE(CreateSocket(&socket));
+    urma::UrmaEndpoint ep(socket.get());
+    urma::UrmaRecoveryTestPeer::Establish(&ep);
+    EXPECT_TRUE(urma::UrmaRecoveryTestPeer::Backpressure(&ep));
+    EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::Complete(&ep, URMA_CR_WR_FLUSH_ERR));
+    EXPECT_TRUE(urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("127.0.0.1:8123"));
+    urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::TCP_ONLY);
+    urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::AUTO);
+    urma::UrmaRecoveryTestPeer::Report(&ep, urma::UrmaFailureReason::CQ_POLL);
+    EXPECT_TRUE(urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("127.0.0.1:8123"));
+    socket->SetFailed();
+}
+
+TEST_F(UrmaRecoveryTest, ack_post_failure_propagates) {
+    SocketUniquePtr socket;
+    ASSERT_NO_FATAL_FAILURE(CreateSocket(&socket));
+    urma::UrmaEndpoint ep(socket.get());
+    urma::UrmaRecoveryTestPeer::Establish(&ep);
+    EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::FailedAck(&ep));
+    EXPECT_FALSE(urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("127.0.0.1:8123"));
+    socket->SetFailed();
+}
+
+TEST_F(UrmaRecoveryTest, jfc_poll_failure_fails_socket_and_cools_peer) {
+    SocketUniquePtr socket;
+    ASSERT_NO_FATAL_FAILURE(CreateSocket(&socket));
+    urma::UrmaEndpoint ep(socket.get());
+    urma::UrmaRecoveryTestPeer::Establish(&ep);
+    const auto before = urma::GetUrmaRecoveryStatus();
+    urma::UrmaRecoveryTestPeer::PollFailure(&ep);
+    EXPECT_TRUE(socket->Failed());
+    EXPECT_FALSE(urma::GlobalUrmaRecoveryPolicy().AllowNewConnection("127.0.0.1:8123"));
+    EXPECT_EQ(before.failures[static_cast<size_t>(urma::UrmaFailureReason::CQ_POLL)] + 1,
+              urma::GetUrmaRecoveryStatus().failures[
+                  static_cast<size_t>(urma::UrmaFailureReason::CQ_POLL)]);
+}
+
+class UrmaRecoveryEcho : public ::test::EchoService {
+    void Echo(google::protobuf::RpcController*, const ::test::EchoRequest* request,
+              ::test::EchoResponse* response, google::protobuf::Closure* done) override {
+        response->set_message(request->message());
+        done->Run();
+    }
+};
+
+TEST_F(UrmaRecoveryTest, tcp_only_client_completes_rpc_on_urma_server) {
+    urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::TCP_ONLY);
+    UrmaRecoveryEcho service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    ServerOptions so;
+    so.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &so));
+    Channel channel;
+    ChannelOptions co;
+    co.socket_mode = SOCKET_MODE_URMA;
+    co.connection_type = "short";
+    co.timeout_ms = 2000;
+    ASSERT_EQ(0, channel.Init(server.listen_address(), &co));
+    ::test::EchoService_Stub stub(&channel);
+    Controller cntl;
+    ::test::EchoRequest request;
+    ::test::EchoResponse response;
+    request.set_message("recovery over TCP");
+    stub.Echo(&cntl, &request, &response, nullptr);
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_EQ(request.message(), response.message());
+    urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::AUTO);
+    SocketOptions failed_options;
+    failed_options.remote_side = server.listen_address();
+    failed_options.user = get_client_side_messenger();
+    SocketId failed_sid;
+    ASSERT_EQ(0, Socket::Create(failed_options, &failed_sid));
+    SocketUniquePtr failed_socket;
+    ASSERT_EQ(0, Socket::Address(failed_sid, &failed_socket));
+    {
+        urma::UrmaEndpoint failed_ep(failed_socket.get());
+        urma::UrmaRecoveryTestPeer::Establish(&failed_ep);
+        EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::Complete(
+            &failed_ep, URMA_CR_RNR_RETRY_CNT_EXC_ERR));
+    }
+    failed_socket->SetFailed();
+    const auto before = urma::GetUrmaRecoveryStatus();
+    cntl.Reset();
+    response.Clear();
+    stub.Echo(&cntl, &request, &response, nullptr);
+    EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_EQ(request.message(), response.message());
+    EXPECT_EQ(before.peer_cooldown_admissions + 1,
+              urma::GetUrmaRecoveryStatus().peer_cooldown_admissions);
+    server.Stop(0);
+    server.Join();
+}
+
+TEST_F(UrmaRecoveryTest, server_declines_v2_and_v3_without_allocating_jetty) {
+    urma::SetUrmaRecoveryMode(urma::UrmaRecoveryMode::TCP_ONLY);
+    Server server;
+    ServerOptions so;
+    so.socket_mode = SOCKET_MODE_URMA;
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &so));
+    for (int version : {2, 3}) {
+        butil::fd_guard fd(butil::tcp_connect(server.listen_address(), nullptr));
+        ASSERT_GE(fd, 0);
+        timeval timeout{2, 0};
+        ASSERT_EQ(0, setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
+        urma::v2_wire::HelloMessage hello;
+        hello.msg_len = urma::v2_wire::HELLO_PACKET_LEN;
+        hello.hello_ver = urma::v2_wire::HELLO_V2_VERSION;
+        hello.impl_ver = urma::v2_wire::IMPL_V2_VERSION;
+        hello.buffer_size = 8192;
+        hello.recv_buffer_cnt = 127;
+        hello.jetty_id = 42;
+        memset(hello.eid, 1, 16);
+        memset(hello.seg_eid, 1, 16);
+        hello.tp_type = URMA_CTP;
+        hello.seg_va = 0x100000;
+        hello.seg_len = 1024 * 1024;
+        if (version == 2) {
+            uint8_t packet[urma::v2_wire::HELLO_PACKET_LEN];
+            memcpy(packet, "URMA", 4);
+            hello.Serialize(packet + 4);
+            ASSERT_EQ(sizeof(packet), static_cast<size_t>(write(fd, packet, sizeof(packet))));
+            uint8_t reply[sizeof(packet)];
+            ASSERT_EQ(sizeof(reply), static_cast<size_t>(recv(fd, reply, sizeof(reply), MSG_WAITALL)));
+            EXPECT_EQ(0, memcmp(reply, "URMA", 4));
+            urma::v2_wire::HelloMessage rejected;
+            rejected.Deserialize(reply + 4);
+            EXPECT_EQ(0, rejected.hello_ver);
+            EXPECT_EQ(0u, rejected.jetty_id);
+        } else {
+            urma::UrmaHello msg;
+            msg.set_buffer_size(8192);
+            msg.set_recv_buffer_cnt(127);
+            msg.set_jetty_id(42);
+            msg.set_uasid(0);
+            msg.set_seg_uasid(0);
+            msg.set_seg_token_id(0);
+            msg.set_eid(hello.eid, 16);
+            msg.set_seg_eid(hello.seg_eid, 16);
+            msg.set_tp_type(URMA_CTP);
+            msg.set_seg_va(hello.seg_va);
+            msg.set_seg_len(hello.seg_len);
+            const std::string body = msg.SerializeAsString();
+            uint32_t size = butil::HostToNet32(body.size());
+            std::string packet("URM3", 4);
+            packet.append(reinterpret_cast<const char*>(&size), 4);
+            packet.append(body);
+            ASSERT_EQ(packet.size(), static_cast<size_t>(write(fd, packet.data(), packet.size())));
+            char header[8];
+            ASSERT_EQ(8, recv(fd, header, 8, MSG_WAITALL));
+            EXPECT_EQ(0, memcmp(header, "URM3", 4));
+            memcpy(&size, header + 4, 4);
+            size = butil::NetToHost32(size);
+            ASSERT_LE(size, 4096u);
+            std::string reply(size, '\0');
+            ASSERT_EQ(size, static_cast<uint32_t>(recv(fd, &reply[0], size, MSG_WAITALL)));
+            urma::UrmaHello rejected;
+            ASSERT_TRUE(rejected.ParseFromString(reply));
+            EXPECT_EQ(0u, rejected.jetty_id());
+        }
+        const std::string request = "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        ASSERT_EQ(request.size(), static_cast<size_t>(write(fd, request.data(), request.size())));
+        char response[4096];
+        const ssize_t nr = recv(fd, response, sizeof(response), 0);
+        ASSERT_GT(nr, 0);
+        EXPECT_NE(std::string::npos, std::string(response, nr).find(" 200 "));
+    }
+    server.Stop(0);
+    server.Join();
 }
 
 #else  // BRPC_WITH_URMA
