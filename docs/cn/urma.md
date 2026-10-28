@@ -157,6 +157,7 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 | `--urma_rq_size` | 128 | 本地 JFR 深度 [16, 4096] |
 | `--urma_cqe_poll_once` | 32 | 每次 `urma_poll_jfc` 的上限 |
 | `--urma_recv_zerocopy` | true | 大于 `--urma_zerocopy_min_size` 的接收零拷贝 |
+| `--urma_copy_send` | false | 将主机发送数据复制合并到 64 字节对齐的注册缓冲区 |
 | `--urma_zerocopy_min_size` | 512 | 小于此值的接收拷贝 |
 | `--urma_device` | "" | URMA 设备名（空=首个） |
 | `--urma_max_sge` | 0 | 每 WR SGE 上限（0=设备上限） |
@@ -218,3 +219,10 @@ SQ/接收 credit 耗尽保留 EAGAIN 背压，ACK 提交失败向连接错误处
 模式切换作用于新连接；存量连接使用已协商的传输，冷却到期后重新准入 URMA。
 
 `example/rdma_performance/recovery_client` 支持 `--transport=urma`，沿用 `--mode`、`--mode_file` 和 CSV 统计，可用于双机故障注入。
+
+## 发送访问错误对照
+
+设置 `--urma_copy_send=true` 后，每个数据 WR 使用一个新的、64 字节对齐的注册缓冲区，
+该缓冲区由发送槽位持有至完成；消息和附件内容保持一致。此模式增加一次 CPU 拷贝。
+可在两端保持设备、队列、消息大小等参数一致，比较原发送路径与复制路径的结果。
+启动日志显示 `copy_send`，失败日志显示完成方向及发送槽位的地址、长度和注册段范围。

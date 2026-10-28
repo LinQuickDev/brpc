@@ -312,6 +312,73 @@ TEST(UrmaHelperTest, local_sge_rejects_out_of_range_and_wrong_context) {
     EXPECT_FALSE(urma::InitUrmaLocalSge(&sge, UINT64_MAX - 3, 2, &segment));
 }
 
+static urma_target_seg_t g_copy_test_segment;
+static int g_copy_test_releases;
+
+static urma_target_seg_t* ResolveCopyTestSegment(void* address) {
+    g_copy_test_segment = urma_target_seg_t{};
+    g_copy_test_segment.urma_ctx = urma::GetUrmaContext();
+    g_copy_test_segment.seg.ubva.va = reinterpret_cast<uint64_t>(address);
+    g_copy_test_segment.seg.len = urma::GetUrmaRecvBlockSize();
+    return &g_copy_test_segment;
+}
+
+static urma_target_seg_t* RejectCopyTestSegment(void*) {
+    return nullptr;
+}
+
+static void DeleteCopyTestData(void* data) {
+    ++g_copy_test_releases;
+    delete[] static_cast<char*>(data);
+}
+
+TEST(UrmaHelperTest, copied_send_coalesces_host_fragments_and_retains_aligned_payload) {
+    g_copy_test_releases = 0;
+    butil::IOBuf buffer;
+    for (const char* text : {"first", "second"}) {
+        const size_t length = strlen(text);
+        char* data = new char[length];
+        memcpy(data, text, length);
+        ASSERT_EQ(0, buffer.append_user_data(data, length, DeleteCopyTestData));
+    }
+    ASSERT_EQ(2u, buffer.backing_block_num());
+    urma_sge_t sge{};
+    ASSERT_TRUE(urma::CopyUrmaSendBuffer(&buffer, &sge, ResolveCopyTestSegment));
+    EXPECT_EQ(2, g_copy_test_releases);
+    EXPECT_EQ("firstsecond", buffer.to_string());
+    ASSERT_EQ(1u, buffer.backing_block_num());
+    EXPECT_EQ(0u, sge.addr % urma::URMA_SEND_BUFFER_ALIGNMENT);
+    EXPECT_EQ(reinterpret_cast<uint64_t>(buffer.backing_block(0).data()), sge.addr);
+    EXPECT_EQ(buffer.size(), sge.len);
+    EXPECT_EQ(&g_copy_test_segment, sge.tseg);
+    EXPECT_EQ(nullptr, sge.user_tseg);
+    EXPECT_EQ("firstsecond", std::string(reinterpret_cast<const char*>(sge.addr), sge.len));
+
+    buffer.clear();
+    const std::string large(urma::GetUrmaRecvBlockSize() -
+                           (urma::URMA_SEND_BUFFER_ALIGNMENT - 1), 'x');
+    buffer.append(large);
+    ASSERT_TRUE(urma::CopyUrmaSendBuffer(&buffer, &sge, ResolveCopyTestSegment));
+    EXPECT_EQ(0u, sge.addr % urma::URMA_SEND_BUFFER_ALIGNMENT);
+    EXPECT_EQ(large, buffer.to_string());
+    EXPECT_EQ(large.size(), sge.len);
+}
+
+TEST(UrmaHelperTest, copied_send_failure_preserves_source_payload) {
+    butil::IOBuf buffer;
+    buffer.append("unchanged");
+    urma_sge_t sge{};
+    EXPECT_FALSE(urma::CopyUrmaSendBuffer(&buffer, &sge, RejectCopyTestSegment));
+    EXPECT_EQ(ERDMAMEM, errno);
+    EXPECT_EQ("unchanged", buffer.to_string());
+    const std::string large(urma::GetUrmaRecvBlockSize(), 'y');
+    buffer.clear();
+    buffer.append(large);
+    EXPECT_FALSE(urma::CopyUrmaSendBuffer(&buffer, &sge, ResolveCopyTestSegment));
+    EXPECT_EQ(EMSGSIZE, errno);
+    EXPECT_EQ(large, buffer.to_string());
+}
+
 // ---------------------------------------------------------------------------
 // SupportedByUrma: only baidu_std.
 // ---------------------------------------------------------------------------

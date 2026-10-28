@@ -64,6 +64,7 @@ DECLARE_int32(urma_sq_size);
 DECLARE_int32(urma_rq_size);
 DECLARE_int32(urma_cqe_poll_once);
 DECLARE_bool(urma_recv_zerocopy);
+DECLARE_bool(urma_copy_send);
 DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
 DECLARE_bool(urma_poller_yield);
@@ -686,6 +687,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
+    const bool copy_send = FLAGS_urma_copy_send;
     int max_sge = GetUrmaMaxSge();
     if (max_sge < 1) {
         max_sge = 1;
@@ -716,6 +718,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         size_t max_len = _remote_recv_block_size > 0
                              ? _remote_recv_block_size
                              : GetUrmaRecvBlockSize();
+        if (copy_send) {
+            max_len = std::min(max_len, GetUrmaRecvBlockSize() -
+                                       (URMA_SEND_BUFFER_ALIGNMENT - 1));
+        }
         while (sge_index < static_cast<size_t>(max_sge) &&
                this_len < max_len && current < ndata) {
             auto* data = reinterpret_cast<UrmaIOBuf*>(from[current]);
@@ -723,8 +729,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                 ++current;
                 continue;
             }
-            ssize_t n = data->cut_into_sglist(sglist, &sge_index, to,
-                                              max_sge, max_len - this_len);
+            ssize_t n = copy_send ?
+                static_cast<ssize_t>(data->cutn(to, max_len - this_len)) :
+                data->cut_into_sglist(sglist, &sge_index, to,
+                                     max_sge, max_len - this_len);
             if (n < 0) {
                 if (errno == ERDMAMEM) {
                     ReportFailure(UrmaFailureReason::ACCESS_ERROR);
@@ -733,8 +741,17 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             }
             this_len += n;
         }
-        if (sge_index == 0) {
+        if (this_len == 0) {
             break;
+        }
+        if (copy_send) {
+            if (!CopyUrmaSendBuffer(to, &sglist[0])) {
+                LOG(ERROR) << "Fail to prepare aligned URMA send buffer: length="
+                           << this_len << " errno=" << errno;
+                ReportFailure(UrmaFailureReason::ACCESS_ERROR);
+                return -1;
+            }
+            sge_index = 1;
         }
 
         urma_sg_t sg{sglist, static_cast<uint32_t>(sge_index)};

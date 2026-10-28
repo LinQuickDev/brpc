@@ -76,6 +76,8 @@ DEFINE_int32(urma_cqe_poll_once, 32,
              "Max completion entries polled per urma_poll_jfc call");
 DEFINE_bool(urma_recv_zerocopy, true,
             "Use zero-copy for receives larger than --urma_zerocopy_min_size");
+DEFINE_bool(urma_copy_send, false,
+            "Copy host send payloads into a 64-byte aligned registered buffer");
 DEFINE_int32(urma_zerocopy_min_size, 512,
              "Receives smaller than this many bytes are copied (not zero-copy)");
 
@@ -439,6 +441,45 @@ bool InitUrmaLocalSge(urma_sge_t* sge, uint64_t address, size_t length,
     return true;
 }
 
+bool CopyUrmaSendBuffer(butil::IOBuf* buffer, urma_sge_t* sge,
+                       urma_target_seg_t* (*lookup)(void*)) {
+    const size_t length = buffer->size();
+    const size_t capacity = GetUrmaRecvBlockSize();
+    if (length == 0 || capacity < URMA_SEND_BUFFER_ALIGNMENT ||
+        length > capacity - (URMA_SEND_BUFFER_ALIGNMENT - 1)) {
+        errno = EMSGSIZE;
+        return false;
+    }
+    butil::IOBuf copied;
+    void* data = nullptr;
+    size_t padding = 0;
+    {
+        butil::IOBufAsZeroCopyOutputStream stream(
+            &copied, capacity + sizeof(butil::IOBuf::Block));
+        int available = 0;
+        if (!stream.Next(&data, &available)) {
+            errno = ENOMEM;
+            return false;
+        }
+        padding = (URMA_SEND_BUFFER_ALIGNMENT -
+                   reinterpret_cast<uintptr_t>(data) % URMA_SEND_BUFFER_ALIGNMENT) %
+                  URMA_SEND_BUFFER_ALIGNMENT;
+        if (padding + length > static_cast<size_t>(available)) {
+            errno = ENOMEM;
+            return false;
+        }
+        data = static_cast<char*>(data) + padding;
+        buffer->copy_to(data, length);
+        stream.BackUp(available - static_cast<int>(padding + length));
+    }
+    copied.pop_front(padding);
+    if (!InitUrmaLocalSge(sge, reinterpret_cast<uint64_t>(data), length, lookup(data))) {
+        return false;
+    }
+    buffer->swap(copied);
+    return true;
+}
+
 static void GlobalRelease() {
     g_urma_available.store(false, butil::memory_order_release);
     if (g_mem_alloc_orig) {
@@ -656,6 +697,7 @@ static bool GlobalUrmaInitializeImpl() {
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
               << " max_sge=" << g_max_sge
+              << " copy_send=" << FLAGS_urma_copy_send
               << " buffer_size=" << g_pool_buffer_size
               << " buffer_count=" << g_pool->buffer_count();
     return true;

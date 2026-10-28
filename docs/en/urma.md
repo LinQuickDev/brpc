@@ -168,6 +168,7 @@ All flags use the `urma_` prefix (mirroring RDMA's `rdma_` prefix):
 | `--urma_rq_size` | 128 | Local JFR depth [16, 4096] |
 | `--urma_cqe_poll_once` | 32 | Max CQEs per `urma_poll_jfc` |
 | `--urma_recv_zerocopy` | true | Zero-copy receives above `--urma_zerocopy_min_size` |
+| `--urma_copy_send` | false | Copy and coalesce host payloads into a 64-byte aligned registered send buffer |
 | `--urma_zerocopy_min_size` | 512 | Receives smaller than this are copied |
 | `--urma_device` | "" | URMA device name (empty = first) |
 | `--urma_max_sge` | 0 | Max SGEs per WR (0 = device max) |
@@ -236,3 +237,12 @@ counts TCP admissions. Mode changes apply to new connections. Existing connectio
 keep their negotiated transport; URMA admission resumes after cooldown.
 
 `example/rdma_performance/recovery_client --transport=urma` supports `--mode`, `--mode_file` and CSV statistics for two-host fault injection.
+
+## Comparing send access failures
+
+With `--urma_copy_send=true`, each data WR uses a fresh, 64-byte aligned registered
+buffer held by its send slot until completion. Message and attachment contents are
+preserved. This mode adds a CPU copy. Compare it with the original send path while
+keeping device, queue and payload settings the same on both peers. Startup logs
+include `copy_send`; failure logs include direction, send-slot addresses, lengths
+and registered segment ranges.
