@@ -390,13 +390,19 @@ urma_target_seg_t *urma_register_seg(urma_context_t *ctx, urma_seg_cfg_t *cfg) {
     if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
         return nullptr;
     }
-    urma_target_seg_t *seg = new urma_target_seg_t;
+    urma_target_seg_t *seg = new urma_target_seg_t{};
     memset(&seg->seg.ubva.eid, 0, sizeof(urma_eid_t));
     seg->seg.ubva.eid.raw[0] = 1;
     seg->seg.ubva.uasid = 0;
     seg->seg.ubva.va = cfg->va;
     seg->seg.len = cfg->len;
     seg->seg.token_id = cfg->token_value.token;
+    seg->seg.attr.bs.access = cfg->flag.bs.access;
+    seg->seg.attr.bs.token_policy = cfg->flag.bs.token_policy;
+    seg->seg.attr.bs.cacheable = cfg->flag.bs.cacheable;
+    seg->user_ctx = cfg->user_ctx;
+    seg->urma_ctx = ctx;
+    seg->token_id = cfg->token_id;
     seg_map[seg] = 1;
     return seg;
 }

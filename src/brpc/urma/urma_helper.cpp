@@ -383,6 +383,12 @@ bool InitPool() {
         g_pool_base = nullptr;
         return false;
     }
+    LOG(INFO) << "URMA registered buffer pool: base=" << g_pool_base
+              << " size=" << g_pool_size
+              << " segment_va=" << g_pool_seg->seg.ubva.va
+              << " segment_len=" << g_pool_seg->seg.len
+              << " segment_access=" << g_pool_seg->seg.attr.bs.access
+              << " segment_token_id=" << g_pool_seg->seg.token_id;
     g_pool->in_use.assign(count, 0);
     for (size_t i = 0; i < count; ++i) {
         auto shard = i % kShardCount;

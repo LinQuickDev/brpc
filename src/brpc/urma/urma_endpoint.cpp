@@ -800,7 +800,8 @@ int UrmaEndpoint::DoPostRecv(void* block, size_t block_size) {
     urma_sge_t sge{reinterpret_cast<uint64_t>(block),
                    static_cast<uint32_t>(block_size), tseg, nullptr};
     urma_sg_t sg{&sge, 1};
-    urma_jfr_wr_t wr{sg, 0, nullptr};
+    // Preserve the receive address in completions for access-error diagnostics.
+    urma_jfr_wr_t wr{sg, reinterpret_cast<uint64_t>(block), nullptr};
     urma_jfr_wr_t* bad = nullptr;
     // Use the shared-JFR path on every device, including bonding. The bonding
     // provider owns physical receive scheduling for the JFR; a local
@@ -932,7 +933,22 @@ int UrmaEndpoint::SendAck(int num) {
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        LOG(WARNING) << "URMA completion failed, status=" << cr.status;
+        LOG(WARNING) << "URMA completion failed, status=" << cr.status
+                     << " direction=" << (cr.flag.bs.s_r ? "recv" : "send")
+                     << " flags=" << static_cast<unsigned>(cr.flag.value)
+                     << " opcode=" << cr.opcode
+                     << " local_id=" << cr.local_id
+                     << " tpn=" << cr.tpn
+                     << " user_ctx=" << cr.user_ctx
+                     << " completion_len=" << cr.completion_len
+                     << " jetty_id="
+                     << (_resource && _resource->jetty ?
+                         _resource->jetty->jetty_id.id : 0)
+                     << " jfr_id="
+                     << (_resource && _resource->jfr ?
+                         _resource->jfr->jfr_id.id : 0)
+                     << " state=" << GetStateStr()
+                     << " on " << _socket->description();
         switch (cr.status) {
         case URMA_CR_ACK_TIMEOUT_ERR:
             ReportFailure(UrmaFailureReason::RETRY_EXHAUSTED);
