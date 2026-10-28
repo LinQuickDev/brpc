@@ -83,6 +83,10 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
 // Return the priority selected for the CTP jettys created by brpc.
 uint8_t GetUrmaJettyPriority();
 
+// Initialize a local SGE whose complete byte range belongs to this context.
+bool InitUrmaLocalSge(urma_sge_t* sge, uint64_t address, size_t length,
+                      urma_target_seg_t* segment);
+
 // If the URMA environment is available.
 bool IsUrmaAvailable();
 

@@ -663,9 +663,16 @@ public:
             if (len + this_len > max_len) {
                 this_len = max_len - len;
             }
-            sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
-            sglist[*sge_index].len = static_cast<uint32_t>(this_len);
-            sglist[*sge_index].tseg = tseg;
+            if (!InitUrmaLocalSge(&sglist[*sge_index],
+                                  reinterpret_cast<uint64_t>(start), this_len, tseg)) {
+                LOG(ERROR) << "Invalid URMA send SGE: address="
+                           << reinterpret_cast<uint64_t>(start)
+                           << " length=" << this_len
+                           << " segment_va=" << tseg->seg.ubva.va
+                           << " segment_len=" << tseg->seg.len
+                           << " context_matches=" << (tseg->urma_ctx == GetUrmaContext());
+                return -1;
+            }
             cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
@@ -719,6 +726,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             ssize_t n = data->cut_into_sglist(sglist, &sge_index, to,
                                               max_sge, max_len - this_len);
             if (n < 0) {
+                if (errno == ERDMAMEM) {
+                    ReportFailure(UrmaFailureReason::ACCESS_ERROR);
+                }
                 return -1;
             }
             this_len += n;
@@ -738,7 +748,8 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
-        wr.user_ctx = 1;
+        // Zero identifies credit ACKs; data completions identify their SQ slot.
+        wr.user_ctx = static_cast<uint64_t>(_sq_current) + 1;
         urma_jfs_wr_t* bad_wr = nullptr;
         const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
@@ -949,6 +960,27 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                          _resource->jfr->jfr_id.id : 0)
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
+        if (!cr.flag.bs.s_r && cr.user_ctx > 0 && cr.user_ctx <= _sbuf.size()) {
+            const size_t slot = static_cast<size_t>(cr.user_ctx - 1);
+            const auto& buffer = _sbuf[slot];
+            LOG(WARNING) << "URMA failed SEND buffer: slot=" << slot
+                         << " bytes=" << buffer.size()
+                         << " blocks=" << buffer.backing_block_num()
+                         << " on " << _socket->description();
+            for (size_t i = 0; i < buffer.backing_block_num(); ++i) {
+                const auto block = buffer.backing_block(i);
+                auto* segment = GetPoolSegFor(const_cast<char*>(block.data()));
+                LOG(WARNING) << "URMA failed SEND block: slot=" << slot
+                             << " block=" << i
+                             << " address=" << reinterpret_cast<uint64_t>(block.data())
+                             << " length=" << block.size()
+                             << " pool_segment=" << (segment != nullptr)
+                             << " segment_va=" << (segment ? segment->seg.ubva.va : 0)
+                             << " segment_len=" << (segment ? segment->seg.len : 0)
+                             << " segment_token_id=" << (segment ? segment->seg.token_id : 0)
+                             << " on " << _socket->description();
+            }
+        }
         switch (cr.status) {
         case URMA_CR_ACK_TIMEOUT_ERR:
             ReportFailure(UrmaFailureReason::RETRY_EXHAUSTED);

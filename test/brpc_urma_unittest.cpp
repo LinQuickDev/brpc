@@ -274,6 +274,44 @@ TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
     EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(attr, URMA_UTP));
 }
 
+TEST(UrmaHelperTest, local_sge_initializes_optional_fields_and_accepts_segment_edges) {
+    urma_target_seg_t segment{};
+    segment.urma_ctx = urma::GetUrmaContext();
+    segment.seg.ubva.va = 0x1000;
+    segment.seg.len = 8192;
+    urma_sge_t sge;
+    memset(&sge, 0xff, sizeof(sge));
+    ASSERT_TRUE(urma::InitUrmaLocalSge(&sge, 0x1000, 8192, &segment));
+    EXPECT_EQ(0x1000u, sge.addr);
+    EXPECT_EQ(8192u, sge.len);
+    EXPECT_EQ(&segment, sge.tseg);
+    EXPECT_EQ(nullptr, sge.user_tseg);
+    ASSERT_TRUE(urma::InitUrmaLocalSge(&sge, 0x2fff, 1, &segment));
+    EXPECT_EQ(0x2fffu, sge.addr);
+    EXPECT_EQ(1u, sge.len);
+}
+
+TEST(UrmaHelperTest, local_sge_rejects_out_of_range_and_wrong_context) {
+    urma_target_seg_t segment{};
+    segment.urma_ctx = urma::GetUrmaContext();
+    segment.seg.ubva.va = 0x1000;
+    segment.seg.len = 8192;
+    urma_sge_t sge{};
+    for (auto values : {std::pair<uint64_t, size_t>(0xfff, 1),
+                        {0x3000, 1}, {0x2fff, 2}, {0x1000, 0},
+                        {0x1000, static_cast<size_t>(UINT32_MAX) + 1}}) {
+        EXPECT_FALSE(urma::InitUrmaLocalSge(&sge, values.first, values.second, &segment));
+        EXPECT_EQ(ERDMAMEM, errno);
+    }
+    EXPECT_FALSE(urma::InitUrmaLocalSge(&sge, 0x1000, 1, nullptr));
+    segment.urma_ctx = reinterpret_cast<urma_context_t*>(1);
+    EXPECT_FALSE(urma::InitUrmaLocalSge(&sge, 0x1000, 1, &segment));
+    segment.urma_ctx = urma::GetUrmaContext();
+    segment.seg.ubva.va = UINT64_MAX - 7;
+    segment.seg.len = 16;
+    EXPECT_FALSE(urma::InitUrmaLocalSge(&sge, UINT64_MAX - 3, 2, &segment));
+}
+
 // ---------------------------------------------------------------------------
 // SupportedByUrma: only baidu_std.
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <new>
 #include <utility>
 #include <vector>
@@ -416,6 +417,26 @@ urma_target_seg_t* GetPoolSegFor(void* buf) {
         return g_pool_seg;
     }
     return nullptr;
+}
+
+bool InitUrmaLocalSge(urma_sge_t* sge, uint64_t address, size_t length,
+                      urma_target_seg_t* segment) {
+    if (!sge || !segment || length == 0 ||
+        length > std::numeric_limits<uint32_t>::max() ||
+        segment->urma_ctx != GetUrmaContext()) {
+        errno = ERDMAMEM;
+        return false;
+    }
+    const uint64_t base = segment->seg.ubva.va;
+    const uint64_t size = segment->seg.len;
+    if (size > std::numeric_limits<uint64_t>::max() - base ||
+        address < base || address - base > size ||
+        length > size - (address - base)) {
+        errno = ERDMAMEM;
+        return false;
+    }
+    *sge = urma_sge_t{address, static_cast<uint32_t>(length), segment, nullptr};
+    return true;
 }
 
 static void GlobalRelease() {
