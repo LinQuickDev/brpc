@@ -687,6 +687,31 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
     return -1;
 }
 uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
+
+bool IsUrmaCtpPrioritySupported(const urma_device_attr_t& attr, int priority) {
+    return priority >= 0 && priority <= URMA_MAX_PRIORITY &&
+           attr.dev_cap.priority_info[priority].tp_type.bs.ctp;
+}
+
+bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority) {
+    if (!qos.IsValid()) {
+        errno = EINVAL;
+        return false;
+    }
+    if (qos.priority == -1) {
+        *priority = GetUrmaJettyPriority();
+        return true;
+    }
+    if (!IsUrmaAvailable() || !g_context ||
+        !IsUrmaCtpPrioritySupported(g_device_attr, qos.priority)) {
+        LOG(ERROR) << "URMA priority " << qos.priority
+                   << " does not advertise CTP on the selected device";
+        errno = EINVAL;
+        return false;
+    }
+    *priority = static_cast<uint8_t>(qos.priority);
+    return true;
+}
 int GetUrmaMaxSge() { return g_max_sge; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }
 

@@ -29,6 +29,7 @@
 #if BRPC_WITH_URMA
 
 #include "urma_api.h"
+#include "brpc/urma/urma_qos.h"
 #include "urma_types.h"
 
 namespace brpc {
@@ -82,6 +83,11 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
 
 // Return the priority selected for the CTP jettys created by brpc.
 uint8_t GetUrmaJettyPriority();
+
+// Check whether an explicit priority advertises the CTP path used by brpc.
+bool IsUrmaCtpPrioritySupported(const urma_device_attr_t& attr, int priority);
+// Resolve automatic selection or validate against the initialized device.
+bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority);
 
 // If the URMA environment is available.
 bool IsUrmaAvailable();

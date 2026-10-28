@@ -207,3 +207,34 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+## Business priority
+
+Set `ChannelOptions.urma_qos.priority` for outgoing requests and
+`ServerOptions.urma_qos.priority` for outgoing responses:
+
+```cpp
+brpc::ChannelOptions client_options;
+client_options.socket_mode = brpc::SOCKET_MODE_URMA;
+client_options.urma_qos.priority = 10;
+
+brpc::ServerOptions server_options;
+server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+server_options.urma_qos.priority = 6;
+```
+
+The default -1 keeps automatic selection: the first CTP priority reported by the
+device, with the existing compatibility value 6 when none is reported. Explicit
+values are in [0,15] and require CTP in `priority_info[priority].tp_type` on the
+selected device. Channel initialization and Server startup reject unsupported
+values. Device and network configuration determine SL mapping and scheduling.
+
+Different priorities use separate connections and Jettys; equal configurations
+share connections. Naming services, pooled and short connections, accepted sockets
+and rebuilt Jettys inherit the configuration. The prepared pool serves matching
+priorities; other priorities allocate Jettys on demand. Debug output shows both
+the configured and effective priority. Each peer configures its outgoing direction;
+v2/v3 handshake formats remain the same.
+
+The client and server in `example/urma_performance` accept `--urma_priority=10`.
+Compare throughput and P99 under competing priorities using the device SL mapping.

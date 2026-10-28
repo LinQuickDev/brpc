@@ -30,6 +30,7 @@
 
 DEFINE_int32(port, 8003, "TCP Port of this server");
 DEFINE_bool(use_urma, true, "Use URMA transport (true) or TCP (false)");
+DEFINE_int32(urma_priority, -1, "Outbound URMA priority: -1 automatic, or [0,15]");
 
 butil::atomic<uint64_t> g_last_time(0);
 
@@ -73,6 +74,7 @@ int main(int argc, char* argv[]) {
     }
 
     brpc::ServerOptions options;
+    options.urma_qos.priority = FLAGS_urma_priority;
     options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA
                                           : brpc::SOCKET_MODE_TCP;
     if (server.Start(FLAGS_port, &options) != 0) {

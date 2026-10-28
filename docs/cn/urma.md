@@ -193,3 +193,31 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+## 业务优先级
+
+`ChannelOptions.urma_qos.priority` 控制请求发送方向，
+`ServerOptions.urma_qos.priority` 控制响应发送方向：
+
+```cpp
+brpc::ChannelOptions client_options;
+client_options.socket_mode = brpc::SOCKET_MODE_URMA;
+client_options.urma_qos.priority = 10;
+
+brpc::ServerOptions server_options;
+server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+server_options.urma_qos.priority = 6;
+```
+
+默认值 -1 沿用设备自动选择，取设备能力表中首个 CTP priority；未报告时沿用兼容值 6。
+显式值范围为 0–15，并要求所选设备的 `priority_info[priority].tp_type` 包含 CTP。
+不满足范围或能力要求时，Channel 初始化和 Server 启动返回错误。
+priority 对应的 SL 和调度待遇由设备及网络配置决定。
+
+不同 priority 使用独立连接和 Jetty，相同配置共享连接。配置继承到服务发现、连接池、
+短连接和服务端 accept 路径，重建时重新应用。默认预建池只用于匹配其 priority 的连接，
+其他 priority 按需创建 Jetty。连接调试信息显示配置值和实际 Jetty priority。
+请求和响应分别配置各自的发送策略，v2/v3 握手格式沿用现有协议。
+
+`example/urma_performance` 的 client/server 支持 `--urma_priority=10`。
+以不同 priority 启动竞争流量，对比吞吐和 P99，并结合设备 SL 映射验证调度效果。

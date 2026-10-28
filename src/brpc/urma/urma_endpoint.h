@@ -100,6 +100,7 @@ struct UrmaResource {
 // windows, and the registered buffer bookkeeping. Cache-line padded to avoid
 // false sharing between connections.
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
+    friend class UrmaQosTestPeer;
     friend class UrmaConnect;
     friend class Socket;
     friend class UrmaTransport;

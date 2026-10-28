@@ -39,6 +39,7 @@
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
 #include "brpc/rdma/rdma_qos.h"
+#include "brpc/urma/urma_qos.h"
 
 namespace brpc {
 
@@ -114,6 +115,9 @@ struct ChannelOptions {
 
     // Outbound RDMA QoS for this Channel. Used when socket_mode is RDMA.
     RdmaQosOptions rdma_qos;
+
+    // Outbound URMA QoS for this Channel. Used when socket_mode is URMA.
+    UrmaQosOptions urma_qos;
 
     // Turn on authentication for this channel if `auth' is not nullptr.
     // Note `auth' will not be deleted by channel and must remain valid when
