@@ -220,4 +220,29 @@ priority 对应的 SL 和调度待遇由设备及网络配置决定。
 请求和响应分别配置各自的发送策略，v2/v3 握手格式沿用现有协议。
 
 `example/urma_performance` 的 client/server 支持 `--urma_priority=10`。
-以不同 priority 启动竞争流量，对比吞吐和 P99，并结合设备 SL 映射验证调度效果。
+示例中的 6 和 10 须在所选设备上报告 CTP 能力；数字大小不代表调度优先关系。
+
+### 实机验证
+
+先使用同一对设备验证原生 RM、CTP、共享 JFR 数据通路。设置本机 `URMA_DEVICE`，
+客户端另设 `SERVER_IP`，先启动服务端，再启动客户端：
+
+```bash
+# 服务端
+urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
+    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003
+# 客户端
+urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
+    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003 -S "$SERVER_IP"
+```
+
+两端再将 `-I 0` 改为 `-I 64` 做 inline 对照。原生测试通过后，用
+`--urma_priority=-1` 完成 brpc 单流基线，再逐个测试设备支持的显式 priority，
+请求、响应方向分别改变配置。连接调试信息应为 `state=ESTABLISHED`，并显示预期的
+`urma_effective_priority`；TCP 回落的吞吐数据不计入 URMA QoS 结果。
+最后启动竞争流量，结合设备 SL 映射、队列计数器、吞吐和 P99 验证调度效果。
+
+记录两端内核、UMDK、provider 和固件版本。`status=4` 是本地内存访问错误；
+原生测试出现该错误时先定位数据通路。brpc 完成错误日志包含收发方向、配置 priority
+和实际 Jetty priority，初始化日志包含 `default_priority`。mock 测试验证配置传递和
+Jetty 属性，报文标记与调度效果由实机测试验证。

@@ -22,6 +22,7 @@
 #include <gflags/gflags.h>
 
 #if BRPC_WITH_URMA
+#include "butil/logging.h"
 #include "brpc/acceptor.h"
 #include "brpc/channel.h"
 #include "brpc/controller.h"
@@ -48,6 +49,9 @@ public:
     static int Priority(UrmaEndpoint* ep) {
         return ep->_resource->jetty->jetty_cfg.jfs_cfg.priority;
     }
+    static ssize_t Complete(UrmaEndpoint* ep, const urma_cr_t& cr) {
+        return ep->HandleCompletion(cr);
+    }
 };
 
 }  // namespace urma
@@ -64,6 +68,24 @@ TEST(UrmaHelperTest, explicit_priority_requires_ctp_capability) {
     for (int priority : {-2, -1, 3, 4, 16}) {
         EXPECT_FALSE(urma::IsUrmaCtpPrioritySupported(attr, priority));
     }
+}
+
+TEST(UrmaHelperTest, automatic_priority_accepts_combined_capabilities) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[10].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[10].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[15].tp_type.bs.ctp = 1;
+    EXPECT_EQ(3, urma::FindUrmaPriorityForTpType(attr, URMA_RTP));
+    EXPECT_EQ(10, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
+    EXPECT_TRUE(urma::IsUrmaCtpPrioritySupported(attr, 10));
+    EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(attr, URMA_UTP));
+    EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(
+        attr, static_cast<urma_tp_type_t>(-1)));
+    attr.dev_cap.priority_info[10].tp_type.bs.ctp = 0;
+    EXPECT_EQ(15, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
+    attr.dev_cap.priority_info[15].tp_type.bs.ctp = 0;
+    EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
 }
 
 class UrmaQosTest : public ::testing::Test {
@@ -192,6 +214,50 @@ TEST_F(UrmaQosTest, prepared_jettys_are_used_only_for_matching_priority) {
         std::ostringstream debug;
         ep->DebugInfo(debug);
         EXPECT_NE(std::string::npos, debug.str().find("urma_effective_priority="));
+        socket->SetFailed();
+    }
+}
+
+TEST_F(UrmaQosTest, access_error_preserves_priority_and_reports_direction) {
+    for (int priority : {-1, 10}) {
+        SocketOptions options;
+        options.socket_mode = SOCKET_MODE_URMA;
+        options.urma_qos.priority = priority;
+        SocketId sid;
+        ASSERT_EQ(0, Socket::Create(options, &sid));
+        SocketUniquePtr socket;
+        ASSERT_EQ(0, Socket::Address(sid, &socket));
+        auto* ep = Endpoint(socket);
+        ASSERT_EQ(0, urma::UrmaQosTestPeer::Allocate(ep));
+        const int effective =
+            priority == -1 ? urma::GetUrmaJettyPriority() : priority;
+        for (bool receive : {false, true}) {
+            urma_cr_t cr{};
+            cr.status = URMA_CR_LOC_ACCESS_ERR;
+            cr.flag.bs.s_r = receive;
+            cr.local_id = 42;
+#if !BRPC_WITH_GLOG
+            logging::StringSink log;
+            logging::LogSink* old_sink = logging::SetLogSink(&log);
+#endif
+            const ssize_t result = urma::UrmaQosTestPeer::Complete(ep, cr);
+            const int saved_errno = errno;
+#if !BRPC_WITH_GLOG
+            logging::SetLogSink(old_sink);
+            EXPECT_NE(std::string::npos, log.find("status=4")) << log;
+            EXPECT_NE(std::string::npos,
+                      log.find(receive ? "direction=recv" : "direction=send")) << log;
+            EXPECT_NE(std::string::npos, log.find("local_id=42")) << log;
+            EXPECT_NE(std::string::npos,
+                      log.find("urma_priority=" + std::to_string(priority))) << log;
+            EXPECT_NE(std::string::npos,
+                      log.find("urma_effective_priority=" +
+                               std::to_string(effective))) << log;
+#endif
+            EXPECT_EQ(-1, result);
+            EXPECT_EQ(EIO, saved_errno);
+            EXPECT_EQ(effective, urma::UrmaQosTestPeer::Priority(ep));
+        }
         socket->SetFailed();
     }
 }

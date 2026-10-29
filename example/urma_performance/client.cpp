@@ -112,7 +112,9 @@ int main(int argc, char* argv[]) {
     stub.Test(&warmup_cntl, &warmup_req, &warmup_resp, nullptr);
     if (warmup_cntl.Failed()) {
         LOG(ERROR) << "Warm-up RPC failed after timeout_ms="
-                   << FLAGS_rpc_timeout_ms << ": "
+                   << FLAGS_rpc_timeout_ms
+                   << " use_urma=" << FLAGS_use_urma
+                   << " urma_priority=" << FLAGS_urma_priority << ": "
                    << warmup_cntl.ErrorText();
         return -1;
     }
@@ -133,6 +135,7 @@ int main(int argc, char* argv[]) {
     }
     LOG(INFO) << "URMA performance client started (server=" << FLAGS_server
               << ", use_urma=" << FLAGS_use_urma
+              << ", urma_priority=" << FLAGS_urma_priority
               << ", threads=" << thread_num
               << ", rpc_timeout_ms=" << FLAGS_rpc_timeout_ms << ")";
     while (!brpc::IsAskedToQuit()) {

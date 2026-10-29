@@ -237,4 +237,32 @@ the configured and effective priority. Each peer configures its outgoing directi
 v2/v3 handshake formats remain the same.
 
 The client and server in `example/urma_performance` accept `--urma_priority=10`.
-Compare throughput and P99 under competing priorities using the device SL mapping.
+The example values 6 and 10 require advertised CTP support on the selected device;
+their numeric order does not specify scheduling precedence.
+
+### Hardware validation
+
+First test the same device pair with native RM, CTP and shared JFR. Set the local
+`URMA_DEVICE` on each host and `SERVER_IP` on the client. Start the server first:
+
+```bash
+# Server
+urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
+    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003
+# Client
+urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
+    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003 -S "$SERVER_IP"
+```
+
+Repeat with `-I 64` on both hosts for the inline comparison. Once native tests
+pass, establish a single-flow brpc baseline with `--urma_priority=-1`, then test
+supported explicit priorities, changing the request and response directions
+separately. Connection debug output must show `state=ESTABLISHED` and the expected
+`urma_effective_priority`. Exclude TCP fallback measurements from URMA QoS results.
+Then compare device SL mappings, queue counters, throughput and P99 under contention.
+
+Record kernel, UMDK, provider and firmware versions on both hosts. Status 4 means
+a local memory access error; resolve native data-path failures before measuring
+QoS. brpc completion errors log the direction and configured/effective priorities;
+initialization logs `default_priority`. Mock tests check configuration propagation
+and Jetty attributes; hardware tests check packet markings and scheduling effects.

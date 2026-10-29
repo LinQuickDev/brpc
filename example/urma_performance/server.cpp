@@ -82,7 +82,8 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     LOG(INFO) << "URMA performance server started on port " << FLAGS_port
-              << " (use_urma=" << FLAGS_use_urma << ")";
+              << " (use_urma=" << FLAGS_use_urma
+              << ", urma_priority=" << FLAGS_urma_priority << ")";
     server.RunUntilAskedToQuit();
     return 0;
 }

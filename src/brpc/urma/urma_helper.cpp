@@ -628,6 +628,7 @@ static bool GlobalUrmaInitializeImpl() {
     // resources on exit; GlobalRelease remains available for init rollback.
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
+              << " default_priority=" << static_cast<int>(g_jetty_priority)
               << " max_sge=" << g_max_sge
               << " buffer_size=" << g_pool_buffer_size
               << " buffer_count=" << g_pool->buffer_count();
@@ -679,8 +680,8 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
                               urma_tp_type_t tp_type) {
     const union urma_tp_type_en expected = TpTypeCapability(tp_type);
     for (int priority = 0; priority <= URMA_MAX_PRIORITY; ++priority) {
-        if (attr.dev_cap.priority_info[priority].tp_type.value ==
-            expected.value) {
+        if ((attr.dev_cap.priority_info[priority].tp_type.value &
+             expected.value) != 0) {
             return priority;
         }
     }

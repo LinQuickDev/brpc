@@ -932,7 +932,21 @@ int UrmaEndpoint::SendAck(int num) {
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        LOG(WARNING) << "URMA completion failed, status=" << cr.status;
+        LOG(WARNING) << "URMA completion failed, status=" << cr.status
+                     << " direction=" << (cr.flag.bs.s_r ? "recv" : "send")
+                     << " flags=" << static_cast<unsigned>(cr.flag.value)
+                     << " opcode=" << cr.opcode
+                     << " local_id=" << cr.local_id
+                     << " tpn=" << cr.tpn
+                     << " user_ctx=" << cr.user_ctx
+                     << " completion_len=" << cr.completion_len
+                     << " urma_priority=" << _socket->urma_qos().priority
+                     << " urma_effective_priority="
+                     << (_resource && _resource->jetty ?
+                         static_cast<int>(
+                             _resource->jetty->jetty_cfg.jfs_cfg.priority) : -1)
+                     << " state=" << GetStateStr()
+                     << " on " << _socket->description();
         errno = EIO;
         return -1;
     }
