@@ -29,6 +29,7 @@
 #include <atomic>
 #include <functional>
 #include <new>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -629,6 +630,7 @@ static bool GlobalUrmaInitializeImpl() {
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
               << " default_priority=" << static_cast<int>(g_jetty_priority)
+              << " default_sl=" << GetUrmaServiceLevelForPriority(g_jetty_priority)
               << " max_sge=" << g_max_sge
               << " buffer_size=" << g_pool_buffer_size
               << " buffer_count=" << g_pool->buffer_count();
@@ -694,24 +696,85 @@ bool IsUrmaCtpPrioritySupported(const urma_device_attr_t& attr, int priority) {
            attr.dev_cap.priority_info[priority].tp_type.bs.ctp;
 }
 
-bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority) {
+static std::string DescribeUrmaCtpSlMap(const urma_device_attr_t& attr) {
+    std::ostringstream os;
+    os << '[';
+    bool first = true;
+    for (int priority = 0; priority <= URMA_MAX_PRIORITY; ++priority) {
+        if (IsUrmaCtpPrioritySupported(attr, priority)) {
+            if (!first) {
+                os << ',';
+            }
+            first = false;
+            os << priority << ':' << attr.dev_cap.priority_info[priority].SL;
+        }
+    }
+    os << ']';
+    return os.str();
+}
+
+bool ResolveUrmaJettyPriority(const urma_device_attr_t& attr,
+                             const UrmaQosOptions& qos, uint8_t default_priority,
+                             uint8_t* priority) {
     if (!qos.IsValid()) {
         errno = EINVAL;
         return false;
     }
+    if (qos.priority == -1 && qos.service_level == -1) {
+        *priority = default_priority;
+        return true;
+    }
     if (qos.priority == -1) {
+        for (int p = 0; p <= URMA_MAX_PRIORITY; ++p) {
+            if (IsUrmaCtpPrioritySupported(attr, p) &&
+                attr.dev_cap.priority_info[p].SL ==
+                    static_cast<uint32_t>(qos.service_level)) {
+                *priority = static_cast<uint8_t>(p);
+                return true;
+            }
+        }
+        LOG(ERROR) << "URMA SL " << qos.service_level
+                   << " has no CTP priority; supported priority:SL="
+                   << DescribeUrmaCtpSlMap(attr);
+    } else if (!IsUrmaCtpPrioritySupported(attr, qos.priority)) {
+        LOG(ERROR) << "URMA priority " << qos.priority
+                   << " does not advertise CTP on the selected device; "
+                      "requested SL=" << qos.service_level
+                   << "; supported priority:SL=" << DescribeUrmaCtpSlMap(attr);
+    } else if (qos.service_level != -1 &&
+               attr.dev_cap.priority_info[qos.priority].SL !=
+                   static_cast<uint32_t>(qos.service_level)) {
+        LOG(ERROR) << "URMA priority " << qos.priority << " maps to SL "
+                   << attr.dev_cap.priority_info[qos.priority].SL
+                   << ", requested SL=" << qos.service_level
+                   << "; supported priority:SL=" << DescribeUrmaCtpSlMap(attr);
+    } else {
+        *priority = static_cast<uint8_t>(qos.priority);
+        return true;
+    }
+    errno = EINVAL;
+    return false;
+}
+
+bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority) {
+    if (qos.IsValid() && qos.priority == -1 && qos.service_level == -1) {
         *priority = GetUrmaJettyPriority();
         return true;
     }
-    if (!IsUrmaAvailable() || !g_context ||
-        !IsUrmaCtpPrioritySupported(g_device_attr, qos.priority)) {
-        LOG(ERROR) << "URMA priority " << qos.priority
-                   << " does not advertise CTP on the selected device";
+    if (!IsUrmaAvailable() || !g_context) {
+        LOG(ERROR) << "URMA QoS requires an initialized device: priority="
+                   << qos.priority << " SL=" << qos.service_level;
         errno = EINVAL;
         return false;
     }
-    *priority = static_cast<uint8_t>(qos.priority);
-    return true;
+    return ResolveUrmaJettyPriority(g_device_attr, qos, GetUrmaJettyPriority(), priority);
+}
+
+int64_t GetUrmaServiceLevelForPriority(int priority) {
+    if (!g_context || !IsUrmaCtpPrioritySupported(g_device_attr, priority)) {
+        return -1;
+    }
+    return g_device_attr.dev_cap.priority_info[priority].SL;
 }
 int GetUrmaMaxSge() { return g_max_sge; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }

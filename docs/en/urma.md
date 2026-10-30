@@ -208,37 +208,45 @@ is tracked as a future enhancement.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
 
-## Business priority
+## Business SL and priority
 
-Set `ChannelOptions.urma_qos.priority` for outgoing requests and
-`ServerOptions.urma_qos.priority` for outgoing responses:
+Set `ChannelOptions.urma_qos` for outgoing requests and
+`ServerOptions.urma_qos` for outgoing responses:
 
 ```cpp
 brpc::ChannelOptions client_options;
 client_options.socket_mode = brpc::SOCKET_MODE_URMA;
-client_options.urma_qos.priority = 10;
+client_options.urma_qos.service_level = 6;
 
 brpc::ServerOptions server_options;
 server_options.socket_mode = brpc::SOCKET_MODE_URMA;
-server_options.urma_qos.priority = 6;
+server_options.urma_qos.service_level = 7;
 ```
 
-The default -1 keeps automatic selection: the first CTP priority reported by the
-device, with the existing compatibility value 6 when none is reported. Explicit
-values are in [0,15] and require CTP in `priority_info[priority].tp_type` on the
-selected device. Channel initialization and Server startup reject unsupported
-values. Device and network configuration determine SL mapping and scheduling.
+The current path uses RM and CTP. CTP derives SL from
+`priority_info[priority].SL`; SL and priority need not have equal numeric values.
+`service_level` defaults to -1 (unspecified), with explicit values in [0,255].
+An explicit SL selects the first priority with both that SL and CTP capability.
+`priority` can also be set explicitly in [0,15]. When both are specified, the
+device mapping must satisfy both. Channel initialization and Server startup
+reject unsupported or conflicting requests and report supported priority:SL pairs.
+For example, if only priority 6/SL 6 and priority 7/SL 7 support CTP, SL 10 is rejected.
 
-Different priorities use separate connections and Jettys; equal configurations
+With both fields at -1, automatic selection retains the first CTP priority and
+the existing compatibility value 6 when none is reported. The platform configures
+device mappings and scheduling; brpc uses the initialization snapshot. Restart
+processes after changing platform mappings. Validation applies to the RM/CTP path.
+
+Different SL/priority configurations use separate connections; equal configurations
 share connections. Naming services, pooled and short connections, accepted sockets
 and rebuilt Jettys inherit the configuration. The prepared pool serves matching
-priorities; other priorities allocate Jettys on demand. Debug output shows both
-the configured and effective priority. Each peer configures its outgoing direction;
+priorities; other priorities allocate Jettys on demand. Debug output shows the
+requested SL/priority, Jetty priority and mapped SL. Each peer configures its outgoing direction;
 v2/v3 handshake formats remain the same.
 
-The client and server in `example/urma_performance` accept `--urma_priority=10`.
-The example values 6 and 10 require advertised CTP support on the selected device;
-their numeric order does not specify scheduling precedence.
+The client and server in `example/urma_performance` accept `--urma_sl=6` and
+`--urma_priority=6`. Example values require matching CTP mappings on the selected
+device; their numeric order does not specify scheduling precedence.
 
 ### Hardware validation
 
@@ -255,14 +263,15 @@ urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
 ```
 
 Repeat with `-I 64` on both hosts for the inline comparison. Once native tests
-pass, establish a single-flow brpc baseline with `--urma_priority=-1`, then test
-supported explicit priorities, changing the request and response directions
-separately. Connection debug output must show `state=ESTABLISHED` and the expected
-`urma_effective_priority`. Exclude TCP fallback measurements from URMA QoS results.
+pass, establish a single-flow brpc baseline with default SL/priority, then test
+supported explicit SLs, changing the request and response directions separately.
+Verify that unsupported SLs and conflicting settings fail initialization.
+Connection debug output must show `state=ESTABLISHED` and the expected
+`urma_effective_priority` and `urma_effective_sl`. Exclude TCP fallback measurements from URMA QoS results.
 Then compare device SL mappings, queue counters, throughput and P99 under contention.
 
 Record kernel, UMDK, provider and firmware versions on both hosts. Status 4 means
 a local memory access error; resolve native data-path failures before measuring
-QoS. brpc completion errors log the direction and configured/effective priorities;
-initialization logs `default_priority`. Mock tests check configuration propagation
+QoS. brpc completion errors log the direction, requested SL/priority, Jetty priority
+and mapped SL; initialization logs `default_priority` and `default_sl`. Mock tests check configuration propagation
 and Jetty attributes; hardware tests check packet markings and scheduling effects.

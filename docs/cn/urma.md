@@ -194,33 +194,39 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
 
-## 业务优先级
+## 业务 SL 与优先级
 
-`ChannelOptions.urma_qos.priority` 控制请求发送方向，
-`ServerOptions.urma_qos.priority` 控制响应发送方向：
+`ChannelOptions.urma_qos` 控制请求发送方向，
+`ServerOptions.urma_qos` 控制响应发送方向：
 
 ```cpp
 brpc::ChannelOptions client_options;
 client_options.socket_mode = brpc::SOCKET_MODE_URMA;
-client_options.urma_qos.priority = 10;
+client_options.urma_qos.service_level = 6;
 
 brpc::ServerOptions server_options;
 server_options.socket_mode = brpc::SOCKET_MODE_URMA;
-server_options.urma_qos.priority = 6;
+server_options.urma_qos.service_level = 7;
 ```
 
-默认值 -1 沿用设备自动选择，取设备能力表中首个 CTP priority；未报告时沿用兼容值 6。
-显式值范围为 0–15，并要求所选设备的 `priority_info[priority].tp_type` 包含 CTP。
-不满足范围或能力要求时，Channel 初始化和 Server 启动返回错误。
-priority 对应的 SL 和调度待遇由设备及网络配置决定。
+当前使用 RM＋CTP。CTP 的 SL 由设备 `priority_info[priority].SL` 决定，
+业务 SL 与 priority 数字可以不同。`service_level` 默认为 -1，表示不指定 SL；
+显式范围为 0–255。指定 SL 后，选择首个同时匹配该 SL 且包含 CTP 能力的 priority。
+`priority` 可单独指定，范围为 0–15；同时指定 SL 和 priority 时，两者必须匹配设备映射。
+找不到 CTP 映射或配置冲突时，Channel 初始化和 Server 启动报错，列出支持的 priority:SL。
+例如设备只有 priority 6→SL 6、priority 7→SL 7 支持 CTP 时，SL 10 会被拒绝。
 
-不同 priority 使用独立连接和 Jetty，相同配置共享连接。配置继承到服务发现、连接池、
+两项均为 -1 时沿用原自动选择：首个 CTP priority，未报告时使用兼容值 6。
+设备全局映射与调度待遇由平台配置；brpc 使用初始化时读取的映射，平台修改后重启进程加载。
+本接口按当前 RM＋CTP 路径校验。
+
+不同 SL/priority 配置使用独立连接，相同配置共享连接。配置继承到服务发现、连接池、
 短连接和服务端 accept 路径，重建时重新应用。默认预建池只用于匹配其 priority 的连接，
-其他 priority 按需创建 Jetty。连接调试信息显示配置值和实际 Jetty priority。
+其他 priority 按需创建 Jetty。连接调试信息显示请求 SL/priority、Jetty priority 和映射 SL。
 请求和响应分别配置各自的发送策略，v2/v3 握手格式沿用现有协议。
 
-`example/urma_performance` 的 client/server 支持 `--urma_priority=10`。
-示例中的 6 和 10 须在所选设备上报告 CTP 能力；数字大小不代表调度优先关系。
+`example/urma_performance` 的 client/server 支持 `--urma_sl=6` 和 `--urma_priority=6`。
+示例值须在设备上有匹配的 CTP 映射，数字大小不代表调度优先关系。
 
 ### 实机验证
 
@@ -237,12 +243,13 @@ urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
 ```
 
 两端再将 `-I 0` 改为 `-I 64` 做 inline 对照。原生测试通过后，用
-`--urma_priority=-1` 完成 brpc 单流基线，再逐个测试设备支持的显式 priority，
-请求、响应方向分别改变配置。连接调试信息应为 `state=ESTABLISHED`，并显示预期的
-`urma_effective_priority`；TCP 回落的吞吐数据不计入 URMA QoS 结果。
+默认 SL/priority 完成 brpc 单流基线，再逐个测试设备支持的显式 SL，
+请求、响应方向分别改变配置，并验证不支持的 SL 和冲突配置在初始化时被拒绝。
+连接调试信息应为 `state=ESTABLISHED`，并显示预期的 `urma_effective_priority` 与
+`urma_effective_sl`；TCP 回落的吞吐数据不计入 URMA QoS 结果。
 最后启动竞争流量，结合设备 SL 映射、队列计数器、吞吐和 P99 验证调度效果。
 
 记录两端内核、UMDK、provider 和固件版本。`status=4` 是本地内存访问错误；
-原生测试出现该错误时先定位数据通路。brpc 完成错误日志包含收发方向、配置 priority
-和实际 Jetty priority，初始化日志包含 `default_priority`。mock 测试验证配置传递和
+原生测试出现该错误时先定位数据通路。brpc 完成错误日志包含收发方向、请求 SL/priority、
+Jetty priority 和映射 SL，初始化日志包含 `default_priority`、`default_sl`。mock 测试验证配置传递和
 Jetty 属性，报文标记与调度效果由实机测试验证。

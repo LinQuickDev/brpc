@@ -145,6 +145,7 @@ static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
         } else if (opt.socket_mode == SOCKET_MODE_URMA) {
             buf.append("|urma");
             buf.append("|priority=").append(std::to_string(opt.urma_qos.priority));
+            buf.append("|sl=").append(std::to_string(opt.urma_qos.service_level));
         }
         butil::MurmurHash3_x64_128_Update(&mm_ctx, buf.data(), buf.size());
         buf.clear();
@@ -196,7 +197,8 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         return -1;
     }
     if (_options.socket_mode == SOCKET_MODE_URMA && !_options.urma_qos.IsValid()) {
-        LOG(ERROR) << "URMA priority must be -1 (automatic) or in [0,15]";
+        LOG(ERROR) << "URMA priority must be -1 or in [0,15], "
+                      "and SL must be -1 or in [0,255]";
         return -1;
     }
     const Protocol* protocol = FindProtocol(_options.protocol);

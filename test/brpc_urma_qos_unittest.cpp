@@ -88,6 +88,73 @@ TEST(UrmaHelperTest, automatic_priority_accepts_combined_capabilities) {
     EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
 }
 
+TEST(UrmaHelperTest, service_level_selects_ctp_priority_from_mapping) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[3].SL = 6;
+    attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[6].SL = 7;
+    attr.dev_cap.priority_info[10].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[10].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[10].SL = 6;
+    attr.dev_cap.priority_info[15].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[15].SL = 6;
+    UrmaQosOptions qos;
+    uint8_t priority = 0;
+    qos.service_level = 6;
+    ASSERT_TRUE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(10, priority);
+    qos.service_level = 7;
+    ASSERT_TRUE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(6, priority);
+    qos.priority = 6;
+    ASSERT_TRUE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(6, priority);
+    attr.dev_cap.priority_info[15].SL = 255;
+    qos.priority = -1;
+    qos.service_level = 255;
+    ASSERT_TRUE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(15, priority);
+    qos.service_level = -1;
+    attr = urma_device_attr_t{};
+    ASSERT_TRUE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(6, priority);
+}
+
+TEST(UrmaHelperTest, service_level_rejects_unsupported_and_conflicting_mapping) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[3].SL = 3;
+    attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[6].SL = 2;
+    attr.dev_cap.priority_info[10].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[10].SL = 4;
+    UrmaQosOptions qos;
+    uint8_t priority = 255;
+    for (int sl : {-2, 0, 3, 6, 255, 256}) {
+        qos.service_level = sl;
+        EXPECT_FALSE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+        EXPECT_EQ(EINVAL, errno);
+        EXPECT_EQ(255, priority);
+    }
+    qos.priority = 6;
+    qos.service_level = 4;
+    EXPECT_FALSE(urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority));
+    EXPECT_EQ(EINVAL, errno);
+    EXPECT_EQ(255, priority);
+#if !BRPC_WITH_GLOG
+    qos.priority = -1;
+    qos.service_level = 3;
+    logging::StringSink log;
+    logging::LogSink* old_sink = logging::SetLogSink(&log);
+    const bool resolved = urma::ResolveUrmaJettyPriority(attr, qos, 6, &priority);
+    logging::SetLogSink(old_sink);
+    EXPECT_FALSE(resolved);
+    EXPECT_NE(std::string::npos, log.find("SL 3 has no CTP priority")) << log;
+    EXPECT_NE(std::string::npos, log.find("[6:2,10:4]")) << log;
+#endif
+}
+
 class UrmaQosTest : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -162,6 +229,39 @@ TEST_F(UrmaQosTest, rejects_invalid_and_unsupported_priority) {
     }
 }
 
+TEST_F(UrmaQosTest, rejects_invalid_unsupported_and_conflicting_service_level) {
+    struct RequestedQos { int priority; int sl; };
+    for (const auto& requested : {RequestedQos{-1, -2}, {-1, 256}, {-1, 0},
+                                 {-1, 3}, {-1, 6}, {-1, 255}, {6, 4}, {3, 3}}) {
+        ChannelOptions co;
+        co.socket_mode = SOCKET_MODE_URMA;
+        co.urma_qos.priority = requested.priority;
+        co.urma_qos.service_level = requested.sl;
+        Channel channel;
+        EXPECT_EQ(-1, channel.Init("127.0.0.1:8123", &co));
+        ServerOptions so;
+        so.socket_mode = SOCKET_MODE_URMA;
+        so.urma_qos = co.urma_qos;
+        Server server;
+        EXPECT_EQ(-1, server.Start("127.0.0.1:0", &so));
+        SocketOptions options;
+        options.socket_mode = SOCKET_MODE_URMA;
+        options.urma_qos = co.urma_qos;
+        SocketId sid;
+        if (!co.urma_qos.IsValid()) {
+            EXPECT_EQ(-1, Socket::Create(options, &sid));
+            EXPECT_EQ(EINVAL, errno);
+        } else {
+            ASSERT_EQ(0, Socket::Create(options, &sid));
+            SocketUniquePtr socket;
+            ASSERT_EQ(0, Socket::Address(sid, &socket));
+            EXPECT_EQ(-1, urma::UrmaQosTestPeer::Allocate(Endpoint(socket)));
+            EXPECT_EQ(EINVAL, errno);
+            socket->SetFailed();
+        }
+    }
+}
+
 TEST_F(UrmaQosTest, channels_isolate_priority_and_inherit_to_child_connections) {
     ChannelOptions co;
     co.socket_mode = SOCKET_MODE_URMA;
@@ -196,24 +296,68 @@ TEST_F(UrmaQosTest, channels_isolate_priority_and_inherit_to_child_connections) 
     short_socket->SetFailed();
 }
 
+TEST_F(UrmaQosTest, service_level_isolates_and_inherits_connections) {
+    ChannelOptions co;
+    co.socket_mode = SOCKET_MODE_URMA;
+    co.urma_qos.service_level = 2;
+    Channel low, same, high, named, by_priority, tcp, tcp_with_qos;
+    ASSERT_EQ(0, low.Init("127.0.0.1:8123", &co));
+    ASSERT_EQ(0, same.Init("127.0.0.1:8123", &co));
+    ASSERT_EQ(0, named.Init("list://127.0.0.1:8123", "rr", &co));
+    co.urma_qos.service_level = 4;
+    ASSERT_EQ(0, high.Init("127.0.0.1:8123", &co));
+    co.urma_qos.service_level = -1;
+    co.urma_qos.priority = 6;
+    ASSERT_EQ(0, by_priority.Init("127.0.0.1:8123", &co));
+    EXPECT_EQ(low._server_id, same._server_id);
+    EXPECT_NE(low._server_id, high._server_id);
+    EXPECT_NE(low._server_id, by_priority._server_id);
+    SocketUniquePtr main, pooled, short_socket, selected;
+    ASSERT_EQ(0, Socket::Address(low._server_id, &main));
+    ASSERT_EQ(0, main->GetPooledSocket(&pooled));
+    ASSERT_EQ(0, main->GetShortSocket(&short_socket));
+    LoadBalancer::SelectIn input{};
+    LoadBalancer::SelectOut output(&selected);
+    ASSERT_EQ(0, named._lb->SelectServer(input, &output));
+    for (auto* socket : {main.get(), pooled.get(), short_socket.get(), selected.get()}) {
+        EXPECT_EQ(-1, socket->urma_qos().priority);
+        EXPECT_EQ(2, socket->urma_qos().service_level);
+    }
+    EXPECT_EQ(main->id(), selected->id());
+    EXPECT_EQ(0, pooled->ReturnToPool());
+    short_socket->SetFailed();
+    co.socket_mode = SOCKET_MODE_TCP;
+    co.urma_qos.service_level = 256;
+    ASSERT_EQ(0, tcp_with_qos.Init("127.0.0.1:8123", &co));
+    ASSERT_EQ(0, tcp.Init("127.0.0.1:8123", nullptr));
+    EXPECT_EQ(tcp._server_id, tcp_with_qos._server_id);
+}
+
 TEST_F(UrmaQosTest, prepared_jettys_are_used_only_for_matching_priority) {
     urma::UrmaEndpoint::GlobalRelease();
     ASSERT_EQ(0, urma::UrmaEndpoint::GlobalInitialize());
-    // Allocate priority 10 before consuming the two prepared default Jettys.
-    for (int priority : {10, -1, 6, 10}) {
+    // SL 4 resolves to priority 10 and must leave the default Jettys available.
+    struct RequestedQos { int priority; int sl; int effective; };
+    for (const auto& qos : {RequestedQos{-1, 4, 10}, {-1, 2, 6}, {6, 2, 6},
+                            {10, -1, 10}, {-1, -1, 6}, {10, 4, 10}}) {
         SocketOptions options;
         options.socket_mode = SOCKET_MODE_URMA;
-        options.urma_qos.priority = priority;
+        options.urma_qos.priority = qos.priority;
+        options.urma_qos.service_level = qos.sl;
         SocketId sid;
         ASSERT_EQ(0, Socket::Create(options, &sid));
         SocketUniquePtr socket;
         ASSERT_EQ(0, Socket::Address(sid, &socket));
         auto* ep = Endpoint(socket);
         ASSERT_EQ(0, urma::UrmaQosTestPeer::Allocate(ep));
-        EXPECT_EQ(priority == -1 ? 6 : priority, urma::UrmaQosTestPeer::Priority(ep));
+        EXPECT_EQ(qos.effective, urma::UrmaQosTestPeer::Priority(ep));
         std::ostringstream debug;
         ep->DebugInfo(debug);
         EXPECT_NE(std::string::npos, debug.str().find("urma_effective_priority="));
+        EXPECT_NE(std::string::npos, debug.str().find(
+            "urma_sl=" + std::to_string(qos.sl)));
+        EXPECT_NE(std::string::npos, debug.str().find(
+            "urma_effective_sl=" + std::to_string(qos.effective == 6 ? 2 : 4)));
         socket->SetFailed();
     }
 }
@@ -223,6 +367,7 @@ TEST_F(UrmaQosTest, access_error_preserves_priority_and_reports_direction) {
         SocketOptions options;
         options.socket_mode = SOCKET_MODE_URMA;
         options.urma_qos.priority = priority;
+        options.urma_qos.service_level = priority == -1 ? 2 : 4;
         SocketId sid;
         ASSERT_EQ(0, Socket::Create(options, &sid));
         SocketUniquePtr socket;
@@ -253,6 +398,10 @@ TEST_F(UrmaQosTest, access_error_preserves_priority_and_reports_direction) {
             EXPECT_NE(std::string::npos,
                       log.find("urma_effective_priority=" +
                                std::to_string(effective))) << log;
+            EXPECT_NE(std::string::npos, log.find("urma_sl=" +
+                std::to_string(options.urma_qos.service_level))) << log;
+            EXPECT_NE(std::string::npos, log.find("urma_effective_sl=" +
+                std::to_string(options.urma_qos.service_level))) << log;
 #endif
             EXPECT_EQ(-1, result);
             EXPECT_EQ(EIO, saved_errno);
@@ -306,6 +455,58 @@ TEST_F(UrmaQosTest, request_and_response_priorities_apply_across_restart) {
         ASSERT_EQ(0, Socket::Address(sockets[0], &accepted));
         EXPECT_EQ(response_priority, accepted->urma_qos().priority);
         EXPECT_EQ(response_priority, urma::UrmaQosTestPeer::Priority(Endpoint(accepted)));
+        accepted.reset();
+        client.reset();
+        server.Stop(0);
+        server.Join();
+    }
+}
+
+TEST_F(UrmaQosTest, request_and_response_service_levels_apply_across_restart) {
+    GFLAGS_NAMESPACE::FlagSaver saved_flags;
+    UrmaQosEcho service;
+    Server server;
+    ASSERT_EQ(0, server.AddService(&service, SERVER_DOESNT_OWN_SERVICE));
+    for (int response_sl : {2, 4}) {
+        urma::FLAGS_urma_client_handshake_version = response_sl == 2 ? 2 : 3;
+        ServerOptions so;
+        so.socket_mode = SOCKET_MODE_URMA;
+        so.urma_qos.service_level = response_sl;
+        ASSERT_EQ(0, server.Start("127.0.0.1:0", &so));
+        ChannelOptions co;
+        co.socket_mode = SOCKET_MODE_URMA;
+        co.urma_qos.service_level = response_sl == 2 ? 4 : 2;
+        co.timeout_ms = 2000;
+        co.max_retry = 0;
+        co.connection_type = "single";
+        Channel channel;
+        ASSERT_EQ(0, channel.Init(server.listen_address(), &co));
+        Controller cntl;
+        ::test::EchoRequest request;
+        ::test::EchoResponse response;
+        request.set_message("URMA SL mapping");
+        ::test::EchoService_Stub(&channel).Echo(&cntl, &request, &response, nullptr);
+        EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        EXPECT_EQ(request.message(), response.message());
+        SocketUniquePtr client;
+        ASSERT_EQ(0, Socket::Address(channel._server_id, &client));
+        EXPECT_EQ(-1, client->urma_qos().priority);
+        EXPECT_EQ(co.urma_qos.service_level, client->urma_qos().service_level);
+        EXPECT_EQ(response_sl == 2 ? 10 : 6,
+                  urma::UrmaQosTestPeer::Priority(Endpoint(client)));
+        std::vector<SocketId> sockets;
+        server._am->ListConnections(&sockets);
+        ASSERT_EQ(1u, sockets.size());
+        SocketUniquePtr accepted;
+        ASSERT_EQ(0, Socket::Address(sockets[0], &accepted));
+        EXPECT_EQ(-1, accepted->urma_qos().priority);
+        EXPECT_EQ(response_sl, accepted->urma_qos().service_level);
+        EXPECT_EQ(response_sl == 2 ? 6 : 10,
+                  urma::UrmaQosTestPeer::Priority(Endpoint(accepted)));
+        std::ostringstream debug;
+        Endpoint(accepted)->DebugInfo(debug);
+        EXPECT_NE(std::string::npos, debug.str().find(
+            "urma_effective_sl=" + std::to_string(response_sl)));
         accepted.reset();
         client.reset();
         server.Stop(0);

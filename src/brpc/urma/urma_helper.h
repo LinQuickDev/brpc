@@ -81,13 +81,20 @@ bool IsUrmaBondingDevice();
 int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
                               urma_tp_type_t tp_type);
 
-// Return the priority selected for the CTP jettys created by brpc.
+// Return the default CTP Jetty priority selected for the device.
 uint8_t GetUrmaJettyPriority();
 
 // Check whether an explicit priority advertises the CTP path used by brpc.
 bool IsUrmaCtpPrioritySupported(const urma_device_attr_t& attr, int priority);
+// Resolve a requested priority/SL pair against a device capability snapshot.
+// Fully automatic options retain default_priority, including legacy fallback.
+bool ResolveUrmaJettyPriority(const urma_device_attr_t& attr,
+                             const UrmaQosOptions& qos, uint8_t default_priority,
+                             uint8_t* priority);
 // Resolve automatic selection or validate against the initialized device.
 bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority);
+// Return the advertised CTP SL, or -1 when no initialized mapping is available.
+int64_t GetUrmaServiceLevelForPriority(int priority);
 
 // If the URMA environment is available.
 bool IsUrmaAvailable();

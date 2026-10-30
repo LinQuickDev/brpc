@@ -941,9 +941,14 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                      << " user_ctx=" << cr.user_ctx
                      << " completion_len=" << cr.completion_len
                      << " urma_priority=" << _socket->urma_qos().priority
+                     << " urma_sl=" << _socket->urma_qos().service_level
                      << " urma_effective_priority="
                      << (_resource && _resource->jetty ?
                          static_cast<int>(
+                             _resource->jetty->jetty_cfg.jfs_cfg.priority) : -1)
+                     << " urma_effective_sl="
+                     << (_resource && _resource->jetty ?
+                         GetUrmaServiceLevelForPriority(
                              _resource->jetty->jetty_cfg.jfs_cfg.priority) : -1)
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
@@ -1580,9 +1585,13 @@ void UrmaEndpoint::DebugInfo(std::ostream& os, butil::StringPiece) const {
        << " sq_window=" << _sq_window_size.load(butil::memory_order_relaxed)
        << " remote_rq_window=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
        << " urma_priority=" << _socket->urma_qos().priority
+       << " urma_sl=" << _socket->urma_qos().service_level
        << " urma_effective_priority="
        << (_resource && _resource->jetty ?
            static_cast<int>(_resource->jetty->jetty_cfg.jfs_cfg.priority) : -1)
+       << " urma_effective_sl="
+       << (_resource && _resource->jetty ? GetUrmaServiceLevelForPriority(
+               _resource->jetty->jetty_cfg.jfs_cfg.priority) : -1)
        << " handshake_version=" << _handshake_version
        << " read_buf=" << _input_processor.read_buf().size();
 }
