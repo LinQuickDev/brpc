@@ -218,7 +218,22 @@ SQ/接收 credit 耗尽保留 EAGAIN 背压，ACK 提交失败向连接错误处
 `/vars/urma_recovery_tcp_fallback_admissions` 提供 TCP 准入次数。
 模式切换作用于新连接；存量连接使用已协商的传输，冷却到期后重新准入 URMA。
 
-`example/rdma_performance/recovery_client` 支持 `--transport=urma`，沿用 `--mode`、`--mode_file` 和 CSV 统计，可用于双机故障注入。
+`example/urma_performance` 构建 `urma_recovery_client`，复用 RDMA 示例的恢复客户端源码，
+通过 URMA 示例链接依赖，支持仅启用 URMA 的构建。增加 `--transport=urma` 选择 URMA，
+使用 `--mode`、`--mode_file` 和 CSV 统计验证双机功能：
+
+```bash
+cmake --build build/urma-example --target urma_performance_server urma_recovery_client -j8
+./build/urma-example/urma_recovery_client --transport=urma \
+    --server=SERVER_IP:8003 --urma_device=URMA_DEVICE \
+    --mode=auto --connection_type=short --seconds=15 --interval_ms=200
+```
+
+`build/urma-example` 使用本文编译配置生成，链接当前 URMA brpc 静态库。
+先分别运行 `auto` 与 `tcp_only`，检查 RPC 成功数、URMA 协商数和 TCP 准入数。
+运行中通过 `--mode_file` 指向的文件切换 `auto`、`tcp_only`，使用 short 连接观察新准入。
+客户端退出码 0 表示至少一次 RPC 成功；健康基线还需确认 `failure=0`。
+功能测试检查模式切换、故障计数及恢复行为，吞吐和 P99 另作性能测试。
 
 ## 发送访问错误对照
 

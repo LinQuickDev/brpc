@@ -236,7 +236,24 @@ cooldown state and negotiation counts. /vars/urma_recovery_tcp_fallback_admissio
 counts TCP admissions. Mode changes apply to new connections. Existing connections
 keep their negotiated transport; URMA admission resumes after cooldown.
 
-`example/rdma_performance/recovery_client --transport=urma` supports `--mode`, `--mode_file` and CSV statistics for two-host fault injection.
+`example/urma_performance` builds `urma_recovery_client` from the shared recovery
+client source using the URMA example dependencies, including URMA-only builds.
+Select URMA with `--transport=urma` and use modes and CSV counters for two-host checks:
+
+```bash
+cmake --build build/urma-example --target urma_performance_server urma_recovery_client -j8
+./build/urma-example/urma_recovery_client --transport=urma \
+    --server=SERVER_IP:8003 --urma_device=URMA_DEVICE \
+    --mode=auto --connection_type=short --seconds=15 --interval_ms=200
+```
+
+Configure `build/urma-example` as described above, linking the current URMA brpc
+static library. Run `auto` and `tcp_only` separately and check RPC success,
+URMA negotiation and TCP admission counters. Use `--mode_file` to switch between
+`auto` and `tcp_only` while running; short connections exercise new admission.
+Exit code 0 means at least one RPC succeeded; a healthy baseline also requires
+`failure=0`. Functional checks cover mode changes, fault counters and recovery;
+throughput and P99 belong to a separate performance test.
 
 ## Comparing send access failures
 
