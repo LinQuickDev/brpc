@@ -1189,6 +1189,8 @@ int RdmaEndpoint::DoPostRecv(void* block, size_t block_size) {
     int err = ibv_post_recv(_resource->qp, &wr, &bad);
     if (err != 0) {
         LOG(WARNING) << "Fail to ibv_post_recv: " << berror(err);
+        ReportFailure(RdmaFailureReason::RECV_POST);
+        errno = err;
         return -1;
     }
     return 0;
@@ -1894,12 +1896,7 @@ void RdmaEndpoint::PollCq(Socket* m) {
             }
 
             if (wc[i].status != IBV_WC_SUCCESS) {
-                if (IsRdmaPathFailure(wc[i].status)) {
-                    ep->ReportFailure(wc[i].status == IBV_WC_RNR_RETRY_EXC_ERR ?
-                        RdmaFailureReason::RNR : RdmaFailureReason::RETRY_EXHAUSTED);
-                } else if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                    ep->ReportFailure(RdmaFailureReason::ACCESS_ERROR);
-                }
+                ep->ReportFailure(ClassifyRdmaCompletion(wc[i].status));
                 PLOG(WARNING) << "Fail to handle RDMA completion, error status("
                               << wc[i].status << "): " << s->description();
                 s->SetFailed(ERDMA, "RDMA completion error(%d) from %s: %s",

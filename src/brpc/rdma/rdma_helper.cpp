@@ -707,8 +707,28 @@ bool IsRdmaAvailable() {
 }
 
 bool IsRdmaPathFailure(ibv_wc_status status) {
-    return status == IBV_WC_RETRY_EXC_ERR ||
-           status == IBV_WC_RNR_RETRY_EXC_ERR;
+    const auto reason = ClassifyRdmaCompletion(status);
+    return reason != RdmaFailureReason::NONE &&
+           reason != RdmaFailureReason::ACCESS_ERROR;
+}
+
+RdmaFailureReason ClassifyRdmaCompletion(ibv_wc_status status) {
+    switch (status) {
+    case IBV_WC_SUCCESS:
+    case IBV_WC_WR_FLUSH_ERR:
+        return RdmaFailureReason::NONE;
+    case IBV_WC_RETRY_EXC_ERR:
+        return RdmaFailureReason::RETRY_EXHAUSTED;
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+        return RdmaFailureReason::RNR;
+    case IBV_WC_LOC_PROT_ERR:
+    case IBV_WC_LOC_ACCESS_ERR:
+    case IBV_WC_REM_ACCESS_ERR:
+    case IBV_WC_MW_BIND_ERR:
+        return RdmaFailureReason::ACCESS_ERROR;
+    default:
+        return RdmaFailureReason::TRANSPORT_ERROR;
+    }
 }
 
 void GlobalDisableRdma() {
