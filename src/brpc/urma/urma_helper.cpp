@@ -83,6 +83,8 @@ DEFINE_int32(urma_zerocopy_min_size, 512,
 
 DEFINE_string(urma_device, "",
               "The name of the URMA device to use. Empty means the first one.");
+DEFINE_string(urma_tp_type, "auto",
+              "RM transport path: auto (prefer CTP, then RTP), ctp, or rtp");
 DEFINE_int32(urma_max_sge, 0,
              "Max SGEs per WR. 0 means the device maximum.");
 DEFINE_int32(urma_bonding_mode, 0,
@@ -126,6 +128,7 @@ static bool g_is_bonding_device = false;
 // Prefer the device capability table and retain priority 6 as a compatibility
 // fallback for CTP providers that do not report a priority.
 static uint8_t g_jetty_priority = 6;
+static urma_tp_type_t g_tp_type = URMA_CTP;
 // urma_init/urma_uninit manage process-global liburma state. Only uninitialize
 // it when this helper performed the successful initialization; URMA_EEXIST
 // means another component owns that state.
@@ -518,6 +521,7 @@ static void GlobalRelease() {
     g_has_local_eid = false;
     g_is_bonding_device = false;
     g_jetty_priority = 6;
+    g_tp_type = URMA_CTP;
     if (g_owns_urma_init) {
         const urma_status_t status = urma_uninit();
         if (status != URMA_SUCCESS) {
@@ -593,13 +597,22 @@ static bool GlobalUrmaInitializeImpl() {
         g_device = nullptr;
         return false;
     }
-    const int ctp_priority =
-        FindUrmaPriorityForTpType(g_device_attr, URMA_CTP);
-    if (ctp_priority >= 0) {
-        g_jetty_priority = static_cast<uint8_t>(ctp_priority);
-    } else {
-        LOG(WARNING) << "URMA device does not report a CTP priority; "
-                        "falling back to compatibility priority "
+    if (!SelectUrmaTransportPath(g_device_attr, FLAGS_urma_tp_type,
+                                  &g_tp_type, &g_jetty_priority)) {
+        LOG(ERROR) << "URMA path selection failed: requested="
+                   << FLAGS_urma_tp_type << " device=" << device_name
+                   << " ctp_priority="
+                   << FindUrmaPriorityForTpType(g_device_attr, URMA_CTP)
+                   << " rtp_priority="
+                   << FindUrmaPriorityForTpType(g_device_attr, URMA_RTP);
+        urma_free_device_list(devices);
+        g_device = nullptr;
+        errno = EINVAL;
+        return false;
+    }
+    if (FindUrmaPriorityForTpType(g_device_attr, g_tp_type) < 0) {
+        LOG(WARNING) << "URMA device does not report path capabilities; "
+                        "using compatibility priority "
                      << static_cast<unsigned>(g_jetty_priority);
     }
     uint32_t eid_cnt = 0;
@@ -696,6 +709,8 @@ static bool GlobalUrmaInitializeImpl() {
     // resources on exit; GlobalRelease remains available for init rollback.
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
+              << " tp_type=" << (g_tp_type == URMA_CTP ? "ctp" : "rtp")
+              << " priority=" << static_cast<unsigned>(g_jetty_priority)
               << " max_sge=" << g_max_sge
               << " copy_send=" << FLAGS_urma_copy_send
               << " buffer_size=" << g_pool_buffer_size
@@ -747,14 +762,46 @@ bool IsUrmaBondingDevice() { return g_is_bonding_device; }
 int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
                               urma_tp_type_t tp_type) {
     const union urma_tp_type_en expected = TpTypeCapability(tp_type);
+    if (expected.value == 0) {
+        return -1;
+    }
     for (int priority = 0; priority <= URMA_MAX_PRIORITY; ++priority) {
-        if (attr.dev_cap.priority_info[priority].tp_type.value ==
-            expected.value) {
+        if ((attr.dev_cap.priority_info[priority].tp_type.value &
+             expected.value) != 0) {
             return priority;
         }
     }
     return -1;
 }
+bool SelectUrmaTransportPath(const urma_device_attr_t& attr,
+                             const std::string& requested,
+                             urma_tp_type_t* tp_type, uint8_t* priority) {
+    if (!tp_type || !priority ||
+        (requested != "auto" && requested != "ctp" && requested != "rtp")) {
+        return false;
+    }
+    for (auto candidate : {URMA_CTP, URMA_RTP}) {
+        if ((requested == "ctp" && candidate != URMA_CTP) ||
+            (requested == "rtp" && candidate != URMA_RTP)) {
+            continue;
+        }
+        const int match = FindUrmaPriorityForTpType(attr, candidate);
+        if (match >= 0) {
+            *tp_type = candidate;
+            *priority = static_cast<uint8_t>(match);
+            return true;
+        }
+    }
+    for (int i = 0; i <= URMA_MAX_PRIORITY; ++i) {
+        if (attr.dev_cap.priority_info[i].tp_type.value != 0) {
+            return false;
+        }
+    }
+    *tp_type = requested == "rtp" ? URMA_RTP : URMA_CTP;
+    *priority = *tp_type == URMA_CTP ? 6 : 0;
+    return true;
+}
+urma_tp_type_t GetUrmaTpType() { return g_tp_type; }
 uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
 int GetUrmaMaxSge() { return g_max_sge; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }

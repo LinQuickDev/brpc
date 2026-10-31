@@ -10,7 +10,7 @@ for large-packet / cross-node scenarios (Route C, "double backend").
 ## Technical Background
 
 URMA exposes a verbs-style API over devices supported by UMDK. This
-implementation creates a reliable-message (`URMA_TM_RM`) Jetty with a CTP
+implementation creates a reliable-message (`URMA_TM_RM`) Jetty with a CTP or RTP
 transport path, posts send work requests with `urma_post_jetty_send_wr`, and
 posts receive work requests with `urma_post_jfr_wr`. Completions are consumed
 from a JFC either by busy polling or through a JFCE event fd.
@@ -171,6 +171,7 @@ All flags use the `urma_` prefix (mirroring RDMA's `rdma_` prefix):
 | `--urma_copy_send` | false | Copy and coalesce host payloads into a 64-byte aligned registered send buffer |
 | `--urma_zerocopy_min_size` | 512 | Receives smaller than this are copied |
 | `--urma_device` | "" | URMA device name (empty = first) |
+| `--urma_tp_type` | auto | RM path: auto prefers CTP, then RTP; ctp or rtp selects a path explicitly |
 | `--urma_max_sge` | 0 | Max SGEs per WR (0 = device max) |
 | `--urma_bonding_mode` | 0 | Bonding mode: 0=standalone, 1=active-backup, 2=balance |
 | `--urma_bonding_level` | 0 | Bonding level: 0=IODIE, 1=port |
@@ -208,6 +209,26 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+### Transport path selection
+
+At process initialization, `--urma_tp_type=auto` selects the first priority
+advertising CTP, or the first RTP priority when CTP is absent. Combined capability
+bits are supported. Both handshake versions advertise the selected path, and
+Jettys use its priority. Configure both peers for the same path; an incompatible
+peer path is rejected before importing resources. The path remains fixed for
+the process lifetime.
+
+For an RTP-only device, start both the server and client with
+`--urma_device=DEVICE --urma_tp_type=rtp`. A priority value is a device table
+index and can map to a different SL. For example, priority 0 may map to SL 2.
+brpc selects the priority from the path capability table and leaves the mapping
+unchanged. Initialization logs report `tp_type` and `priority`.
+
+An explicit path missing from a reported capability table disables URMA through
+the existing initialization fallback. Providers reporting no path capabilities
+retain compatibility values: CTP priority 6 for auto/ctp, RTP priority 0 for rtp.
+Check negotiation counters when validating a URMA data path.
 
 ## Runtime recovery
 

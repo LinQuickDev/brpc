@@ -272,6 +272,76 @@ TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
     EXPECT_EQ(3, urma::FindUrmaPriorityForTpType(attr, URMA_RTP));
     EXPECT_EQ(6, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
     EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(attr, URMA_UTP));
+    attr.dev_cap.priority_info[6].tp_type.bs.rtp = 1;
+    EXPECT_EQ(6, urma::FindUrmaPriorityForTpType(attr, URMA_CTP));
+    EXPECT_EQ(-1, urma::FindUrmaPriorityForTpType(
+                      attr, static_cast<urma_tp_type_t>(255)));
+}
+
+TEST(UrmaHelperTest, auto_path_prefers_ctp_and_selects_rtp_on_rtp_only_devices) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[0].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[0].SL = 2;
+    urma_tp_type_t path = URMA_CTP;
+    uint8_t priority = 6;
+    ASSERT_TRUE(urma::SelectUrmaTransportPath(attr, "auto", &path, &priority));
+    EXPECT_EQ(URMA_RTP, path);
+    EXPECT_EQ(0, priority);
+    attr.dev_cap.priority_info[7].tp_type.bs.ctp = 1;
+    ASSERT_TRUE(urma::SelectUrmaTransportPath(attr, "auto", &path, &priority));
+    EXPECT_EQ(URMA_CTP, path);
+    EXPECT_EQ(7, priority);
+}
+
+TEST(UrmaHelperTest, explicit_path_uses_matching_priority_and_combined_capabilities) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[2].tp_type.bs.rtp = 1;
+    attr.dev_cap.priority_info[2].tp_type.bs.ctp = 1;
+    attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
+    urma_tp_type_t path = URMA_UTP;
+    uint8_t priority = 15;
+    for (const auto& requested : {"rtp", "ctp"}) {
+        ASSERT_TRUE(urma::SelectUrmaTransportPath(attr, requested, &path, &priority));
+        EXPECT_EQ(std::string(requested) == "rtp" ? URMA_RTP : URMA_CTP, path);
+        EXPECT_EQ(2, priority);
+    }
+}
+
+TEST(UrmaHelperTest, rejects_unsupported_paths_in_a_reported_capability_table) {
+    urma_device_attr_t attr{};
+    attr.dev_cap.priority_info[0].tp_type.bs.rtp = 1;
+    urma_tp_type_t path = URMA_UTP;
+    uint8_t priority = 15;
+    EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, "ctp", &path, &priority));
+    EXPECT_EQ(URMA_UTP, path);
+    EXPECT_EQ(15, priority);
+    attr.dev_cap.priority_info[0].tp_type.value = 0;
+    attr.dev_cap.priority_info[4].tp_type.bs.utp = 1;
+    EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, "auto", &path, &priority));
+    EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, "rtp", &path, &priority));
+}
+
+TEST(UrmaHelperTest, providers_without_path_capabilities_keep_compatibility_priorities) {
+    urma_device_attr_t attr{};
+    urma_tp_type_t path = URMA_UTP;
+    uint8_t priority = 15;
+    for (const auto& requested : {"auto", "ctp", "rtp"}) {
+        ASSERT_TRUE(urma::SelectUrmaTransportPath(attr, requested, &path, &priority));
+        const bool rtp = std::string(requested) == "rtp";
+        EXPECT_EQ(rtp ? URMA_RTP : URMA_CTP, path);
+        EXPECT_EQ(rtp ? 0 : 6, priority);
+    }
+}
+
+TEST(UrmaHelperTest, rejects_invalid_path_configuration) {
+    urma_device_attr_t attr{};
+    urma_tp_type_t path = URMA_CTP;
+    uint8_t priority = 6;
+    for (const auto& requested : {"", "utp", "RM", "typo"}) {
+        EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, requested, &path, &priority));
+    }
+    EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, "auto", nullptr, &priority));
+    EXPECT_FALSE(urma::SelectUrmaTransportPath(attr, "auto", &path, nullptr));
 }
 
 TEST(UrmaHelperTest, local_sge_initializes_optional_fields_and_accepts_segment_edges) {
@@ -715,6 +785,9 @@ namespace urma {
 
 class UrmaRecoveryTestPeer {
 public:
+    static int ImportPeer(UrmaEndpoint* ep, const ParsedHello& peer) {
+        return ep->ImportPeer(peer);
+    }
     static void Establish(UrmaEndpoint* ep) {
         GlobalUrmaRecoveryPolicy().AllowNewConnection("", &ep->_recovery_epoch);
         ep->_state = UrmaEndpoint::ESTABLISHED;
@@ -831,6 +904,17 @@ TEST_F(UrmaRecoveryTest, independent_transport_modes_and_metrics) {
               bvar::Variable::describe_exposed("urma_recovery_status").find("tcp_only"));
     EXPECT_FALSE(bvar::Variable::describe_exposed(
         "urma_recovery_tcp_fallback_admissions").empty());
+}
+
+TEST_F(UrmaRecoveryTest, rejects_mismatched_path_before_importing_resources) {
+    urma::UrmaEndpoint endpoint(nullptr);
+    urma::ParsedHello peer;
+    peer.tp_type = urma::GetUrmaTpType() == URMA_CTP ? URMA_RTP : URMA_CTP;
+    EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::ImportPeer(&endpoint, peer));
+    EXPECT_EQ(EPROTO, errno);
+    peer.tp_type = URMA_UTP;
+    EXPECT_EQ(-1, urma::UrmaRecoveryTestPeer::ImportPeer(&endpoint, peer));
+    EXPECT_EQ(EPROTO, errno);
 }
 
 TEST_F(UrmaRecoveryTest, completion_errors_cool_peer_once) {

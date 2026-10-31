@@ -11,7 +11,7 @@ UrmaTransport 是使用 openEuler
 ## 技术背景
 
 URMA 在 UMDK 支持的设备上提供 verbs 风格接口。当前实现创建可靠消息
-（`URMA_TM_RM`）Jetty，并使用 CTP 传输路径；通过
+（`URMA_TM_RM`）Jetty，并使用 CTP 或 RTP 传输路径；通过
 `urma_post_jetty_send_wr` 提交发送 WR，通过 `urma_post_jfr_wr` 提交接收
 WR。完成事件既可由 JFC 忙轮询获取，也可通过 JFCE 事件 fd 获取。
 
@@ -160,6 +160,7 @@ block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs �
 | `--urma_copy_send` | false | 将主机发送数据复制合并到 64 字节对齐的注册缓冲区 |
 | `--urma_zerocopy_min_size` | 512 | 小于此值的接收拷贝 |
 | `--urma_device` | "" | URMA 设备名（空=首个） |
+| `--urma_tp_type` | auto | RM 路径：auto 优先 CTP，其次 RTP；ctp 或 rtp 显式选择路径 |
 | `--urma_max_sge` | 0 | 每 WR SGE 上限（0=设备上限） |
 | `--urma_bonding_mode` | 0 | bonding 模式：0=standalone，1=active-backup，2=balance |
 | `--urma_bonding_level` | 0 | bonding 层级：0=IODIE，1=port |
@@ -194,6 +195,21 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+### 传输路径选择
+
+进程初始化时，`--urma_tp_type=auto` 从设备表中选择第一个支持 CTP 的优先级，
+没有 CTP 时选择第一个支持 RTP 的优先级，同时支持组合能力位。
+v2/v3 握手携带所选路径，Jetty 使用对应优先级。两端需配置相同路径，
+不匹配的对端路径会在导入资源前被拒绝。路径在进程生命周期内保持固定。
+
+仅提供 RTP 的设备，两端均使用 `--urma_device=DEVICE --urma_tp_type=rtp`。
+优先级是设备表索引，映射的 SL 可以不同，例如 priority 0 映射 SL 2。
+brpc 按路径能力选择优先级，设备映射保持原值。初始化日志记录 `tp_type` 和 `priority`。
+
+能力表已报告但不支持显式指定路径时，初始化沿用现有 TCP 回落流程。
+未报告任何路径能力的 provider 保留兼容值：auto/ctp 使用 CTP priority 6，
+rtp 使用 RTP priority 0。验收 URMA 数据通路时检查协商计数。
 
 ## 运行期故障恢复
 
