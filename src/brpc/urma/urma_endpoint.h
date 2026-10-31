@@ -262,7 +262,8 @@ private:
     void PollerAddCqSid();
     void PollerRemoveCqSid();
 
-    inline void TryReadOnTcp();
+    void TryReadOnTcp();
+    void DrainEstablishedTcp();
     void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
     void ReportFailure(UrmaFailureReason reason);
     void FailHandshake(UrmaTransport* transport, int error,
@@ -284,6 +285,8 @@ private:
     int _handshake_version{0};  // 0 = unnegotiated; 2 = v2; 3 = v3
     butil::atomic<int64_t> _pending_received_bytes{0};
     butil::Mutex _dispatch_mutex;
+    // Serialize TCP parsing / EOF checks across event and handshake bthreads.
+    butil::Mutex _tcp_read_mutex;
 
     // The URMA resources (jetty / jfc / jfr / jfce / imported peer objects).
     UrmaResource* _resource{nullptr};

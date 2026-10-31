@@ -1295,8 +1295,6 @@ void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
 // OnNewDataFromTcp: edge-triggered dispatcher.
 // ============================================================================
 
-static void TryReadOnTcpDuringUrmaEst(Socket* socket);
-
 void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
     auto* tp = static_cast<UrmaTransport*>(m->_transport.get());
     if (!tp) {
@@ -1320,7 +1318,7 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
                 if (!IsUrmaAvailable()) {
                     ep->_state = FALLBACK_TCP;
                     tp->_urma_state = UrmaTransport::URMA_OFF;
-                    InputMessenger::OnNewMessages(m);
+                    ep->TryReadOnTcp();
                     return;
                 }
                 SocketUniquePtr s;
@@ -1336,35 +1334,43 @@ void UrmaEndpoint::OnNewDataFromTcp(Socket* m) {
                 } else {
                     s.release();
                 }
-                return;
             }
             // Client side: handled by ProcessHandshakeAtClient.
-            return;
         } else if (state < ESTABLISHED) {
             // During handshake: wake the handshake bthread parked in ReadFromFd.
             ep->_read_butex->fetch_add(1, butil::memory_order_release);
             bthread::butex_wake(ep->_read_butex);
-            return;
         } else if (state == FALLBACK_TCP) {
-            InputMessenger::OnNewMessages(m);
+            ep->TryReadOnTcp();
             return;
         } else if (state == ESTABLISHED) {
-            TryReadOnTcpDuringUrmaEst(m);
+            ep->DrainEstablishedTcp();
             return;
         }
+        // Return handshake events to the dispatcher as well. Leaving _nevent
+        // nonzero suppresses later EOF callbacks and retains server resources
+        // after a short-connection client closes its TCP fd.
         if (!m->MoreReadEvents(&progress)) {
             break;
         }
     }
 }
 
-inline void UrmaEndpoint::TryReadOnTcp() {
-    if (_state.load(butil::memory_order_acquire) == FALLBACK_TCP) {
+void UrmaEndpoint::TryReadOnTcp() {
+    std::unique_lock<butil::Mutex> lock(_tcp_read_mutex);
+    if (_state.load(butil::memory_order_acquire) == FALLBACK_TCP &&
+        !_socket->Failed()) {
         InputMessenger::OnNewMessages(_socket);
     }
 }
 
-static void TryReadOnTcpDuringUrmaEst(Socket* socket) {
+void UrmaEndpoint::DrainEstablishedTcp() {
+    std::unique_lock<butil::Mutex> lock(_tcp_read_mutex);
+    if (_state.load(butil::memory_order_acquire) != ESTABLISHED ||
+        _socket->Failed()) {
+        return;
+    }
+    Socket* socket = _socket;
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         uint8_t byte = 0;
@@ -1496,6 +1502,7 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     ep->_state = ESTABLISHED;
     GlobalUrmaRecoveryPolicy().RecordNegotiatedConnection(ep->_recovery_epoch);
     ep->DispatchReceivedBytes(s, 0);
+    ep->DrainEstablishedTcp();
     return nullptr;
 }
 
@@ -1592,6 +1599,7 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         ep->_state = ESTABLISHED;
         GlobalUrmaRecoveryPolicy().RecordNegotiatedConnection(ep->_recovery_epoch);
         ep->DispatchReceivedBytes(s, 0);
+        ep->DrainEstablishedTcp();
     } else {
         ep->FallbackToTcp(tp, true);
     }

@@ -147,12 +147,15 @@ TEST_P(UrmaTransportTest, switches_new_connections_from_auto_to_tcp_only_and_bac
     co.timeout_ms = 3000;
     co.max_retry = 0;
     ASSERT_EQ(0, channel.Init(server.listen_address(), &co));
+    // Cumulative receive buffers exceed the pool capacity unless closed
+    // short connections release their queues and buffers.
+    const int requests_per_mode = 40;
     for (auto mode : {brpc::urma::UrmaRecoveryMode::AUTO,
                       brpc::urma::UrmaRecoveryMode::TCP_ONLY,
                       brpc::urma::UrmaRecoveryMode::AUTO}) {
         ASSERT_TRUE(brpc::urma::SetUrmaRecoveryMode(mode));
         const auto before = brpc::urma::GetUrmaRecoveryStatus();
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < requests_per_mode; ++i) {
             brpc::Controller cntl;
             test::EchoRequest request;
             test::EchoResponse response;
@@ -164,9 +167,11 @@ TEST_P(UrmaTransportTest, switches_new_connections_from_auto_to_tcp_only_and_bac
         const auto after = brpc::urma::GetUrmaRecoveryStatus();
         if (mode == brpc::urma::UrmaRecoveryMode::TCP_ONLY) {
             EXPECT_EQ(before.negotiated_connections, after.negotiated_connections);
-            EXPECT_EQ(before.tcp_only_admissions + 3, after.tcp_only_admissions);
+            EXPECT_EQ(before.tcp_only_admissions + requests_per_mode,
+                      after.tcp_only_admissions);
         } else {
-            EXPECT_EQ(before.negotiated_connections + 6, after.negotiated_connections);
+            EXPECT_EQ(before.negotiated_connections + 2 * requests_per_mode,
+                      after.negotiated_connections);
             EXPECT_EQ(before.tcp_only_admissions, after.tcp_only_admissions);
         }
     }
