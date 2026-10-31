@@ -239,6 +239,9 @@ same path on both peers. Client example:
 Healthy AUTO requires `failure=0`, increasing URMA negotiations and zero TCP
 admissions. TCP_ONLY requires `failure=0` and increasing TCP admissions.
 Use `--mode_file` to switch modes while running.
+Use `--connection_type=single` or `pooled` for connection reuse and
+`--attachment_size=1048576` for a 1 MiB echo attachment. The client checks every
+byte and reports `validation_failures` in the summary.
 
 ### Targeted send failure test
 
@@ -253,8 +256,11 @@ python3 example/urma_performance/run_recovery_injection.py \
 
 The runner waits for successful URMA RPCs, checks the metric listener PID, and
 saves CSV, logs and three phase snapshots. Defaults are v3, a 40-second run and
-10-second cooldown. Checks require one expected failure, `send_post=1`, increasing
-TCP admissions during cooldown and resumed URMA negotiations afterward.
+10-second cooldown. Checks require `send_post=1` and TCP admission during cooldown.
+`short` requires one expected RPC failure and resumed URMA negotiations;
+`--connection-type=single` or `pooled` checks sustained RPC recovery after
+reconnecting and reusing TCP. The runner supports `--attachment-size` for echo
+validation and `--polling` for polling mode.
 Build `urma_send_failure_injector_test` and run CTest in the example build
 directory for the tool self-tests.
 

@@ -223,6 +223,8 @@ URMA 与 RDMA 独立维护模式、epoch 和冷却缓存，模式切换过滤旧
 
 健康 AUTO 检查 `failure=0`、URMA 协商增加、TCP 准入为 0；
 TCP_ONLY 检查 `failure=0`、TCP 准入增加。运行中通过 `--mode_file` 切换模式。
+使用 `--connection_type=single` 或 `pooled` 验证连接复用，`--attachment_size=1048576`
+验证 1 MiB 回显附件；客户端逐字节校验，汇总输出 `validation_failures`。
 
 ### 定向发送失败测试
 
@@ -236,8 +238,10 @@ python3 example/urma_performance/run_recovery_injection.py \
 ```
 
 运行器等待 URMA RPC 成功后注入，校验指标 PID，保存 CSV、日志和三阶段快照。
-默认 v3 握手、运行 40 秒、冷却 10 秒；验收一次预期失败、`send_post=1`、
-冷却期间 TCP 准入增加、冷却后 URMA 协商恢复。
+默认 v3 握手、运行 40 秒、冷却 10 秒；验收 `send_post=1` 和冷却期间 TCP 准入。
+`short` 检查一次预期 RPC 失败和冷却后 URMA 协商恢复；`--connection-type=single` 或
+`pooled` 检查重连后 RPC 持续成功，复用已建立的 TCP 连接。
+运行器支持 `--attachment-size` 回显校验和 `--polling` 轮询模式。
 构建 `urma_send_failure_injector_test` 后，通过示例目录的 CTest 执行工具自测。
 
 ### 发送访问错误对照

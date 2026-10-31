@@ -59,6 +59,13 @@ class RecoveryInjectionTest(unittest.TestCase):
     def test_validate_complete_recovery(self):
         runner.validate_phases(*self.phases())
 
+    def test_persistent_connections_can_reuse_tcp_after_cooldown(self):
+        baseline, cooldown, recovered = self.phases()
+        recovered["negotiated_connections"] = cooldown["negotiated_connections"]
+        runner.validate_phases(baseline, cooldown, recovered, require_urma_reconnect=False)
+        with self.assertRaises(RuntimeError):
+            runner.validate_phases(baseline, cooldown, recovered)
+
     def test_reject_stale_zero_failure_snapshot(self):
         baseline, cooldown, recovered = self.phases()
         cooldown["failures"]["send_post"] = 0

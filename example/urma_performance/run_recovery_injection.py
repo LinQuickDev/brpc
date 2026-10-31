@@ -60,7 +60,7 @@ def wait_for(proc, predicate, timeout, description):
     raise RuntimeError("Timed out waiting for " + description)
 
 
-def validate_phases(baseline, cooldown, recovered):
+def validate_phases(baseline, cooldown, recovered, require_urma_reconnect=True):
     if any(s["mode"] != "auto" for s in (baseline, cooldown, recovered)):
         raise RuntimeError("Expected AUTO throughout the run")
     if len({s["epoch"] for s in (baseline, cooldown, recovered)}) != 1:
@@ -71,8 +71,10 @@ def validate_phases(baseline, cooldown, recovered):
     if (cooldown["failures"]["send_post"] != 1 or cooldown["cooled_peers"] != 1
             or cooldown["peer_cooldown_admissions"] <= 0):
         raise RuntimeError("Expected one SEND failure and TCP peer-cooldown admission")
+    negotiated = recovered["negotiated_connections"]
+    previous = cooldown["negotiated_connections"]
     if (recovered["failures"]["send_post"] != 1 or recovered["cooled_peers"] != 0
-            or recovered["negotiated_connections"] <= cooldown["negotiated_connections"]
+            or negotiated < previous or (require_urma_reconnect and negotiated == previous)
             or recovered["peer_cooldown_admissions"] < cooldown["peer_cooldown_admissions"]):
         raise RuntimeError("Expected URMA negotiations to resume after cooldown")
 
@@ -112,7 +114,9 @@ def run(args):
                "--server=" + args.server, "--urma_device=" + args.device,
                "--urma_tp_type=" + args.tp_type,
                "--urma_client_handshake_version=" + str(args.handshake_version),
-               "--urma_buffer_count=4096", "--connection_type=short",
+               "--urma_buffer_count=4096", "--connection_type=" + args.connection_type,
+               "--attachment_size=" + str(args.attachment_size),
+               "--urma_use_polling=" + str(args.polling).lower(),
                "--interval_ms=200", "--timeout_ms=3000",
                "--seconds=" + str(args.seconds),
                "--cooldown_ms=" + str(args.cooldown_ms), "--dummy_port=" + str(port)]
@@ -149,30 +153,47 @@ def run(args):
                                   and status["peer_cooldown_admissions"] > 0) else None
 
             phases["cooldown"] = record_phase("cooldown", wait_for(
-                proc, cooling, 5, "peer cooldown and TCP admission"))
+                proc, cooling, args.cooldown_ms / 1000, "peer cooldown and TCP admission"))
+            require_urma_reconnect = args.connection_type == "short"
+            recovery_success = None
 
             def recovering():
+                nonlocal recovery_success
                 status = read_var("urma_recovery_status")
-                return status if (status["cooled_peers"] == 0 and
-                                  status["negotiated_connections"] >
-                                  phases["cooldown"]["negotiated_connections"]) else None
+                if status["cooled_peers"] != 0:
+                    return None
+                if require_urma_reconnect:
+                    return status if (status["negotiated_connections"] >
+                                      phases["cooldown"]["negotiated_connections"]) else None
+                rows = read_samples(csv_path)
+                if recovery_success is None:
+                    recovery_success = rows[-1][1]
+                return status if rows[-1][1] > recovery_success else None
 
             phases["recovered"] = record_phase("recovered", wait_for(
                 proc, recovering, args.cooldown_ms / 1000 + 5, "URMA recovery"))
-            validate_phases(**phases)
+            validate_phases(**phases, require_urma_reconnect=require_urma_reconnect)
+            failures_at_recovery = read_samples(csv_path)[-1][2]
             (output / "snapshots.json").write_text(json.dumps(
                 {"pid": proc.pid, "port": port, "phases": phases}, indent=2))
             rc = proc.wait(timeout=args.seconds + 10)
         summary = re.search(r"completed success=(\d+) failure=(\d+)", csv_path.read_text())
-        if rc != 0 or not summary or int(summary[1]) == 0 or int(summary[2]) != 1:
-            raise RuntimeError("Expected exactly one failed RPC and remaining RPCs to succeed")
+        expected_failures = 1 if require_urma_reconnect else failures_at_recovery
+        if (rc != 0 or not summary or int(summary[1]) == 0
+                or expected_failures < 1 or int(summary[2]) != expected_failures):
+            raise RuntimeError("Expected RPC recovery with no further failures afterward")
+        if args.attachment_size:
+            validation = re.search(r"validation_failures=(\d+)", csv_path.read_text())
+            if not validation or int(validation[1]) != 0:
+                raise RuntimeError("Attachment content validation failed")
         if log_path.read_text().count("injected one data SEND post failure") != 1:
             raise RuntimeError("Expected exactly one injection log")
         last = read_samples(csv_path)[-1]
         if last[5] != 0 or last[4] != phases["recovered"]["peer_cooldown_admissions"]:
             raise RuntimeError("TCP cooldown admissions must stop after URMA recovery")
-        print(summary[0])
-        print("PASS: one SEND failure, TCP cooldown, and URMA recovery")
+        print(csv_path.read_text().splitlines()[-1])
+        recovered_transport = "URMA" if require_urma_reconnect else "RPC"
+        print("PASS: one SEND failure, TCP cooldown, and " + recovered_transport + " recovery")
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -191,12 +212,16 @@ def main():
     parser.add_argument("--injector", default="build/urma-example/liburma_send_failure_injector.so")
     parser.add_argument("--tp-type", choices=("rtp", "ctp", "auto"), default="rtp")
     parser.add_argument("--handshake-version", type=int, choices=(2, 3), default=3)
+    parser.add_argument("--connection-type", choices=("short", "single", "pooled"), default="short")
+    parser.add_argument("--attachment-size", type=int, default=0)
+    parser.add_argument("--polling", action="store_true")
     parser.add_argument("--seconds", type=int, default=40)
     parser.add_argument("--cooldown-ms", type=int, default=10000)
     parser.add_argument("--baseline-seconds", type=float, default=5)
     parser.add_argument("--startup-timeout", type=float, default=120)
     args = parser.parse_args()
-    if (args.cooldown_ms <= 0 or args.baseline_seconds < 0 or args.startup_timeout <= 0
+    if (args.cooldown_ms <= 0 or args.attachment_size < 0
+            or args.baseline_seconds < 0 or args.startup_timeout <= 0
             or args.seconds < args.baseline_seconds + args.cooldown_ms / 1000 + 5):
         parser.error("Duration must cover baseline, cooldown and at least five seconds of recovery")
     try:

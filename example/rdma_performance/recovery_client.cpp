@@ -39,6 +39,7 @@ DEFINE_int32(interval_ms, 100, "Pause between RPCs");
 DEFINE_int32(timeout_ms, 1000, "RPC deadline");
 DEFINE_int32(cooldown_ms, 5000, "Path cooldown");
 DEFINE_int32(dummy_port, 8001, "Local /vars port; 0 disables it");
+DEFINE_int32(attachment_size, 0, "Echo attachment bytes and verify the returned content");
 
 static bool SetMode(const std::string& value) {
     using brpc::rdma::RdmaRecoveryMode;
@@ -70,9 +71,10 @@ int main(int argc, char* argv[]) {
         brpc::urma::SetUrmaRecoveryCooldownMs(FLAGS_cooldown_ms) :
         brpc::rdma::SetRdmaRecoveryCooldownMs(FLAGS_cooldown_ms);
     if (FLAGS_seconds <= 0 || FLAGS_interval_ms < 0 || FLAGS_timeout_ms <= 0 ||
+        FLAGS_attachment_size < 0 ||
         !cooldown_ok ||
         !SetMode(FLAGS_mode)) {
-        std::cerr << "Invalid duration, interval, timeout, cooldown or mode\n";
+        std::cerr << "Invalid duration, interval, timeout, cooldown, mode or attachment size\n";
         return 1;
     }
     brpc::Channel channel;
@@ -92,6 +94,11 @@ int main(int argc, char* argv[]) {
     std::string mode = FLAGS_mode;
     uint64_t succeeded = 0;
     uint64_t failed = 0;
+    uint64_t validation_failed = 0;
+    std::string payload(static_cast<size_t>(FLAGS_attachment_size), '\0');
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>(i % 251);
+    }
     const int64_t start = butil::monotonic_time_us();
     int64_t next_report = start;
     std::cout << "seconds,mode,success,failure,transport_negotiated,tcp_fallback_admissions,"
@@ -110,13 +117,23 @@ int main(int argc, char* argv[]) {
             }
         }
         test::PerfTestRequest request;
-        request.set_echo_attachment(false);
+        request.set_echo_attachment(!payload.empty());
         test::PerfTestResponse response;
         brpc::Controller cntl;
+        const uint64_t sequence = succeeded + failed;
+        for (size_t i = 0; i < payload.size() && i < sizeof(sequence); ++i) {
+            payload[i] = static_cast<char>(sequence >> (i * 8));
+        }
+        cntl.request_attachment().append(payload);
         test::PerfTestService_Stub(&channel).Test(&cntl, &request, &response, nullptr);
         if (cntl.Failed()) {
             ++failed;
             std::cerr << "RPC failure: " << cntl.ErrorText() << '\n';
+        } else if (!payload.empty() && cntl.response_attachment().to_string() != payload) {
+            ++failed;
+            ++validation_failed;
+            std::cerr << "Attachment mismatch: expected=" << payload.size()
+                      << " actual=" << cntl.response_attachment().size() << '\n';
         } else {
             ++succeeded;
         }
@@ -134,6 +151,10 @@ int main(int argc, char* argv[]) {
         }
         usleep(static_cast<useconds_t>(FLAGS_interval_ms) * 1000);
     }
-    std::cout << "completed success=" << succeeded << " failure=" << failed << std::endl;
+    std::cout << "completed success=" << succeeded << " failure=" << failed;
+    if (!payload.empty()) {
+        std::cout << " validation_failures=" << validation_failed;
+    }
+    std::cout << std::endl;
     return succeeded ? 0 : 2;
 }

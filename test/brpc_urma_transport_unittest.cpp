@@ -116,7 +116,8 @@ TEST_P(UrmaTransportTest, exchanges_zero_copy_payloads_and_receive_credits) {
     const auto before = brpc::urma::GetUrmaRecoveryStatus();
     ASSERT_EQ(0, channel.Init(server.listen_address(), &co));
     for (int round = 0; round < 40; ++round) {
-        const std::string payload(round == 0 ? 0 : 20000, 'r');
+        const size_t size = round == 0 ? 0 : round == 1 ? 1024 * 1024 : 20000;
+        const std::string payload(size, 'r');
         brpc::Controller cntl;
         test::EchoRequest request;
         test::EchoResponse response;
