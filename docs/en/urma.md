@@ -276,6 +276,30 @@ Exit code 0 means at least one RPC succeeded; a healthy baseline also requires
 `failure=0`. Functional checks cover mode changes, fault counters and recovery;
 throughput and P99 belong to a separate performance test.
 
+### Targeted send failure test
+
+The URMA example provides an optional Linux `LD_PRELOAD` module that rejects one
+data SEND with EIO in the selected client process. Other calls, including credit
+ACKs, are forwarded to liburma.
+
+```bash
+cmake -S example/urma_performance -B build/urma-example -DBUILD_URMA_FAULT_INJECTOR=ON
+cmake --build build/urma-example --target urma_send_failure_injector -j8
+BRPC_URMA_FAIL_ONCE_FILE="$PWD/pr92-inject.once" \
+LD_PRELOAD="$PWD/build/urma-example/liburma_send_failure_injector.so" \
+./build/urma-example/urma_recovery_client --transport=urma \
+    --server=SERVER_IP:8003 --urma_device=URMA_DEVICE --urma_tp_type=rtp \
+    --mode=auto --connection_type=short --cooldown_ms=10000 --seconds=40
+```
+
+Remove any old marker before starting, then create `pr92-inject.once` from another
+terminal after normal RPCs succeed. Expect one injection log, one failed RPC and
+one increment of `failures.send_post`. During cooldown, `cooled_peers` and TCP
+admissions increase while URMA negotiations pause; negotiations resume after
+cooldown. This tests SEND_POST handling and recovery policy. Device completion
+errors require separate injection. Build `urma_send_failure_injector_test` and
+run CTest in the example build directory to check forwarding and single injection.
+
 ## Comparing send access failures
 
 With `--urma_copy_send=true`, each data WR uses a fresh, 64-byte aligned registered
