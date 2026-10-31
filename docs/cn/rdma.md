@@ -1,6 +1,6 @@
 # 业务级 QoS
 
-通过 `ChannelOptions.rdma_qos` 配置请求方向的 RDMA QoS：
+请求方向配置 `ChannelOptions.rdma_qos`，响应方向配置 `ServerOptions.rdma_qos`：
 
 ```cpp
 brpc::ChannelOptions options;
@@ -9,28 +9,15 @@ options.rdma_qos.service_level = 3;
 options.rdma_qos.traffic_class = (26 << 2) | 2;  // DSCP=26, ECN=2
 ```
 
-`service_level` 范围为 0–15，`traffic_class` 为完整的 8 位 GRH/IP Traffic Class，范围为 0–255，
-两者默认均为 0。SL 的调度待遇由网络侧 SL→VL 或优先级映射决定。
-RoCE 部署结合网卡及交换机的 PCP/DSCP 映射配置；示例中的 DSCP/ECN 值按部署策略选择。
+`service_level` 范围为 0–15，`traffic_class` 是完整的 8 位 GRH/IP 字节，范围为 0–255，
+两者默认均为 0。网络配置决定 SL→VL 及 PCP/DSCP 映射和调度策略。
 
-同一地址下，相同 QoS 的 Channel 可共享连接，不同 SL 或 Traffic Class 使用独立连接及 QP。
-配置随单连接、连接池和短连接传递，并在 QP 重建时重新应用。
-
-响应方向通过 `ServerOptions.rdma_qos` 配置：
-
-```cpp
-brpc::ServerOptions options;
-options.socket_mode = brpc::SOCKET_MODE_RDMA;
-options.rdma_qos.service_level = 3;
-options.rdma_qos.traffic_class = 106;
-```
-
-客户端和服务端分别配置各自的发送方向。设置在 Channel 初始化或 Server 启动时生效，
-V2/V3 握手沿用现有格式；TCP 传输按原配置运行。
+不同 QoS 使用独立连接与 QP，相同配置共享连接。配置随服务发现、连接池、短连接和
+服务端 accept 传递，在 QP 重建时重新应用。v2/v3 握手沿用现有格式。
 连接调试信息提供 `rdma_sl` 和 `rdma_traffic_class`。
 
-`example/rdma_performance` 的 client/server 支持 `--rdma_sl`、`--rdma_traffic_class`。
-实机验证时检查 QP 属性和实际报文标记，再比较竞争流量下的吞吐与 P99。
+`example/rdma_performance` 的两端支持 `--rdma_sl`、`--rdma_traffic_class`。
+实机检查 QP 属性与报文标记，再结合竞争流量比较吞吐和 P99。
 
 # 编译
 

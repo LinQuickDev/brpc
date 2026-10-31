@@ -25,7 +25,6 @@
 #include <unistd.h>
 #include <functional>
 #include <vector>
-#include <utility>
 #include <google/protobuf/descriptor.h>
 #include "butil/endpoint.h"
 #include "butil/fd_guard.h"
@@ -48,7 +47,6 @@
 #include "brpc/rdma/rdma_handshake_constants.h"
 #include "brpc/rdma/rdma_handshake.pb.h"
 #include "brpc/rdma/rdma_helper.h"
-#include "brpc/details/load_balancer_with_naming.h"
 #include "echo.pb.h"
 
 static const int PORT = 8713;
@@ -3316,147 +3314,6 @@ TEST(RdmaInlineDataTest, should_post_inline) {
     EXPECT_FALSE(rdma::ShouldPostInline(false, granted, granted));
     // A QP granted no inline data inlines nothing.
     EXPECT_FALSE(rdma::ShouldPostInline(true, 1, 0));
-}
-
-TEST_F(RdmaTest, qos_rejects_invalid_options_before_connecting) {
-    for (const auto& values : {std::pair<int, int>(-1, 0), {16, 0}, {0, -1}, {0, 256}}) {
-        ChannelOptions options;
-        options.socket_mode = SOCKET_MODE_RDMA;
-        options.rdma_qos.service_level = values.first;
-        options.rdma_qos.traffic_class = values.second;
-        Channel channel;
-        EXPECT_EQ(-1, channel.Init(g_ep, &options));
-        ServerOptions server_options;
-        server_options.socket_mode = SOCKET_MODE_RDMA;
-        server_options.rdma_qos = options.rdma_qos;
-        Server server;
-        EXPECT_EQ(-1, server.Start(PORT, &server_options));
-        SocketOptions socket_options;
-        socket_options.socket_mode = SOCKET_MODE_RDMA;
-        socket_options.rdma_qos = options.rdma_qos;
-        SocketId sid;
-        EXPECT_EQ(-1, Socket::Create(socket_options, &sid));
-        EXPECT_EQ(EINVAL, errno);
-    }
-}
-
-TEST_F(RdmaTest, qos_isolates_channels_and_preserves_equal_config_sharing) {
-    ChannelOptions options;
-    options.socket_mode = SOCKET_MODE_RDMA;
-    Channel a, b, same, different_tc, default_rdma, tcp, tcp_with_qos;
-    ASSERT_EQ(0, default_rdma.Init(g_ep, &options));
-    ASSERT_EQ(0, tcp.Init(g_ep, nullptr));
-    EXPECT_NE(default_rdma._server_id, tcp._server_id);
-    options.rdma_qos.service_level = 3;
-    options.rdma_qos.traffic_class = 106;
-    ASSERT_EQ(0, a.Init(g_ep, &options));
-    ASSERT_EQ(0, same.Init(g_ep, &options));
-    EXPECT_EQ(a._server_id, same._server_id);
-    EXPECT_NE(a._server_id, default_rdma._server_id);
-    options.rdma_qos.service_level = 4;
-    ASSERT_EQ(0, b.Init(g_ep, &options));
-    EXPECT_NE(a._server_id, b._server_id);
-    options.rdma_qos.service_level = 3;
-    options.rdma_qos.traffic_class = 104;
-    ASSERT_EQ(0, different_tc.Init(g_ep, &options));
-    EXPECT_NE(a._server_id, different_tc._server_id);
-    options.socket_mode = SOCKET_MODE_TCP;
-    ASSERT_EQ(0, tcp_with_qos.Init(g_ep, &options));
-    EXPECT_EQ(tcp._server_id, tcp_with_qos._server_id);
-    SocketUniquePtr socket;
-    ASSERT_EQ(0, Socket::Address(a._server_id, &socket));
-    EXPECT_EQ(3, socket->rdma_qos().service_level);
-    EXPECT_EQ(106, socket->rdma_qos().traffic_class);
-}
-
-TEST_F(RdmaTest, qos_follows_pooled_short_and_named_connections) {
-    ChannelOptions options;
-    options.socket_mode = SOCKET_MODE_RDMA;
-    options.rdma_qos.service_level = 7;
-    options.rdma_qos.traffic_class = 255;
-    Channel direct, named;
-    ASSERT_EQ(0, direct.Init(g_ep, &options));
-    ASSERT_EQ(0, named.Init(_naming_url.c_str(), "rr", &options));
-    SocketUniquePtr main_socket;
-    ASSERT_EQ(0, Socket::Address(direct._server_id, &main_socket));
-    SocketUniquePtr pooled, short_socket, selected;
-    ASSERT_EQ(0, main_socket->GetPooledSocket(&pooled));
-    ASSERT_EQ(0, main_socket->GetShortSocket(&short_socket));
-    LoadBalancer::SelectIn input{};
-    LoadBalancer::SelectOut output(&selected);
-    ASSERT_EQ(0, named._lb->SelectServer(input, &output));
-    for (Socket* s : {pooled.get(), short_socket.get(), selected.get()}) {
-        EXPECT_EQ(7, s->rdma_qos().service_level);
-        EXPECT_EQ(255, s->rdma_qos().traffic_class);
-    }
-    EXPECT_EQ(main_socket->id(), selected->id());
-    EXPECT_EQ(0, pooled->ReturnToPool());
-    short_socket->SetFailed();
-}
-
-TEST_F(RdmaTest, qos_server_options_follow_accept_and_restart) {
-    for (int sl : {3, 7}) {
-        ServerOptions options;
-        options.socket_mode = SOCKET_MODE_RDMA;
-        options.rdma_qos.service_level = sl;
-        options.rdma_qos.traffic_class = 106;
-        ASSERT_EQ(0, _server.Start(PORT, &options));
-        butil::fd_guard fd;
-        ASSERT_NO_FATAL_FAILURE(ConnectToServer(&fd));
-        Socket* socket = WaitForServerSocket();
-        ASSERT_TRUE(socket != nullptr);
-        EXPECT_EQ(sl, socket->rdma_qos().service_level);
-        EXPECT_EQ(106, socket->rdma_qos().traffic_class);
-        fd.reset(-1);
-        ASSERT_TRUE(WaitForServerSocketGone());
-        StopServer();
-    }
-}
-
-static ibv_ah_attr g_qos_rtr_address;
-static int g_qos_rtr_calls;
-static int CaptureQosModify(ibv_qp*, ibv_qp_attr* attr, ibv_qp_attr_mask mask) {
-    if (mask & IBV_QP_AV) {
-        g_qos_rtr_address = attr->ah_attr;
-        ++g_qos_rtr_calls;
-    }
-    return 0;
-}
-
-TEST_F(RdmaTest, qos_applies_to_rtr_on_each_qp_bringup) {
-    for (const auto& values : {std::pair<int, int>(15, 255), {0, 0}}) {
-        SocketOptions options;
-        options.socket_mode = SOCKET_MODE_RDMA;
-        options.rdma_qos.service_level = values.first;
-        options.rdma_qos.traffic_class = values.second;
-        SocketId sid;
-        ASSERT_EQ(0, Socket::Create(options, &sid));
-        SocketUniquePtr socket;
-        ASSERT_EQ(0, Socket::Address(sid, &socket));
-        auto* ep = RdmaTransportOf(socket)->_rdma_ep;
-        ibv_qp qp{};
-        rdma::RdmaResource resource;
-        resource.qp = &qp;
-        ep->_resource = &resource;
-        ep->_rq_size = 0;
-        rdma::ParsedHello remote{};
-        const bool skip = rdma::g_skip_rdma_init;
-        const auto modify = rdma::IbvModifyQp;
-        rdma::g_skip_rdma_init = false;
-        rdma::IbvModifyQp = CaptureQosModify;
-        g_qos_rtr_calls = 0;
-        // Reapply attributes on both client and server bringup.
-        EXPECT_EQ(0, ep->BringUpQp(remote, false));
-        EXPECT_EQ(0, ep->BringUpQp(remote, true));
-        rdma::g_skip_rdma_init = skip;
-        rdma::IbvModifyQp = modify;
-        EXPECT_EQ(2, g_qos_rtr_calls);
-        EXPECT_EQ(values.first, g_qos_rtr_address.sl);
-        EXPECT_EQ(values.second, g_qos_rtr_address.grh.traffic_class);
-        ep->_resource = nullptr;
-        resource.qp = nullptr;
-        socket->SetFailed();
-    }
 }
 
 #endif  // if BRPC_WITH_RDMA

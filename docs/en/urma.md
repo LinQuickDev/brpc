@@ -170,6 +170,7 @@ All flags use the `urma_` prefix (mirroring RDMA's `rdma_` prefix):
 | `--urma_recv_zerocopy` | true | Zero-copy receives above `--urma_zerocopy_min_size` |
 | `--urma_zerocopy_min_size` | 512 | Receives smaller than this are copied |
 | `--urma_device` | "" | URMA device name (empty = first) |
+| `--urma_tp_type` | auto | RM path: auto, ctp or rtp |
 | `--urma_max_sge` | 0 | Max SGEs per WR (0 = device max) |
 | `--urma_bonding_mode` | 0 | Bonding mode: 0=standalone, 1=active-backup, 2=balance |
 | `--urma_bonding_level` | 0 | Bonding level: 0=IODIE, 1=port |
@@ -216,62 +217,45 @@ Set `ChannelOptions.urma_qos` for outgoing requests and
 ```cpp
 brpc::ChannelOptions client_options;
 client_options.socket_mode = brpc::SOCKET_MODE_URMA;
-client_options.urma_qos.service_level = 6;
+client_options.urma_qos.service_level = 2;
 
 brpc::ServerOptions server_options;
 server_options.socket_mode = brpc::SOCKET_MODE_URMA;
-server_options.urma_qos.service_level = 7;
+server_options.urma_qos.service_level = 2;
 ```
 
-The current path uses RM and CTP. CTP derives SL from
-`priority_info[priority].SL`; SL and priority need not have equal numeric values.
-`service_level` defaults to -1 (unspecified), with explicit values in [0,255].
-An explicit SL selects the first priority with both that SL and CTP capability.
-`priority` can also be set explicitly in [0,15]. When both are specified, the
-device mapping must satisfy both. Channel initialization and Server startup
-reject unsupported or conflicting requests and report supported priority:SL pairs.
-For example, if only priority 6/SL 6 and priority 7/SL 7 support CTP, SL 10 is rejected.
+`--urma_tp_type=auto` prefers CTP, then RTP, using device capabilities.
+Use `ctp` or `rtp` to select a path explicitly. Both peers use the same path,
+fixed at process initialization. Providers without a capability table use
+priority 6 for auto/CTP and priority 0 for RTP.
 
-With both fields at -1, automatic selection retains the first CTP priority and
-the existing compatibility value 6 when none is reported. The platform configures
-device mappings and scheduling; brpc uses the initialization snapshot. Restart
-processes after changing platform mappings. Validation applies to the RM/CTP path.
+| Option | Default | Explicit range | Meaning |
+| --- | --- | --- | --- |
+| `service_level` | -1 | 0–255 | Select the first priority mapping to this SL on the selected path |
+| `priority` | -1 | 0–15 | Select a priority supported by the selected path |
 
-Different SL/priority configurations use separate connections; equal configurations
-share connections. Naming services, pooled and short connections, accepted sockets
-and rebuilt Jettys inherit the configuration. The prepared pool serves matching
-priorities; other priorities allocate Jettys on demand. Debug output shows the
-requested SL/priority, Jetty priority and mapped SL. Each peer configures its outgoing direction;
-v2/v3 handshake formats remain the same.
+Both fields at -1 select the device default. When both are explicit, they must
+match the same device mapping. Channel initialization and Server startup reject
+unsupported or conflicting settings and report supported priority:SL pairs.
+For example, RTP priority 0 mapping to SL 2 resolves `service_level=2` to priority 0.
+The platform configures mappings and scheduling; brpc uses the initialization snapshot.
 
-The client and server in `example/urma_performance` accept `--urma_sl=6` and
-`--urma_priority=6`. Example values require matching CTP mappings on the selected
-device; their numeric order does not specify scheduling precedence.
+Different configurations use separate connections; equal configurations share
+connections. Naming services, pooled and short connections, accepted sockets and
+rebuilt Jettys inherit the configuration. The prepared pool serves the default
+priority; other priorities allocate Jettys on demand. Both v2/v3 handshakes carry
+the selected path.
 
-### Hardware validation
+### Functional validation
 
-First test the same device pair with native RM, CTP and shared JFR. Set the local
-`URMA_DEVICE` on each host and `SERVER_IP` on the client. Start the server first:
+Inspect the selected path's priority:SL map with
+`urma_admin show --dev "$URMA_DEVICE" --whole`.
+Both examples in `example/urma_performance` accept `--urma_tp_type=rtp --urma_sl=2`
+and an optional matching `--urma_priority`. Establish RPCs with defaults, then
+change request and response SLs separately. Check supported mappings, unsupported
+SLs and conflicting pairs across v2/v3, single/pooled and polling modes.
 
-```bash
-# Server
-urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
-    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003
-# Client
-urma_perftest send_lat --mgmt_proto tcp -d "$URMA_DEVICE" --ctp \
-    -p 0 -j true -I 0 -s 64 -n 1000 -P 8003 -S "$SERVER_IP"
-```
-
-Repeat with `-I 64` on both hosts for the inline comparison. Once native tests
-pass, establish a single-flow brpc baseline with default SL/priority, then test
-supported explicit SLs, changing the request and response directions separately.
-Verify that unsupported SLs and conflicting settings fail initialization.
-Connection debug output must show `state=ESTABLISHED` and the expected
-`urma_effective_priority` and `urma_effective_sl`. Exclude TCP fallback measurements from URMA QoS results.
-Then compare device SL mappings, queue counters, throughput and P99 under contention.
-
-Record kernel, UMDK, provider and firmware versions on both hosts. Status 4 means
-a local memory access error; resolve native data-path failures before measuring
-QoS. brpc completion errors log the direction, requested SL/priority, Jetty priority
-and mapped SL; initialization logs `default_priority` and `default_sl`. Mock tests check configuration propagation
-and Jetty attributes; hardware tests check packet markings and scheduling effects.
+Connection diagnostics expose `state`, `urma_effective_priority` and
+`urma_effective_sl`. Check that URMA is `ESTABLISHED`, the mapping matches the
+device and RPCs succeed. Evaluate scheduling with competing traffic, device queue
+counters, throughput and P99.

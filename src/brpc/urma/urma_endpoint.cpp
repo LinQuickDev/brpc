@@ -262,7 +262,7 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
                 : _resource->jetty->jetty_id.eid.raw;
         std::memcpy(out->eid, advertised_eid, 16);
     }
-    out->tp_type = static_cast<uint8_t>(URMA_CTP);
+    out->tp_type = static_cast<uint8_t>(GetUrmaTpType());
     // Pool segment: flatten g_pool_seg's seg fields.
     urma_target_seg_t* pool = GetPoolSegFor(nullptr);
     if (pool) {
@@ -544,6 +544,12 @@ void UrmaEndpoint::DeallocateResources() {
 // ============================================================================
 
 int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
+    if (peer.tp_type != static_cast<uint8_t>(GetUrmaTpType())) {
+        LOG(ERROR) << "URMA path mismatch: local=" << GetUrmaTpType()
+                   << " remote=" << static_cast<unsigned>(peer.tp_type);
+        errno = EPROTO;
+        return -1;
+    }
     urma_context_t* ctx = GetUrmaContext();
     if (!ctx) {
         errno = ENODEV;
@@ -577,10 +583,6 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
     remote.jetty_id.id = peer.jetty_id;
     remote.trans_mode = URMA_TM_RM;
     remote.type = URMA_JETTY;
-    if (peer.tp_type > static_cast<uint8_t>(URMA_UTP)) {
-        errno = EPROTO;
-        return -1;
-    }
     remote.tp_type = static_cast<urma_tp_type_t>(peer.tp_type);
 
     urma_token_t token{};

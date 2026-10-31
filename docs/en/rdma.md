@@ -1,20 +1,18 @@
-# Business-level QoS
+# Business QoS
 
-Set `ChannelOptions.rdma_qos.service_level` (0–15) and
-`ChannelOptions.rdma_qos.traffic_class` (0–255) for outbound requests.
-Both default to 0. Traffic Class is the full GRH/IP byte, including DSCP and ECN.
-Set `ServerOptions.rdma_qos` independently for outbound responses.
+Configure `ChannelOptions.rdma_qos` for outgoing requests and
+`ServerOptions.rdma_qos` for outgoing responses. `service_level` accepts 0–15;
+`traffic_class` accepts the full 8-bit GRH/IP byte, 0–255, including DSCP and ECN.
+Both default to 0. The network configures SL→VL and PCP/DSCP mappings and scheduling.
 
-Different SL or Traffic Class values use separate connections and QPs, while equal
-settings can share connections. Settings follow pooled and short sockets and are
-applied whenever the QP is brought up. V2/V3 handshake formats stay the same.
-TCP transports retain their existing settings.
+Different QoS settings use separate connections and QPs; equal settings share them.
+Naming services, pooled and short connections, accepted sockets and rebuilt QPs
+inherit the settings. v2/v3 handshake formats stay the same. Connection diagnostics
+show `rdma_sl` and `rdma_traffic_class`.
 
-The fabric defines how SL maps to VLs and scheduling priority. For RoCE, configure
-the NIC and switch PCP/DSCP mappings to match the deployment. The performance
-client/server accept `--rdma_sl` and `--rdma_traffic_class`; socket diagnostics show
-both applied values. Validate QP attributes and packet markings on hardware before
-comparing throughput and P99 under competing workloads.
+Both examples in `example/rdma_performance` accept `--rdma_sl` and
+`--rdma_traffic_class`. Check QP attributes and packet markings, then compare
+throughput and P99 under competing traffic.
 
 # Build
 

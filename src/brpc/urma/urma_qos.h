@@ -20,7 +20,7 @@
 
 namespace brpc {
 
-// Outbound CTP QoS, resolved through the selected device's priority/SL map.
+// Outbound RM QoS, resolved through the selected device's priority/SL map.
 struct UrmaQosOptions {
     int priority = -1;  // -1 selects from SL or device default; explicit [0, 15].
     int service_level = -1;  // -1 leaves SL unspecified; explicit range [0, 255].
