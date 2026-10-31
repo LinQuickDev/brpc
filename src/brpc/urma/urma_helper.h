@@ -33,6 +33,7 @@ class IOBuf;
 #if BRPC_WITH_URMA
 
 #include "urma_api.h"
+#include "brpc/urma/urma_qos.h"
 #include "urma_types.h"
 
 namespace brpc {
@@ -93,6 +94,20 @@ bool SelectUrmaTransportPath(const urma_device_attr_t& attr,
 // Return the process-wide path and priority selected at initialization.
 urma_tp_type_t GetUrmaTpType();
 uint8_t GetUrmaJettyPriority();
+
+// Check whether a priority advertises the selected RM path.
+bool IsUrmaPrioritySupported(const urma_device_attr_t& attr, int priority,
+                             urma_tp_type_t tp_type);
+// Resolve a requested priority/SL pair against a device capability snapshot.
+// Fully automatic options retain default_priority, including legacy fallback.
+bool ResolveUrmaJettyPriority(const urma_device_attr_t& attr,
+                             const UrmaQosOptions& qos, urma_tp_type_t tp_type,
+                             uint8_t default_priority, uint8_t* priority);
+// Resolve automatic selection or validate against the initialized device.
+bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority);
+// Return the advertised SL on the selected path, or -1 when no initialized mapping is available.
+int64_t GetUrmaServiceLevelForPriority(int priority);
+
 
 // Initialize a local SGE whose complete byte range belongs to this context.
 bool InitUrmaLocalSge(urma_sge_t* sge, uint64_t address, size_t length,

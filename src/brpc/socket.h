@@ -43,6 +43,8 @@
 #include "brpc/versioned_ref_with_id.h"
 #include "brpc/health_check_option.h"
 #include "brpc/socket_mode.h"
+#include "brpc/rdma/rdma_qos.h"
+#include "brpc/urma/urma_qos.h"
 #include "brpc/input_messenger_processor.h"  // InputMessengerProcessor
 
 namespace brpc {
@@ -309,6 +311,8 @@ struct SocketOptions {
     bool force_ssl{false};
     std::shared_ptr<SocketSSLContext> initial_ssl_ctx;
     SocketMode socket_mode{SOCKET_MODE_TCP};
+    RdmaQosOptions rdma_qos;
+    UrmaQosOptions urma_qos;
     bthread_keytable_pool_t* keytable_pool{nullptr};
     SocketConnection* conn{nullptr};
     std::shared_ptr<AppConnect> app_connect;
@@ -632,6 +636,8 @@ public:
 
     // The socket mode decided at creation.
     SocketMode socket_mode() const { return _socket_mode; }
+    const RdmaQosOptions& rdma_qos() const { return _rdma_qos; }
+    const UrmaQosOptions& urma_qos() const { return _urma_qos; }
 
     // Get an UNUSED socket connecting to the same place as this socket
     // from the SocketPool of this socket.
@@ -999,6 +1005,8 @@ private:
 
     // Should use SOCKET_MODE_RDMA or SOCKET_MODE_TCP or Other, default is SOCKET_MODE_TCP Transport
     SocketMode _socket_mode;
+    RdmaQosOptions _rdma_qos;
+    UrmaQosOptions _urma_qos;
     std::unique_ptr<Transport> _transport;
 
     // Pass from controller, for progressive reading.

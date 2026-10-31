@@ -295,6 +295,18 @@ foreach(BRPC_UT ${BRPC_UNITTESTS})
         brpc_test_config
         ${GPERFTOOLS_LIBRARIES})
     add_test(NAME ${BRPC_UT_WE} COMMAND ${BRPC_UT_WE})
+    if(WITH_URMA AND BRPC_UT_WE STREQUAL "brpc_urma_qos_unittest")
+        add_test(NAME brpc_urma_qos_rtp_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp)
+        add_test(NAME brpc_urma_qos_rtp_polling_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp --urma_use_polling=true)
+    endif()
+    if(WITH_URMA AND BRPC_UT_WE STREQUAL "brpc_urma_qos_churn_unittest")
+        add_test(NAME brpc_urma_qos_churn_rtp_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp)
+        add_test(NAME brpc_urma_qos_churn_rtp_polling_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp --urma_use_polling=true)
+    endif()
     if(WITH_URMA AND BRPC_UT_WE STREQUAL "brpc_urma_transport_unittest")
         add_test(NAME brpc_urma_transport_rtp_unittest
                  COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp)

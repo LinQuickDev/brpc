@@ -1533,9 +1533,9 @@ int RdmaEndpoint::BringUpQp(const ParsedHello& remote, bool is_server) {
     attr.ah_attr.grh.flow_label = 0;
     attr.ah_attr.grh.sgid_index = GetRdmaGidIndex();
     attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
-    attr.ah_attr.grh.traffic_class = 0;
+    attr.ah_attr.grh.traffic_class = _socket->rdma_qos().traffic_class;
     attr.ah_attr.dlid = remote.lid;
-    attr.ah_attr.sl = 0;
+    attr.ah_attr.sl = _socket->rdma_qos().service_level;
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.static_rate = 0;
     attr.ah_attr.is_global = 1;
@@ -1952,6 +1952,8 @@ std::string RdmaEndpoint::GetStateStr() const {
 
 void RdmaEndpoint::DebugInfo(std::ostream& os, butil::StringPiece connector) const {
     os << "rdma_state=ON"
+       << connector << "rdma_sl=" << _socket->rdma_qos().service_level
+       << connector << "rdma_traffic_class=" << _socket->rdma_qos().traffic_class
        << connector << "handshake_state=" << GetStateStr()
        << connector << "handshake_version=" << static_cast<int>(_handshake_version)
        << connector << "rdma_sq_imm_window_size=" << _sq_imm_window_size

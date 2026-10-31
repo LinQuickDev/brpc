@@ -270,3 +270,54 @@ directory for the tool self-tests.
 buffer held until completion, adding one CPU copy. Keep device, queue and payload
 settings consistent when comparing send paths. Startup logs report `copy_send`;
 failure logs report direction, send slot and registered segment range.
+
+## Business SL and priority
+
+Set `ChannelOptions.urma_qos` for outgoing requests and
+`ServerOptions.urma_qos` for outgoing responses:
+
+```cpp
+brpc::ChannelOptions client_options;
+client_options.socket_mode = brpc::SOCKET_MODE_URMA;
+client_options.urma_qos.service_level = 2;
+
+brpc::ServerOptions server_options;
+server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+server_options.urma_qos.service_level = 2;
+```
+
+`--urma_tp_type=auto` prefers CTP, then RTP, using device capabilities.
+Use `ctp` or `rtp` to select a path explicitly. Both peers use the same path,
+fixed at process initialization. Providers without a capability table use
+priority 6 for auto/CTP and priority 0 for RTP.
+
+| Option | Default | Explicit range | Meaning |
+| --- | --- | --- | --- |
+| `service_level` | -1 | 0–255 | Select the first priority mapping to this SL on the selected path |
+| `priority` | -1 | 0–15 | Select a priority supported by the selected path |
+
+Both fields at -1 select the device default. When both are explicit, they must
+match the same device mapping. Channel initialization and Server startup reject
+unsupported or conflicting settings and report supported priority:SL pairs.
+For example, RTP priority 0 mapping to SL 2 resolves `service_level=2` to priority 0.
+The platform configures mappings and scheduling; brpc uses the initialization snapshot.
+
+Different configurations use separate connections; equal configurations share
+connections. Naming services, pooled and short connections, accepted sockets and
+rebuilt Jettys inherit the configuration. The prepared pool serves the default
+priority; other priorities allocate Jettys on demand. Both v2/v3 handshakes carry
+the selected path.
+
+### Functional validation
+
+Inspect the selected path's priority:SL map with
+`urma_admin show --dev "$URMA_DEVICE" --whole`.
+Both examples in `example/urma_performance` accept `--urma_tp_type=rtp --urma_sl=2`
+and an optional matching `--urma_priority`. Establish RPCs with defaults, then
+change request and response SLs separately. Check supported mappings, unsupported
+SLs and conflicting pairs across v2/v3, single/pooled and polling modes.
+
+Connection diagnostics expose `state`, `urma_effective_priority` and
+`urma_effective_sl`. Check that URMA is `ESTABLISHED`, the mapping matches the
+device and RPCs succeed. Evaluate scheduling with competing traffic, device queue
+counters, throughput and P99.
