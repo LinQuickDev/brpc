@@ -1,7 +1,7 @@
-# 运行期故障恢复设计
+# 运行期故障恢复
 
-端口故障隔离、冷却探测、运行时降级及多端口主备方案见
-[RDMA 运行期故障恢复与 TCP 降级设计](rdma_runtime_recovery.md)。
+模式切换、端口与对端冷却及 TCP 回落见
+[RDMA 与 URMA 运行期故障恢复](rdma_runtime_recovery.md)。
 
 # 编译
 
