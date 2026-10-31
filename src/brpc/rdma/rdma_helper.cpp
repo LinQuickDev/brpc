@@ -30,6 +30,7 @@
 #include "brpc/rdma/block_pool.h"
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/rdma/rdma_helper.h"
+#include "brpc/rdma/rdma_recovery_policy.h"
 
 
 namespace butil {
@@ -268,7 +269,7 @@ static void OnRdmaAsyncEvent(Socket* m) {
             SocketId sid = (SocketId)event.element.qp->qp_context;
             SocketUniquePtr s;
             if (Socket::Address(sid, &s) == 0) {
-                s->SetFailed(ERDMA, "QP fatal error");
+                RdmaEndpoint::OnAsyncError(s.get(), event);
                 LOG(WARNING) << "Receive a QP fatal error on " << s->description();
             }
             // NOTE:
@@ -280,7 +281,11 @@ static void OnRdmaAsyncEvent(Socket* m) {
             break;
         }
         case IBV_EVENT_CQ_ERR: {
-            LOG(WARNING) << "CQ overruns, the connection will be stopped.";
+            SocketUniquePtr s;
+            const SocketId sid = reinterpret_cast<SocketId>(event.element.cq->cq_context);
+            if (Socket::Address(sid, &s) == 0) {
+                RdmaEndpoint::OnAsyncError(s.get(), event);
+            }
             IbvAckAsyncEvent(&event);
             break;
         }
@@ -313,8 +318,10 @@ static void OnRdmaAsyncEvent(Socket* m) {
         }
         case IBV_EVENT_PORT_ACTIVE:
         case IBV_EVENT_PORT_ERR: {
-            // Port up/down will lead these two events.
-            // The port error is recoverable.
+            if (event.element.port_num == g_port_num) {
+                GlobalRdmaRecoveryPolicy().ReportPortState(
+                    event.event_type == IBV_EVENT_PORT_ACTIVE);
+            }
             IbvAckAsyncEvent(&event);
             break;
         }
@@ -697,6 +704,31 @@ uint8_t GetRdmaPortNum() {
 
 bool IsRdmaAvailable() {
     return g_rdma_available.load(butil::memory_order_acquire);
+}
+
+bool IsRdmaPathFailure(ibv_wc_status status) {
+    const auto reason = ClassifyRdmaCompletion(status);
+    return reason != RdmaFailureReason::NONE &&
+           reason != RdmaFailureReason::ACCESS_ERROR;
+}
+
+RdmaFailureReason ClassifyRdmaCompletion(ibv_wc_status status) {
+    switch (status) {
+    case IBV_WC_SUCCESS:
+    case IBV_WC_WR_FLUSH_ERR:
+        return RdmaFailureReason::NONE;
+    case IBV_WC_RETRY_EXC_ERR:
+        return RdmaFailureReason::RETRY_EXHAUSTED;
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+        return RdmaFailureReason::RNR;
+    case IBV_WC_LOC_PROT_ERR:
+    case IBV_WC_LOC_ACCESS_ERR:
+    case IBV_WC_REM_ACCESS_ERR:
+    case IBV_WC_MW_BIND_ERR:
+        return RdmaFailureReason::ACCESS_ERROR;
+    default:
+        return RdmaFailureReason::TRANSPORT_ERROR;
+    }
 }
 
 void GlobalDisableRdma() {

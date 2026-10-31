@@ -26,6 +26,10 @@
 #include "bthread/types.h"
 #include "butil/atomicops.h"
 
+namespace butil {
+class IOBuf;
+}
+
 #if BRPC_WITH_URMA
 
 #include "urma_api.h"
@@ -76,18 +80,19 @@ const urma_eid_t* GetUrmaLocalEid();
 // Return true when the selected URMA device is a bonding provider device.
 bool IsUrmaBondingDevice();
 
-// Find the first priority whose advertised capabilities include @tp_type.
+// Find the first priority advertising @tp_type, including combined capabilities.
 // Returns -1 when the device does not report one.
 int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
                               urma_tp_type_t tp_type);
 
-// Select the process-wide RM path and its default priority from device capabilities.
+// Select an RM path from "auto", "ctp", or "rtp". Auto prefers CTP, then RTP.
+// Providers without a capability table retain CTP/6 or explicit RTP/0.
 bool SelectUrmaTransportPath(const urma_device_attr_t& attr,
                              const std::string& requested,
                              urma_tp_type_t* tp_type, uint8_t* priority);
-urma_tp_type_t GetUrmaTpType();
 
-// Return the default Jetty priority selected for the device.
+// Return the process-wide path and priority selected at initialization.
+urma_tp_type_t GetUrmaTpType();
 uint8_t GetUrmaJettyPriority();
 
 // Check whether a priority advertises the selected RM path.
@@ -102,6 +107,16 @@ bool ResolveUrmaJettyPriority(const urma_device_attr_t& attr,
 bool ResolveUrmaJettyPriority(const UrmaQosOptions& qos, uint8_t* priority);
 // Return the advertised SL on the selected path, or -1 when no initialized mapping is available.
 int64_t GetUrmaServiceLevelForPriority(int priority);
+
+
+// Initialize a local SGE whose complete byte range belongs to this context.
+bool InitUrmaLocalSge(urma_sge_t* sge, uint64_t address, size_t length,
+                      urma_target_seg_t* segment);
+
+constexpr size_t URMA_SEND_BUFFER_ALIGNMENT = 64;
+// Copy host payloads into one aligned block and transfer its ownership to buffer.
+bool CopyUrmaSendBuffer(butil::IOBuf* buffer, urma_sge_t* sge,
+                       urma_target_seg_t* (*lookup)(void*) = GetPoolSegFor);
 
 // If the URMA environment is available.
 bool IsUrmaAvailable();

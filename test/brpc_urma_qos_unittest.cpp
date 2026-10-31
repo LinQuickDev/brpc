@@ -315,6 +315,9 @@ protected:
     static urma::UrmaEndpoint* Endpoint(SocketUniquePtr& socket) {
         return static_cast<UrmaTransport*>(socket->_transport.get())->GetUrmaEp();
     }
+    static int Sl2Priority() {
+        return urma::GetUrmaTpType() == URMA_RTP ? 0 : 6;
+    }
 };
 bool UrmaQosTest::_mock = false;
 
@@ -508,7 +511,7 @@ TEST_F(UrmaQosTest, prepared_jettys_are_used_only_for_matching_priority) {
     ASSERT_EQ(0, urma::UrmaEndpoint::GlobalInitialize());
     // SL 4 resolves to priority 10 and must leave the default Jettys available.
     struct RequestedQos { int priority; int sl; int effective; };
-    for (const auto& qos : {RequestedQos{-1, 4, 10}, {-1, 2, 6}, {6, 2, 6},
+    for (const auto& qos : {RequestedQos{-1, 4, 10}, {-1, 2, Sl2Priority()}, {6, 2, 6},
                             {10, -1, 10}, {-1, -1, urma::GetUrmaJettyPriority()}, {10, 4, 10}}) {
         SocketOptions options;
         options.socket_mode = SOCKET_MODE_URMA;
@@ -546,7 +549,7 @@ TEST_F(UrmaQosTest, access_error_preserves_priority_and_reports_direction) {
         auto* ep = Endpoint(socket);
         ASSERT_EQ(0, urma::UrmaQosTestPeer::Allocate(ep));
         const int effective =
-            priority == -1 ? 6 : priority;
+            priority == -1 ? Sl2Priority() : priority;
         for (bool receive : {false, true}) {
             urma_cr_t cr{};
             cr.status = URMA_CR_LOC_ACCESS_ERR;
@@ -663,7 +666,7 @@ TEST_F(UrmaQosTest, request_and_response_service_levels_apply_across_restart) {
         ASSERT_EQ(0, Socket::Address(channel._server_id, &client));
         EXPECT_EQ(-1, client->urma_qos().priority);
         EXPECT_EQ(co.urma_qos.service_level, client->urma_qos().service_level);
-        EXPECT_EQ(response_sl == 2 ? 10 : 6,
+        EXPECT_EQ(response_sl == 2 ? 10 : Sl2Priority(),
                   urma::UrmaQosTestPeer::Priority(Endpoint(client)));
         std::vector<SocketId> sockets;
         server._am->ListConnections(&sockets);
@@ -672,7 +675,7 @@ TEST_F(UrmaQosTest, request_and_response_service_levels_apply_across_restart) {
         ASSERT_EQ(0, Socket::Address(sockets[0], &accepted));
         EXPECT_EQ(-1, accepted->urma_qos().priority);
         EXPECT_EQ(response_sl, accepted->urma_qos().service_level);
-        EXPECT_EQ(response_sl == 2 ? 6 : 10,
+        EXPECT_EQ(response_sl == 2 ? Sl2Priority() : 10,
                   urma::UrmaQosTestPeer::Priority(Endpoint(accepted)));
         std::ostringstream debug;
         Endpoint(accepted)->DebugInfo(debug);

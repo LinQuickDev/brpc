@@ -301,6 +301,19 @@ foreach(BRPC_UT ${BRPC_UNITTESTS})
         add_test(NAME brpc_urma_qos_rtp_polling_unittest
                  COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp --urma_use_polling=true)
     endif()
+    if(WITH_URMA AND BRPC_UT_WE STREQUAL "brpc_urma_qos_churn_unittest")
+        add_test(NAME brpc_urma_qos_churn_rtp_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp)
+        add_test(NAME brpc_urma_qos_churn_rtp_polling_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp --urma_use_polling=true)
+    endif()
+    if(WITH_URMA AND BRPC_UT_WE STREQUAL "brpc_urma_transport_unittest")
+        add_test(NAME brpc_urma_transport_rtp_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp)
+        add_test(NAME brpc_urma_transport_rtp_stress_unittest
+                 COMMAND ${BRPC_UT_WE} --urma_tp_type=rtp
+                         --gtest_shuffle --gtest_random_seed=92 --gtest_repeat=20)
+    endif()
 endforeach()
 
 if(BUILD_FUZZ_TESTS)
