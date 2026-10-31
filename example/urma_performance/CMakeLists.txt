@@ -81,5 +81,11 @@ if(BUILD_URMA_FAULT_INJECTOR)
                  COMMAND ${CMAKE_COMMAND} -E env
                          "LD_PRELOAD=$<TARGET_FILE:urma_send_failure_injector>"
                          $<TARGET_FILE:urma_send_failure_injector_test>)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME urma_recovery_injection_runner_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/test_run_recovery_injection.py)
+        endif()
     endif()
 endif()

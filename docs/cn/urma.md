@@ -259,18 +259,16 @@ URMA 示例提供默认关闭的 Linux 注入模块，使用 `LD_PRELOAD` 在指
 ```bash
 cmake -S example/urma_performance -B build/urma-example -DBUILD_URMA_FAULT_INJECTOR=ON
 cmake --build build/urma-example --target urma_send_failure_injector -j8
-BRPC_URMA_FAIL_ONCE_FILE="$PWD/pr92-inject.once" \
-LD_PRELOAD="$PWD/build/urma-example/liburma_send_failure_injector.so" \
-./build/urma-example/urma_recovery_client --transport=urma \
-    --server=SERVER_IP:8003 --urma_device=URMA_DEVICE --urma_tp_type=rtp \
-    --mode=auto --connection_type=short --cooldown_ms=10000 --seconds=40
+python3 example/urma_performance/run_recovery_injection.py \
+    --server=SERVER_IP:8003 --device=URMA_DEVICE --tp-type=rtp
 ```
 
-启动前移除旧标记文件，正常 RPC 后在另一终端创建 `pr92-inject.once`。
-日志应记录一次注入，失败 RPC 增加一次，`failures.send_post` 增加一次；
-冷却期间 `cooled_peers` 和 TCP 准入增加，URMA 协商数暂停，冷却后重新增长。
+运行器等待成功的 URMA RPC 后创建独立标记文件，直接访问客户端的 loopback 指标端口，
+并校验指标 PID。它保存 CSV、日志及基线、冷却中、恢复后三份状态快照，
+检查恰好一次失败、`failures.send_post=1`、冷却期间 TCP 准入及冷却后 URMA 协商恢复。
+默认 v3 握手、运行 40 秒、冷却 10 秒；启动等待单独计时。
 该模块验证 SEND_POST 错误处理与恢复策略，设备完成错误需单独注入。
-构建 `urma_send_failure_injector_test` 后，可通过示例目录的 CTest 执行转发与单次注入自测。
+构建 `urma_send_failure_injector_test` 后，可通过示例目录的 CTest 执行工具自测。
 
 ## 发送访问错误对照
 

@@ -285,20 +285,19 @@ ACKs, are forwarded to liburma.
 ```bash
 cmake -S example/urma_performance -B build/urma-example -DBUILD_URMA_FAULT_INJECTOR=ON
 cmake --build build/urma-example --target urma_send_failure_injector -j8
-BRPC_URMA_FAIL_ONCE_FILE="$PWD/pr92-inject.once" \
-LD_PRELOAD="$PWD/build/urma-example/liburma_send_failure_injector.so" \
-./build/urma-example/urma_recovery_client --transport=urma \
-    --server=SERVER_IP:8003 --urma_device=URMA_DEVICE --urma_tp_type=rtp \
-    --mode=auto --connection_type=short --cooldown_ms=10000 --seconds=40
+python3 example/urma_performance/run_recovery_injection.py \
+    --server=SERVER_IP:8003 --device=URMA_DEVICE --tp-type=rtp
 ```
 
-Remove any old marker before starting, then create `pr92-inject.once` from another
-terminal after normal RPCs succeed. Expect one injection log, one failed RPC and
-one increment of `failures.send_post`. During cooldown, `cooled_peers` and TCP
-admissions increase while URMA negotiations pause; negotiations resume after
-cooldown. This tests SEND_POST handling and recovery policy. Device completion
-errors require separate injection. Build `urma_send_failure_injector_test` and
-run CTest in the example build directory to check forwarding and single injection.
+The runner waits for successful URMA RPCs before creating a unique marker. It
+queries the client's loopback metrics directly and checks the listener PID.
+CSV, logs and baseline/cooldown/recovered snapshots are saved in a new directory.
+Checks require exactly one failed RPC, `failures.send_post=1`, TCP admission during
+cooldown and resumed URMA negotiations. Defaults are v3, a 40-second run and
+10-second cooldown, with a separate startup timeout. This tests SEND_POST handling
+and recovery policy; device completion errors require separate injection. Build
+`urma_send_failure_injector_test` and run CTest in the example build directory
+for the tool self-tests.
 
 ## Comparing send access failures
 
