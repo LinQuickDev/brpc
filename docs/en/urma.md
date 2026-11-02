@@ -207,3 +207,40 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+## Observability and diagnostics
+
+Use `/vars/urma_*` and Prometheus for process metrics, and `/sockets/urma` for
+connection and registered BufferPool snapshots. Use `internal_port` when configured.
+
+```sh
+curl http://127.0.0.1:8003/sockets/urma
+curl 'http://127.0.0.1:8003/sockets/123?format=json'
+python3 tools/urma_diag.py --server 127.0.0.1:8003 pool
+python3 tools/urma_diag.py --server 127.0.0.1:8003 --json watch --interval 1
+python3 tools/urma_diag.py --server 127.0.0.1:8003 trace 123 --trace-id 456
+```
+
+The CLI uses the Python 3 standard library and supports `connections`, `pool`,
+`socket`, `trace`, and `watch`.
+
+| Metrics | Contents |
+| --- | --- |
+| Writes and transfers | Bulk writes, data bytes, submitted and locally completed WRs, errors |
+| Flow control | Remaining SQ/remote credit, blocked attempts, wait time |
+| Connections | Handshake success, failure, TCP fallback and reasons |
+| Registered pool | Capacity, occupancy, peak occupancy, exhaustion, allocation fallback |
+
+`urma_bulk_min_bytes` defaults to 65536 and classifies serialized writes including
+protocol headers and attachments. Wait time is attributed to the window state
+at butex-wait entry; SQ and remote-credit waits can overlap.
+
+Enable rpcz and set `urma_trace_sample_every=N` to sample one in N span IDs.
+The default is 0 (disabled); 1 traces every available span. Samples record queueing,
+submission, local completion and resource waits in rpcz annotations. Each connection
+also retains its latest 64 finished samples.
+
+Snapshot IDs are decimal strings. The inventory returns up to 1024 connections
+and sets `truncated` for larger lists; individual sockets can be queried directly.
+Connection reuse increments `generation` and resets connection counters. The CLI
+calculates rates within the same generation.

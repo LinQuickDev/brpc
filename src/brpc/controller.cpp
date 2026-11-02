@@ -1509,6 +1509,9 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     }
     Socket::WriteOptions wopt;
     wopt.id_wait = cid;
+#if BRPC_WITH_URMA
+    wopt.urma_trace_span = _span;
+#endif
     wopt.abstime = pabstime;
     wopt.pipelined_count = _pipelined_count;
     wopt.auth_flags = _auth_flags;

@@ -46,6 +46,7 @@
 #include "brpc/input_messenger_processor.h"  // InputMessengerProcessor
 
 namespace brpc {
+class Span;
 namespace policy {
 class ConsistentHashingLoadBalancer;
 class RtmpContext;
@@ -393,6 +394,10 @@ public:
     // - Write once when uncontended(most cases).
     // - Wait-free when contended.
     struct WriteOptions {
+#if BRPC_WITH_URMA
+        // Explicit RPC span; never infer this from the KeepWrite bthread's TLS.
+        std::shared_ptr<Span> urma_trace_span;
+#endif
         // `id_wait' is signalled when this Socket is SetFailed or data is written
         // successfully with `notify_on_success=true'. To disable the signal, set
         // this field to INVALID_BTHREAD_ID. `on_reset' of `id_wait' is NOT called
@@ -632,6 +637,10 @@ public:
 
     // The socket mode decided at creation.
     SocketMode socket_mode() const { return _socket_mode; }
+#if BRPC_WITH_URMA
+    // Called with an addressed Socket, keeping its transport alive.
+    bool DescribeUrmaJson(std::ostream& os) const;
+#endif
 
     // Get an UNUSED socket connecting to the same place as this socket
     // from the SocketPool of this socket.

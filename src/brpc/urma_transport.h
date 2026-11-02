@@ -20,6 +20,8 @@
 
 #if BRPC_WITH_URMA
 
+#include <mutex>
+#include <unordered_map>
 #include "brpc/channel.h"
 #include "brpc/socket.h"
 #include "brpc/transport.h"
@@ -54,6 +56,11 @@ public:
     void QueueMessage(InputMessageClosure& input_msg, int* num_bthread_created,
                       bool last_msg) override;
     void Debug(std::ostream& os) override;
+    bool DescribeJson(std::ostream& os) const;
+    ssize_t CutWithTrace(butil::IOBuf** data, size_t ndata);
+    void TrackWrite(const butil::IOBuf* data, std::shared_ptr<Span> span);
+    void ObserveWrite(size_t bytes);
+    void FinishWrite(const butil::IOBuf* data, int error);
 
     urma::UrmaEndpoint* GetUrmaEp() {
         CHECK(_urma_ep != nullptr);
@@ -73,6 +80,10 @@ private:
         URMA_UNKNOWN
     };
 
+    // Only sampled writes enter this side table; Socket::WriteRequest stays 64 bytes.
+    std::mutex _trace_mutex;
+    std::unordered_map<const butil::IOBuf*, std::shared_ptr<urma::WriteTrace>> _write_traces;
+    butil::atomic<bool> _has_traces{false};
     urma::UrmaEndpoint* _urma_ep = nullptr;
     butil::atomic<UrmaState> _urma_state{URMA_UNKNOWN};
     std::shared_ptr<TcpTransport> _tcp_transport;

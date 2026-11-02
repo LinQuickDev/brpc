@@ -193,3 +193,36 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+## 可观测性与诊断
+
+通过 `/vars/urma_*` 和 Prometheus 查看进程指标，通过 `/sockets/urma` 查看连接与
+注册 BufferPool 快照。配置 `internal_port` 时使用该端口。
+
+```sh
+curl http://127.0.0.1:8003/sockets/urma
+curl 'http://127.0.0.1:8003/sockets/123?format=json'
+python3 tools/urma_diag.py --server 127.0.0.1:8003 pool
+python3 tools/urma_diag.py --server 127.0.0.1:8003 --json watch --interval 1
+python3 tools/urma_diag.py --server 127.0.0.1:8003 trace 123 --trace-id 456
+```
+
+CLI 使用 Python 3 标准库，支持 `connections`、`pool`、`socket`、`trace` 和 `watch`。
+
+| 指标 | 内容 |
+| --- | --- |
+| 写入与传输 | bulk 写入、数据字节、WR 提交与本地完成、错误 |
+| 流控 | SQ/远端 credit 剩余量、阻塞次数与等待时间 |
+| 建链 | 握手成功、失败、TCP 回退及原因 |
+| 注册池 | 容量、占用、峰值、耗尽与回退分配次数 |
+
+`urma_bulk_min_bytes` 默认 65536，按包含协议头和附件的序列化写入大小分类。
+等待时间按进入 butex 等待时的窗口状态归因，SQ 与远端 credit 等待可重叠。
+
+开启 rpcz 并设置 `urma_trace_sample_every=N`，按 span ID 每 N 条采样一条；
+默认 0 关闭，1 跟踪全部可用 span。采样记录排队、提交、本地完成及资源等待，
+写入 rpcz 注释，并在每连接保留最近 64 条已结束记录。
+
+快照中的 ID 为十进制字符串。列表最多返回 1024 条连接，超出时标记 `truncated`；
+按 SocketId 可直接查询。连接重用时 `generation` 递增、连接计数清零，CLI 按
+同一 generation 计算速率。
