@@ -37,6 +37,7 @@
 #include "urma_api.h"
 #include "urma_types.h"
 #include "brpc/urma/urma_handshake.h"
+#include "brpc/urma/urma_observability.h"
 #include "brpc/urma/urma_handshake.pb.h"
 
 namespace brpc {
@@ -126,7 +127,11 @@ public:
     // ---- Data path (called by UrmaTransport) ----
     // Cut data from the IOBuf list and post it via URMA SEND.
     // Returns bytes sent, or -1 (errno set; EAGAIN when windows are full).
-    ssize_t CutFromIOBufList(butil::IOBuf** data, size_t ndata);
+    ssize_t CutFromIOBufList(butil::IOBuf** data, size_t ndata,
+                             const std::shared_ptr<WriteTrace>* traces = nullptr);
+    ConnectionSnapshot GetSnapshot() const;
+    void RecordWait(bool sq, bool remote, uint64_t elapsed_us);
+    ConnectionStats& stats() { return _stats; }
 
     // Whether the endpoint can post more sends (both windows non-empty).
     bool IsWritable() const;
@@ -260,7 +265,8 @@ private:
     void PollerRemoveCqSid();
 
     inline void TryReadOnTcp();
-    void FallbackToTcp(UrmaTransport* transport, bool process_tcp);
+    void FallbackToTcp(UrmaTransport* transport, bool process_tcp,
+                       const char* reason = "peer declined URMA", int error = 0);
     void FailHandshake(UrmaTransport* transport, int error,
                        const char* reason);
 
@@ -294,6 +300,13 @@ private:
 
     // Per-WR send buffers (own the IOBuf until the SEND completes).
     std::vector<butil::IOBuf> _sbuf;
+    struct SendObservation {
+        size_t bytes = 0;
+        std::vector<TraceContribution> traces;
+    };
+    std::vector<SendObservation> _send_observations;
+    std::vector<std::shared_ptr<WriteTrace>> _waiting_traces;
+    ConnectionStats _stats;
     // Per-WR recv buffers (zero-copy targets).
     std::vector<butil::IOBuf> _rbuf;
     std::vector<void*> _rbuf_data;

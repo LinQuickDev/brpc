@@ -467,6 +467,9 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
         // Have the risk of unlimited pending responses, in which case, tell
         // users to set max_concurrency.
         Socket::WriteOptions wopt;
+#if BRPC_WITH_URMA
+        wopt.urma_trace_span = span;
+#endif
         wopt.ignore_eovercrowded = true;
         if (INVALID_BTHREAD_ID != response_id) {
             wopt.id_wait = response_id;

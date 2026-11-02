@@ -41,6 +41,9 @@
 #include "brpc/errno.pb.h"
 #include "brpc/event_dispatcher.h"          // RemoveConsumer
 #include "brpc/socket.h"
+#if BRPC_WITH_URMA
+#include "brpc/urma_transport.h"
+#endif
 #include "brpc/describable.h"               // Describable
 #include "brpc/circuit_breaker.h"           // CircuitBreaker
 #include "brpc/input_messenger.h"
@@ -399,6 +402,11 @@ void Socket::WriteRequest::Setup(Socket* s) {
                 return;
             }
         }
+#if BRPC_WITH_URMA
+        if (s->socket_mode() == SOCKET_MODE_URMA) {
+            static_cast<UrmaTransport*>(s->_transport.get())->ObserveWrite(data.size());
+        }
+#endif
         const int64_t before_write =
             s->_unwritten_bytes.fetch_add(data.size(), butil::memory_order_relaxed);
         if (before_write + (int64_t)data.size() >= FLAGS_socket_max_unwritten_bytes) {
@@ -508,6 +516,11 @@ Socket::~Socket() {
 
 void Socket::ReturnSuccessfulWriteRequest(Socket::WriteRequest* p) {
     DCHECK(p->data.empty());
+#if BRPC_WITH_URMA
+    if (socket_mode() == SOCKET_MODE_URMA) {
+        static_cast<UrmaTransport*>(_transport.get())->FinishWrite(&p->data, 0);
+    }
+#endif
     AddOutputMessages(1);
     const bthread_id_t id_wait = p->id_wait;
     bool is_notify_on_success = p->is_notify_on_success();
@@ -528,6 +541,11 @@ void Socket::ReturnFailedWriteRequest(Socket::WriteRequest* p, int error_code,
         CancelUnwrittenBytes(p->data.size());
     }
     p->data.clear();  // data is probably not written.
+#if BRPC_WITH_URMA
+    if (socket_mode() == SOCKET_MODE_URMA) {
+        static_cast<UrmaTransport*>(_transport.get())->FinishWrite(&p->data, error_code);
+    }
+#endif
     const bthread_id_t id_wait = p->id_wait;
     butil::return_object(p);
     if (id_wait != INVALID_BTHREAD_ID) {
@@ -1677,6 +1695,11 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
     // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
+#if BRPC_WITH_URMA
+    if (socket_mode() == SOCKET_MODE_URMA) {
+        static_cast<UrmaTransport*>(_transport.get())->TrackWrite(&req->data, opt.urma_trace_span);
+    }
+#endif
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
     req->set_pipelined_count_and_user_message(
         opt.pipelined_count, DUMMY_USER_MESSAGE, opt.auth_flags);
@@ -1714,6 +1737,11 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
     // wait until it points to a valid WriteRequest or nullptr.
     req->next = WriteRequest::UNCONNECTED;
     req->id_wait = opt.id_wait;
+#if BRPC_WITH_URMA
+    if (socket_mode() == SOCKET_MODE_URMA) {
+        static_cast<UrmaTransport*>(_transport.get())->TrackWrite(&req->data, opt.urma_trace_span);
+    }
+#endif
     req->clear_and_set_control_bits(opt.notify_on_success, opt.shutdown_write);
     req->set_pipelined_count_and_user_message(
         opt.pipelined_count, msg.release(), opt.auth_flags);
@@ -1780,7 +1808,15 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
         butil::IOBuf* data_arr[1] = { &req->data };
         nw = _conn->CutMessageIntoFileDescriptor(fd(), data_arr, 1);
     } else {
-        nw = _transport->CutFromIOBuf(&req->data);
+#if BRPC_WITH_URMA
+        if (socket_mode() == SOCKET_MODE_URMA) {
+            butil::IOBuf* data_arr[] = {&req->data};
+            nw = static_cast<UrmaTransport*>(_transport.get())->CutWithTrace(data_arr, 1);
+        } else
+#endif
+        {
+            nw = _transport->CutFromIOBuf(&req->data);
+        }
     }
     if (nw < 0) {
         // RTMP may return EOVERCROWDED
@@ -1925,6 +1961,12 @@ ssize_t Socket::DoWrite(WriteRequest* req) {
         if (_conn) {
             return _conn->CutMessageIntoFileDescriptor(fd(), data_list, ndata);
         } else {
+#if BRPC_WITH_URMA
+            if (socket_mode() == SOCKET_MODE_URMA) {
+                return static_cast<UrmaTransport*>(_transport.get())
+                    ->CutWithTrace(data_list, ndata);
+            }
+#endif
             return _transport->CutFromIOBufList(data_list, ndata);
         }
     }
@@ -2326,6 +2368,15 @@ std::ostream& operator<<(std::ostream& os, const ObjectPtr<T>& obj) {
     }
     return os << obj._obj;
 }
+
+#if BRPC_WITH_URMA
+bool Socket::DescribeUrmaJson(std::ostream& os) const {
+    if (socket_mode() != SOCKET_MODE_URMA || !_transport) {
+        return false;
+    }
+    return static_cast<UrmaTransport*>(_transport.get())->DescribeJson(os);
+}
+#endif
 
 void Socket::DebugSocket(std::ostream& os, SocketId id) {
     SocketUniquePtr ptr;

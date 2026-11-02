@@ -321,3 +321,21 @@ if(BUILD_FUZZ_TESTS)
             INSTALL_RPATH "$ORIGIN/lib")
     endforeach()
 endif()
+
+# The URMA diagnostic CLI only depends on the Python standard library.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME urma_diag_test
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/urma_diag_test.py)
+endif()
+
+# These functional data-path tests use the in-process mock, never a real device.
+if(WITH_URMA AND (URMA_USE_MOCK STREQUAL "ON" OR
+                  (URMA_USE_MOCK STREQUAL "AUTO" AND NOT URMA_LIB)))
+    foreach(mode IN ITEMS false true)
+        add_test(NAME urma_datapath_polling_${mode}
+                 COMMAND brpc_urma_observability_unittest --urma_test_datapath
+                         --urma_use_polling=${mode} --gtest_filter=UrmaDatapathTest.*)
+        set_tests_properties(urma_datapath_polling_${mode} PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()

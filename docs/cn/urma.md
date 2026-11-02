@@ -193,3 +193,62 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+
+## 可观测性与诊断
+
+URMA 通过已有 `/vars` 和 Prometheus 导出进程级 `urma_*` 指标，通过已有
+内置服务入口提供连接快照。设置 `internal_port` 时使用内网端口，沿用现有
+内置服务访问控制。
+
+```sh
+curl http://127.0.0.1:8003/sockets/urma
+curl 'http://127.0.0.1:8003/sockets/123?format=json'
+python3 tools/urma_diag.py --server 127.0.0.1:8003 connections
+python3 tools/urma_diag.py --server 127.0.0.1:8003 pool
+python3 tools/urma_diag.py --server 127.0.0.1:8003 socket 123
+python3 tools/urma_diag.py --server 127.0.0.1:8003 --json watch --interval 1 --count 10
+python3 tools/urma_diag.py --server 127.0.0.1:8003 trace 123 --trace-id 456
+```
+
+CLI 仅依赖 Python 3 标准库。列表最多返回 1024 条连接并输出 `truncated`；
+按 SocketId 查询不受列表上限影响。ID 用十进制 JSON 字符串保存，避免 64 位
+精度丢失。列表 `schema_version` 为 1。
+
+连接快照包括建链/回退状态和原因、实际协商窗口容量、剩余 SQ/远端 credit、
+数据 WR 提交与完成、在途字节、错误及两种资源等待。进程指标带 `urma_` 前缀，
+连接快照的 `counters` 使用不带前缀的名称。
+
+* `writes`、`bulk_writes`、`bulk_write_bytes`：进入已建立 URMA 数据路径的完整
+  序列化写入。`urma_bulk_min_bytes` 默认 65536 字节，非正值关闭分类。大小包括
+  协议头和附件；写入、WR 和业务 RPC 的数量不能混用。
+* `send_bytes` / `send_wrs` 与 `send_completed_bytes` / `send_completed_wrs`
+  分别表示数据提交和本地完成。提交失败会回滚；本地完成不等于远端业务已处理。
+* `sq_blocked` / `remote_credit_blocked` 统计尝试发送时窗口为零的观察次数；
+  `sq_wait_us` / `remote_credit_wait_us` 按 butex 等待入口观察到的原因归因。
+  两者可能重叠，不能作为互斥阶段相加。
+* `urma_pool_capacity`、`urma_pool_buffer_size`、`urma_pool_in_use` 和
+  `urma_pool_peak_in_use` 统计注册 BufferPool。IOBuf 引用和线程缓存可能在 RPC
+  结束后继续持有 buffer。`urma_pool_exhausted` 和 `urma_malloc_fallback` 统计池耗尽
+  及分配回退尝试，后者还包括超大分配；分配回退不等于连接回退 TCP。
+
+开启 rpcz 并设置 `urma_trace_sample_every=N`，按 span ID 每 N 条采样一条；
+默认 0 关闭，1 跟踪所有可用 rpcz span，仍受 rpcz 自身采样影响。客户端请求和
+baidu_std 服务端响应显式携带 Span 进入写队列，不依赖 KeepWrite 的当前 TLS。
+支持一条 RPC 拆成多个 WR、一个 WR 合并多个请求数据，纯 credit WR 不计入。
+旁路关联表仅用于采样写入，保持 `Socket::WriteRequest` 为 64 字节。
+
+排队、首次提交和完成/失败事件写入 rpcz 注释。完成可能晚于 rpcz 序列化，
+不会为观测延迟 RPC 完成或 rpcz 收集，因此每连接另保留最近 64 条已结束采样，
+包含 trace/span/log ID，供 CLI 查询。`path=no_urma_wr` 表示没有提交 URMA 数据 WR，
+例如走了 TCP 回退。历史在连接重置或销毁时清除。这些时间描述本地传输进度，
+不能直接当作远端处理耗时或纯链路延迟。
+
+快照是各原子字段的并发观察，不保证所有字段来自同一瞬间。Endpoint 重用时
+连接计数清零且 `generation` 递增，进程指标累计保留；CLI 不跨 generation 计算速率。
+完整指标口径与验证说明见 [英文文档](../en/urma.md#observability-and-diagnostics)。
+
+使用 URMA mock 构建后运行 `brpc_urma_unittest`、
+`brpc_urma_observability_unittest` 和 `python3 test/urma_diag_test.py`；同时检查
+`WITH_URMA=OFF` 构建。上线前需在真实硬件上比较关闭跟踪及代表性采样率下的
+吞吐、CPU 和尾延迟；mock 测试不能代替硬件性能验证。

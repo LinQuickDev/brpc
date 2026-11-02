@@ -46,6 +46,7 @@
 #include "urma_types.h"
 #include "brpc/urma/urma_bonding.h"
 #include "brpc/urma/urma_endpoint.h"
+#include "brpc/urma/urma_observability.h"
 
 DECLARE_int32(task_group_ntags);
 
@@ -278,6 +279,7 @@ void* PoolAllocate(size_t size) {
     // Only serve the configured buffer size; callers always ask for that.
     if (size > g_pool_buffer_size) {
         // Larger than a single buffer -- fall back to the system allocator.
+        AddGlobalCounter(malloc_fallback);
         return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
     }
     auto start = PreferredShard();
@@ -296,8 +298,11 @@ void* PoolAllocate(size_t size) {
             g_pool->in_use[idx] = 1;
         }
         g_pool->outstanding.fetch_add(1, butil::memory_order_relaxed);
+        PoolAllocated();
         return buf;
     }
+    AddGlobalCounter(pool_exhausted);
+    AddGlobalCounter(malloc_fallback);
     LOG_EVERY_SECOND(WARNING)
         << "URMA buffer pool exhausted; falling back to malloc";
     return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
@@ -337,6 +342,7 @@ void PoolDeallocate(void* buf) {
     g_pool->free_lists[shard].push_back(buf);
     if (g_pool->outstanding.load(butil::memory_order_relaxed) > 0) {
         g_pool->outstanding.fetch_sub(1, butil::memory_order_relaxed);
+        PoolDeallocated();
     }
 }
 
@@ -389,6 +395,7 @@ bool InitPool() {
         g_pool->free_lists[shard].push_back(
             static_cast<char*>(g_pool_base) + i * g_pool_buffer_size);
     }
+    SetPoolCapacity(count, g_pool_buffer_size);
     return true;
 }
 

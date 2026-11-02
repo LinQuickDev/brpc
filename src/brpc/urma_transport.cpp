@@ -23,12 +23,14 @@
 
 #include "butil/iobuf.h"
 #include "butil/logging.h"
+#include "butil/time.h"
 #include "bthread/bthread.h"
 #include "bthread/types.h"
 
 #include "brpc/event_dispatcher.h"
 #include "brpc/input_messenger.h"
 #include "brpc/socket.h"
+#include "brpc/span.h"
 #include "brpc/tcp_transport.h"
 #include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma/urma_helper.h"
@@ -38,6 +40,9 @@ namespace brpc {
 // Defined in urma_helper.cpp.
 DECLARE_bool(urma_use_polling);
 DECLARE_bool(urma_disable_bthread);
+namespace urma {
+DECLARE_int64(urma_bulk_min_bytes);
+}
 
 void UrmaTransport::Init(Socket* socket, const SocketOptions& options) {
     CHECK(_urma_ep == nullptr);
@@ -117,8 +122,15 @@ int UrmaTransport::WaitEpollOut(butil::atomic<int>* epollout_butex,
         if (!_urma_ep->IsWritable()) {
             // Same caveat as RDMA: URMA cannot detect failure by writing, so
             // after a failed butex wait we must re-check _socket->Failed().
+            const bool sq = _urma_ep->_sq_window_size.load(butil::memory_order_relaxed) == 0;
+            const bool remote =
+                _urma_ep->_remote_rq_window_size.load(butil::memory_order_relaxed) == 0;
+            const int64_t start_us = butil::cpuwide_time_us();
             int rc =
                 bthread::butex_wait(epollout_butex, expected_val, &duetime);
+            const int saved_wait_errno = errno;
+            _urma_ep->RecordWait(sq, remote, butil::cpuwide_time_us() - start_us);
+            errno = saved_wait_errno;
             if (rc < 0 && errno != EWOULDBLOCK && errno != ETIMEDOUT) {
                 const int saved_errno = errno;
                 PLOG(ERROR) << "Fail to wait epollout butex";
@@ -157,14 +169,17 @@ void UrmaTransport::ProcessEvent(bthread_attr_t attr) {
 
 void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
                                  int* num_bthread_created, bool last_msg) {
-    if (last_msg && !urma::FLAGS_urma_use_polling) {
+    // rpcz's server response path joins the queued write. A large response may
+    // need receive-credit completions from this same CQ before that write can
+    // finish. Keep the CQ drainer runnable while the application waits.
+    if (last_msg && !urma::FLAGS_urma_use_polling && !FLAGS_enable_rpcz) {
         return;
     }
     InputMessageBase* to_run_msg = input_msg.release();
     if (!to_run_msg) {
         return;
     }
-    if (urma::FLAGS_urma_disable_bthread) {
+    if (urma::FLAGS_urma_disable_bthread && !FLAGS_enable_rpcz) {
         Transport::ProcessInputMessage(to_run_msg);
         return;
     }
@@ -175,19 +190,89 @@ void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
     tmp.keytable_pool = _socket->keytable_pool();
     tmp.tag = bthread_self_tag();
     bthread_attr_set_name(&tmp, "ProcessInputMessage");
-    if (!FLAGS_usercode_in_coroutine && bthread_start_background(
-            &th, &tmp, Transport::ProcessInputMessage, to_run_msg) == 0) {
+    if ((!FLAGS_usercode_in_coroutine || FLAGS_enable_rpcz) &&
+        bthread_start_background(&th, &tmp, Transport::ProcessInputMessage, to_run_msg) == 0) {
         ++*num_bthread_created;
     } else {
         Transport::ProcessInputMessage(to_run_msg);
     }
 }
 
+void UrmaTransport::ObserveWrite(size_t bytes) {
+    if (!_urma_ep || _urma_state.load(butil::memory_order_acquire) != URMA_ON) {
+        return;
+    }
+    _urma_ep->stats().Add(urma::writes);
+    const int64_t threshold = urma::FLAGS_urma_bulk_min_bytes;
+    if (threshold > 0 && bytes >= static_cast<uint64_t>(threshold)) {
+        _urma_ep->stats().Add(urma::bulk_writes);
+        _urma_ep->stats().Add(urma::bulk_write_bytes, bytes);
+    }
+}
+
+void UrmaTransport::TrackWrite(const butil::IOBuf* data, std::shared_ptr<Span> span) {
+    if (!_urma_ep) {
+        return;
+    }
+    auto trace = _urma_ep->stats().NewTrace(std::move(span), _socket->id());
+    if (!trace) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(_trace_mutex);
+    _write_traces[data] = std::move(trace);
+    _has_traces.store(true, butil::memory_order_release);
+}
+
+void UrmaTransport::FinishWrite(const butil::IOBuf* data, int error) {
+    if (!_has_traces.load(butil::memory_order_acquire)) {
+        return;
+    }
+    std::shared_ptr<urma::WriteTrace> trace;
+    {
+        std::lock_guard<std::mutex> lock(_trace_mutex);
+        auto it = _write_traces.find(data);
+        if (it == _write_traces.end()) {
+            return;
+        }
+        trace = std::move(it->second);
+        _write_traces.erase(it);
+        _has_traces.store(!_write_traces.empty(), butil::memory_order_release);
+    }
+    trace->PostingDone(error);
+}
+
+ssize_t UrmaTransport::CutWithTrace(butil::IOBuf** data, size_t ndata) {
+    if (!_urma_ep || _urma_state.load(butil::memory_order_acquire) != URMA_ON) {
+        return _tcp_transport->CutFromIOBufList(data, ndata);
+    }
+    if (!_has_traces.load(butil::memory_order_acquire)) {
+        return _urma_ep->CutFromIOBufList(data, ndata);
+    }
+    std::vector<std::shared_ptr<urma::WriteTrace>> traces(ndata);
+    {
+        std::lock_guard<std::mutex> lock(_trace_mutex);
+        for (size_t i = 0; i < ndata; ++i) {
+            auto it = _write_traces.find(data[i]);
+            if (it != _write_traces.end()) {
+                traces[i] = it->second;
+            }
+        }
+    }
+    return _urma_ep->CutFromIOBufList(data, ndata, traces.data());
+}
+
 void UrmaTransport::Debug(std::ostream& os) {
-    if (_urma_state.load(butil::memory_order_acquire) == URMA_ON &&
-        _urma_ep) {
+    if (_urma_ep) {
         _urma_ep->DebugInfo(os);
     }
+}
+
+bool UrmaTransport::DescribeJson(std::ostream& os) const {
+    if (!_urma_ep) {
+        return false;
+    }
+    urma::DescribeConnectionJson(os, _urma_ep->GetSnapshot());
+    return true;
 }
 
 int UrmaTransport::ContextInitOrDie(bool server_or_not, const void* options) {

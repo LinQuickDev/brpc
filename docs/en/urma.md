@@ -207,3 +207,99 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+
+## Observability and diagnostics
+
+URMA exports process-wide `urma_*` bvars through `/vars` (and the existing
+Prometheus exporter), with per-connection snapshots through the existing
+builtin-services listener:
+
+```sh
+curl http://127.0.0.1:8003/sockets/urma
+curl 'http://127.0.0.1:8003/sockets/123?format=json'
+python3 tools/urma_diag.py --server 127.0.0.1:8003 connections
+python3 tools/urma_diag.py --server 127.0.0.1:8003 pool
+python3 tools/urma_diag.py --server 127.0.0.1:8003 socket 123
+python3 tools/urma_diag.py --server 127.0.0.1:8003 --json watch --interval 1 --count 10
+python3 tools/urma_diag.py --server 127.0.0.1:8003 trace 123 --trace-id 456
+```
+
+Use the internal port when `ServerOptions.internal_port` is configured. These
+queries use the existing builtin-service access controls. Python 3 and its
+standard library are sufficient for the CLI; there are no third-party packages.
+The inventory returns at most 1024 connections and explicitly sets `truncated`.
+An individual socket query bypasses that inventory limit. IDs are decimal JSON
+strings to preserve all 64 bits. `schema_version` is currently 1 for the inventory.
+
+### Counter definitions
+
+All names below have the `urma_` prefix in `/vars`. Connection snapshots contain
+these names without the prefix under `counters`.
+
+| Counters | Meaning |
+| --- | --- |
+| `writes`, `bulk_writes`, `bulk_write_bytes` | Serialized writes entering the established URMA data path. Bulk means at least `--urma_bulk_min_bytes` bytes (default 65536); a nonpositive value disables classification. Includes protocol headers and attachments. A write is not a WR or necessarily an application RPC. |
+| `send_bytes`, `send_wrs` | Payload bytes and data WRs accepted for submission. Failed single-WR posts are rolled back. |
+| `send_completed_bytes`, `send_completed_wrs` | Locally completed data sends; this does not mean the peer application has processed them. |
+| `recv_bytes`, `recv_wrs` | Received nonempty payloads accepted by the URMA receive path. Credit-only traffic is excluded. |
+| `send_errors`, `recv_post_errors`, `completion_errors` | Data-send post failures, receive-post failures, and provider completion errors. |
+| `sq_blocked`, `remote_credit_blocked` | Observations of a zero local SQ window or zero remote receive credit while attempting a send. Counts attempts, not distinct congestion episodes. |
+| `sq_wait_us`, `remote_credit_wait_us` | Time spent in a writer's butex wait, attributed to windows observed empty at wait entry. Both can increase for the same wait; do not sum them as exclusive phases. |
+| `handshake_success`, `handshake_failed`, `tcp_fallback` | Established URMA handshakes, terminal handshake failures, and negotiated/unavailable-resource TCP fallbacks. |
+| `pool_exhausted`, `malloc_fallback` | Registered-pool allocation misses and fallback allocation attempts (also includes allocations larger than one pool buffer). These are process-wide. |
+
+The pool gauges are `urma_pool_capacity`, `urma_pool_buffer_size`,
+`urma_pool_in_use`, and `urma_pool_peak_in_use`. They count registered buffers,
+not live RPCs; IOBuf references and thread-local caches may retain buffers after
+an RPC returns. The implementation calls this resource `BufferPool`, not a
+separate bulk arena. Pool exhaustion and allocation fallback do not by themselves
+imply that the entire connection switched to TCP.
+
+Snapshots include the connection state, negotiated data-window capacity,
+remaining SQ/remote credit, in-flight data bytes/WRs, and the last diagnostic
+reason/provider error. `FALLBACK_TCP` and `FAILED` remain queryable while the
+Socket is addressable. Reads are race-free observations of individual counters,
+not a transaction across the data path. Connection counters reset on endpoint
+reuse and `generation` increases; process bvars remain cumulative. The CLI
+suppresses rates across a changed generation.
+
+### Sampled RPC transport traces
+
+Enable rpcz and set `--urma_trace_sample_every=N` to trace one in N span IDs.
+The default is 0 (disabled). `N=1` traces every available rpcz span; rpcz's own
+sampling still applies. The client request and baidu_std server response carry
+their explicit Span through Socket's write queue, so background KeepWrite and
+batched writes do not borrow an unrelated bthread's trace context.
+
+A sampled write records queue-to-first-post time, bytes, data WR count,
+local completions, per-cause wait time and failure. One RPC can span several WRs,
+and a single WR can contain contributions from several RPCs. Credit-only WRs
+never count as RPC data. Tracing uses a side table only for sampled writes and
+keeps `Socket::WriteRequest` at 64 bytes. It adds no global data-path lock when
+transport tracing is disabled.
+
+Annotations are added to the existing rpcz span at queue, first-post and local
+completion/failure boundaries. Completion may occur after rpcz has serialized
+the span; it does not delay RPC completion or rpcz collection. For that reason,
+each connection also retains its latest 64 finished sampled writes in the JSON
+snapshot, including trace/span/log IDs. `path=no_urma_wr` identifies writes that
+never submitted a URMA data WR (for example, TCP fallback). The bounded history
+lasts until connection reset or destruction. These measurements describe local
+transport progress, not remote execution or wire-only latency.
+
+### Validation
+
+Build with `WITH_URMA=ON`, `URMA_USE_MOCK=ON`, and `BUILD_UNIT_TESTS=ON`, then run
+`brpc_urma_unittest`, `brpc_urma_observability_unittest`, and
+`python3 test/urma_diag_test.py`. Also build with `WITH_URMA=OFF` to check the
+optional-transport boundary. Hardware throughput, CPU and tail latency should be
+compared with tracing disabled and representative sampling rates before rollout;
+mock results are functional validation, not a hardware performance measurement.
+
+CMake automatically registers `urma_datapath_polling_false` and
+`urma_datapath_polling_true` in mock builds. These send concurrent 128 KiB RPCs,
+check split/merged WR trace completion, inject empty SQ/remote-credit windows,
+and exhaust the actual registered buffer pool. With rpcz enabled, URMA schedules
+application callbacks outside the CQ drainer so a large traced response cannot
+block the credit completions needed to finish its own write.
