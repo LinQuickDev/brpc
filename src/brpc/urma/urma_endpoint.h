@@ -103,6 +103,7 @@ struct UrmaResource {
 // false sharing between connections.
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
     friend class UrmaRecoveryTestPeer;
+    friend class UrmaQosTestPeer;
     friend class UrmaConnect;
     friend class Socket;
     friend class UrmaTransport;

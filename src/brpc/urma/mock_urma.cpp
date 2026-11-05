@@ -240,14 +240,20 @@ urma_status_t urma_query_device(urma_device_t *device,
     if (!device || !attr) {
         return URMA_EINVAL;
     }
+    mock_device_attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[3].SL = 3;
+    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
+    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[6].SL = 2;
+    mock_device_attr.dev_cap.priority_info[10].tp_type.bs.ctp = 1;
+    mock_device_attr.dev_cap.priority_info[10].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[10].SL = 4;
     mock_device_attr.dev_cap.max_jfc = 1024;
     mock_device_attr.dev_cap.max_jetty = 1024;
     mock_device_attr.dev_cap.max_jfs_sge = 8;
     mock_device_attr.dev_cap.max_jfr_sge = 8;
     mock_device_attr.dev_cap.priority_info[0].tp_type.bs.rtp = 1;
     mock_device_attr.dev_cap.priority_info[0].SL = 2;
-    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
-    mock_device_attr.dev_cap.priority_info[6].SL = 6;
     memcpy(attr, &mock_device_attr, sizeof(urma_device_attr_t));
     return URMA_SUCCESS;
 }
@@ -566,14 +572,16 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             return URMA_EINVAL;
         }
 
-        urma_cr_t send_cr{};
-        send_cr.status = URMA_CR_SUCCESS;
-        send_cr.user_ctx = current->user_ctx;
-        send_cr.flag.bs.s_r = 0;
-        if (current->flag.bs.complete_enable) {
-            PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
-                           local_state, send_cr);
-        }
+        auto complete_send = [&] {
+            if (current->flag.bs.complete_enable) {
+                urma_cr_t send_cr{};
+                send_cr.status = URMA_CR_SUCCESS;
+                send_cr.user_ctx = current->user_ctx;
+                send_cr.flag.bs.s_r = 0;
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
+                               local_state, send_cr);
+            }
+        };
 
         PendingRecv recv{};
         urma_jfc_t* remote_jfc = nullptr;
@@ -581,6 +589,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
             auto remote_it = jetty_id_map.find(current->tjetty->id.id);
             if (remote_it == jetty_id_map.end()) {
+                complete_send();
                 continue;
             }
             urma_jfr_t* remote_jfr =
@@ -589,6 +598,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             auto jfc_it = jfr_jfc_map.find(remote_jfr);
             if (recv_it == jfr_recv_map.end() || recv_it->second.empty() ||
                 jfc_it == jfr_jfc_map.end()) {
+                complete_send();
                 continue;
             }
             recv = recv_it->second.front();
@@ -627,6 +637,9 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             recv_cr.imm_data = current->send.imm_data;
             PushCompletion(remote_jfc, remote_state, recv_cr);
         }
+        // A SEND completion lets the consumer release its source buffers.
+        // Finish copying the payload before publishing that completion.
+        complete_send();
     }
     if (bad_wr) {
         *bad_wr = nullptr;
