@@ -358,3 +358,22 @@ if(BUILD_FUZZ_TESTS)
             INSTALL_RPATH "$ORIGIN/lib")
     endforeach()
 endif()
+
+if(WITH_URMA)
+    string(TOUPPER "${URMA_USE_MOCK}" URMA_STABILITY_MOCK_MODE)
+    if(URMA_STABILITY_MOCK_MODE STREQUAL "ON" OR
+       (URMA_STABILITY_MOCK_MODE STREQUAL "AUTO" AND NOT URMA_LIB))
+        foreach(mode IN ITEMS false true)
+            add_test(NAME urma_stability_polling_${mode}
+                COMMAND brpc_urma_stability_unittest --urma_stability_datapath
+                    --urma_use_polling=${mode}
+                    --gtest_filter=UrmaStabilityDatapathTest.*:UrmaHandshakeFaultTest.*)
+            set_tests_properties(urma_stability_polling_${mode} PROPERTIES TIMEOUT 60)
+        endforeach()
+        add_test(NAME urma_stability_polling_inline
+            COMMAND brpc_urma_stability_unittest --urma_stability_datapath
+                --urma_use_polling=true --urma_disable_bthread=true
+                --gtest_filter=UrmaStabilityDatapathTest.*:UrmaHandshakeFaultTest.*)
+        set_tests_properties(urma_stability_polling_inline PROPERTIES TIMEOUT 60)
+    endif()
+endif()

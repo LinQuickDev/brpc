@@ -207,3 +207,18 @@ is tracked as a future enhancement.
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.
+
+## Stability tests
+
+Run fault injection and end-to-end tests with a URMA mock build:
+
+```sh
+ctest --test-dir build -R '^(brpc_urma_stability_unittest|urma_stability_.*)$' --output-on-failure
+python3 tools/urma_stability.py build/test/brpc_urma_stability_unittest --connections 1024 --rounds 100
+```
+
+Coverage includes credit/SQ delays, failed sends and receive reposts, completion errors,
+disconnects, resource recreation and registered-pool exhaustion. The scale test maintains
+independent URMA connections and checks each mixed-size response in event, polling and
+inline polling modes. A test binary linked with real `liburma` runs the same scale test
+on hardware; use `--device` to select a device.
