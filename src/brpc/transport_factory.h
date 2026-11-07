@@ -23,7 +23,9 @@
 
 namespace brpc {
 
-// Creates transport instances for a SocketMode.
+// Creates AdapterTransport for TCP and RDMA sockets; concrete transports are
+// still created directly for URMA/UBSHM until those handshakes move onto the
+// common skeleton.
 class TransportFactory {
 public:
     static int ContextInitOrDie(SocketMode mode, bool server_or_not,

@@ -15,26 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "brpc/policy/rdma_handshake_protocol.h"
+#include "brpc/policy/transport_handshake_protocol.h"
 
 #include "butil/logging.h"
-#include "brpc/destroyable.h"
-#include "brpc/rdma/rdma_handshake_server.h"
+#include "brpc/adapter_transport.h"
 
 namespace brpc {
 namespace policy {
 
-ParseResult ParseRdmaHandshake(butil::IOBuf* source, Socket* socket,
-                               bool /*read_eof*/, const void* /*arg*/) {
-    return rdma::ExecuteServerHandshake(source, socket);
+ParseResult ParseTransportHandshake(butil::IOBuf* source, Socket* socket,
+                                     bool /*read_eof*/, const void* /*arg*/) {
+    return AdapterTransport::Get(socket)->ProcessUpgradeReadable(source);
 }
 
-void ProcessRdmaHandshake(InputMessageBase* msg) {
-    // ParseRdmaHandshake replies inline and only ever returns
-    // NOT_ENOUGH_DATA / TRY_OTHERS / hard errors, never a real message, so this
-    // must never run. Keep a placeholder (required for server registration).
+void ProcessTransportHandshake(InputMessageBase* msg) {
     DestroyingPtr<InputMessageBase> destroying_msg(msg);
-    CHECK(false) << "ProcessRdmaHandshake should never be called";
+    CHECK(false) << "ProcessTransportHandshake should never be called";
 }
 
 }  // namespace policy

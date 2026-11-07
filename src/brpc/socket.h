@@ -57,11 +57,6 @@ class ChannelBalancer;
 }
 namespace rdma {
 class RdmaEndpoint;
-class RdmaConnect;
-class RdmaHandshakeClientV2;
-class RdmaHandshakeServerV2;
-class RdmaHandshakeClientV3;
-class RdmaHandshakeServerV3;
 }
 
 namespace urma {
@@ -87,6 +82,7 @@ class AuthContext;
 class EventDispatcher;
 class Stream;
 class Transport;
+class AdapterTransport;
 
 // Set SO_SNDBUF/SO_RCVBUF according to socket_*_buffer_size flags.
 void SetSocketBufferOptions(int fd);
@@ -347,14 +343,9 @@ friend class policy::ConsistentHashingLoadBalancer;
 friend class policy::RtmpContext;
 friend class schan::ChannelBalancer;
 friend class rdma::RdmaEndpoint;
-friend class rdma::RdmaConnect;
 friend class ubring::UBShmEndpoint;
 friend class ubring::UBConnect;
 friend class UBShmTransport;
-friend class rdma::RdmaHandshakeClientV2;
-friend class rdma::RdmaHandshakeServerV2;
-friend class rdma::RdmaHandshakeClientV3;
-friend class rdma::RdmaHandshakeServerV3;
 friend class urma::UrmaEndpoint;
 friend class urma::UrmaConnect;
 friend class urma::UrmaHandshakeClientV2;
@@ -369,6 +360,7 @@ friend class VersionedRefWithId<Socket>;
 friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
 friend class handshake::SocketHandshakeIO;
+friend class AdapterTransport;
 friend class Transport;
 friend class TcpTransport;
 friend class RdmaTransport;
