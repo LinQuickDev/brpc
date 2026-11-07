@@ -718,6 +718,31 @@ static const AdapterTransport::Registration reg =
 - **P4 收尾**：硬编码分流/mode switch 全部切换到注册表（含
   `SocketMode` 映射归位到注册表一处）；死代码清理；文档更新。
 
+### 落地状态
+
+P0-P4 已全部落地（`transport-handshake-dev` 分支）：
+
+- P0：公共骨架 + 注册表 + loopback 合规基线（单测 16 项）。
+- P1：RDMA v2/v3 codec 与 server adapter 迁入
+  `handshake/rdma_handshake.*`，`rdma_handshake_server.*` 与
+  `policy/rdma_handshake_protocol.*` 删除；master 独有的 MTU 协商
+  保留。
+- P2：UBSHM 迁入 `handshake/ubshm_handshake.*`，endpoint 内联状态机
+  删除；`UB` 识别仅在 `BRPC_WITH_UBRING` 构建内编译。
+- P3：URMA 迁入 `handshake/urma_handshake.*` +
+  `urma_fallback_handshake.cpp`（无 liburma 识别通道，无条件编译）；
+  legacy 握手类移入 `test/brpc_urma_legacy_handshake.h` 供互操作
+  测试。
+- P4：注册表收口。`TransportHandshakeEntry` 扩展出完整通道钩子
+  （`server_adapter`/`create_transport`/`upgrade_ready`/
+  `set_high_speed_available`/`start_upgrade_events`/
+  `run_client_upgrade`），三传输在各自 handshake TU 自注册；
+  `adapter_transport.cpp` 的 magic 分派、transport 创建、
+  `upgrade_capable`、可用性镜像、升级事件启动与 client 升级流程全部
+  改走注册表，文件内不再有任何 per-transport switch 与
+  `BRPC_WITH_*` 分支；client 侧 participant 类随升级流程迁入各
+  handshake TU。
+
 每个阶段的回归底线：`transport_handshake` 单测全绿、
 `urma_fallback` 单测全绿、对应传输的端到端示例（echo over
 RDMA/UBSHM/URMA）互通。

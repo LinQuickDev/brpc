@@ -28,6 +28,11 @@ namespace handshake {
 // common HandshakeAdapter interface.
 HandshakeAdapter* GetRdmaServerHandshakeAdapter();
 
+// Registers the RDMA entry in TransportHandshakeRegistry (idempotent).
+// Runs once at static init; tests call it again to restore builtins after
+// TransportHandshakeRegistry::ResetForTest.
+void RegisterRdmaHandshake();
+
 }  // namespace handshake
 }  // namespace brpc
 

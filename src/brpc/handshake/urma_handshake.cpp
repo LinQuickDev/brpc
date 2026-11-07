@@ -442,6 +442,97 @@ HandshakeAdapter* GetUrmaServerHandshakeAdapter() {
     return &adapter;
 }
 
+namespace {
+
+// Participant used by the client-side upgrade: maps session callbacks onto
+// UrmaTransport resource operations.
+class UrmaClientHandshakeTransport : public handshake::HandshakeTransport {
+public:
+    UrmaClientHandshakeTransport(
+        UrmaTransport* transport, urma::UrmaHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
+        : _transport(transport), _protocol(protocol), _socket(socket),
+          _connect_error(connect_error) {}
+
+    handshake::StepResult PrepareResources() override {
+        return _transport->PrepareUpgradeResources(false) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+    handshake::StepResult NegotiateResources() override {
+        return _transport->NegotiateUpgradeResources(
+                   _protocol->remote(), false) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+    void OnEstablished() override { _transport->ActivateUpgrade(); }
+    void OnFallback() override { _transport->DeactivateUpgrade(); }
+    void OnFailed() override {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        _transport->DeactivateUpgrade();
+        *_connect_error = saved_errno;
+        _socket->SetFailed(saved_errno,
+                           "Fail to complete URMA handshake from %s: %s",
+                           _socket->description().c_str(),
+                           berror(saved_errno));
+    }
+
+private:
+    UrmaTransport* _transport;
+    urma::UrmaHandshakeAdapter* _protocol;
+    Socket* _socket;
+    int* _connect_error;
+};
+
+}  // namespace
+
+Transport* CreateUrmaTransportForRegistry() { return new UrmaTransport; }
+
+bool UrmaTransportReadyForRegistry(Transport* transport) {
+    return static_cast<UrmaTransport*>(transport)->UpgradeReady();
+}
+
+void UrmaSetAvailableForRegistry(Transport* transport, bool available) {
+    static_cast<UrmaTransport*>(transport)->SetHighSpeedAvailable(available);
+}
+
+int UrmaStartEventsForRegistry(Transport* transport, int* err) {
+    UrmaTransport* urma_transport = static_cast<UrmaTransport*>(transport);
+    if (urma_transport->StartUpgradeEvents() == 0) {
+        return 0;
+    }
+    *err = errno != 0 ? errno : EIO;
+    urma_transport->DeactivateUpgrade();
+    return -1;
+}
+
+void RunUrmaClientUpgradeForRegistry(AdapterTransport* adapter,
+                                     Socket* socket, int* connect_error) {
+    UrmaTransport* transport =
+        static_cast<UrmaTransport*>(adapter->high_speed_transport());
+    if (!urma::IsUrmaAvailable()) {
+        adapter->FallbackToTcp();
+        adapter->CompleteConnection(handshake::FALLBACK_TCP);
+        return;
+    }
+    std::unique_ptr<urma::UrmaHandshakeAdapter> protocol =
+        urma::CreateClientHandshakeAdapter(transport->GetUrmaEp());
+    UrmaClientHandshakeTransport participant(
+        transport, protocol.get(), socket, connect_error);
+    const handshake::StepResult result =
+        adapter->handshake_session()->RunClient(protocol.get(), &participant);
+    if (result == handshake::STEP_OK &&
+        transport->StartUpgradeEvents() < 0) {
+        *connect_error = errno != 0 ? errno : EIO;
+        transport->DeactivateUpgrade();
+        adapter->handshake_session()->MarkFailed();
+        socket->SetFailed(*connect_error, "Fail to start URMA CQ events");
+    }
+    if (result == handshake::STEP_ERROR && *connect_error == 0) {
+        *connect_error = errno != 0 ? errno : EPROTO;
+    }
+    adapter->CompleteConnection(static_cast<handshake::Phase>(
+        adapter->handshake_session()->phase(butil::memory_order_acquire)));
+}
+
 }  // namespace handshake
 }  // namespace brpc
 

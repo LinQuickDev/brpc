@@ -17,6 +17,7 @@
 
 #include "brpc/handshake/transport_registry.h"
 
+#include <algorithm>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -48,9 +49,9 @@ int TransportHandshakeRegistry::Register(
     const TransportHandshakeEntry& entry) {
     CHECK(entry.name != nullptr);
     CHECK(entry.recognize_specs != nullptr ||
-          entry.create_server_adapters != nullptr)
+          entry.server_adapter != nullptr)
         << "handshake registration for `" << (entry.name ? entry.name : "?")
-        << "' provides neither recognition specs nor server adapters";
+        << "' provides neither recognition specs nor a server adapter";
     std::lock_guard<std::mutex> lock(EntriesMutex());
     for (const auto& e : Entries()) {
         CHECK(e.mode != entry.mode)
@@ -92,6 +93,27 @@ const TransportHandshakeEntry* TransportHandshakeRegistry::FindByMagic(
         }
     }
     return nullptr;
+}
+
+bool TransportHandshakeRegistry::CouldMatchMagic(const char* data,
+                                                 size_t len) {
+    if (data == nullptr || len == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(EntriesMutex());
+    for (const auto& e : Entries()) {
+        for (size_t i = 0; i < e.recognize_spec_count; ++i) {
+            const FrameSpec& spec = e.recognize_specs[i];
+            if (spec.magic == nullptr || spec.magic_len == 0) {
+                continue;
+            }
+            const size_t compare_len = std::min(len, spec.magic_len);
+            if (memcmp(data, spec.magic, compare_len) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 std::vector<TransportHandshakeEntry> TransportHandshakeRegistry::All() {

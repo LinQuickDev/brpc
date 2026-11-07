@@ -32,6 +32,18 @@ HandshakeAdapter* GetUBShmServerHandshakeAdapter();
 
 #if BRPC_WITH_UBRING
 
+namespace brpc {
+namespace handshake {
+
+// Registers the UBSHM entry in TransportHandshakeRegistry (idempotent).
+// Runs once at static init; tests call it again to restore builtins after
+// TransportHandshakeRegistry::ResetForTest. Only exists in UBSHM-enabled
+// builds: other builds must not recognize the "UB" magic at all.
+void RegisterUBShmHandshake();
+
+}  // namespace handshake
+}  // namespace brpc
+
 #include <cstdint>
 #include <string>
 

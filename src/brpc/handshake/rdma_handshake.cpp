@@ -26,6 +26,7 @@
 #include "butil/sys_byteorder.h"
 #include "brpc/adapter_transport.h"
 #include "brpc/handshake/rdma_handshake_constants.h"
+#include "brpc/handshake/transport_registry.h"
 #include "brpc/rdma_handshake.pb.h"
 #include "brpc/rdma/rdma_helper.h"
 #include "brpc/socket.h"
@@ -393,6 +394,110 @@ CreateServerHandshakeAdapters(RdmaEndpoint* ep) {
     return adapters;
 }
 
+namespace {
+
+// Participant used by the client-side upgrade: maps session callbacks onto
+// RdmaTransport resource operations.
+class RdmaClientHandshakeTransport : public handshake::HandshakeTransport {
+public:
+    RdmaClientHandshakeTransport(
+        RdmaTransport* transport, RdmaHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
+        : _transport(transport), _protocol(protocol), _socket(socket),
+          _connect_error(connect_error) {}
+
+    handshake::StepResult PrepareResources() override {
+        if (_transport->PrepareUpgradeResources() == 0) {
+            return handshake::STEP_OK;
+        }
+        errno = 0;
+        return handshake::STEP_FALLBACK;
+    }
+
+    handshake::StepResult NegotiateResources() override {
+        return _transport->NegotiateUpgradeResources(
+                   _protocol->remote(), false) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+
+    void OnEstablished() override { _transport->ActivateUpgrade(); }
+
+    void OnFallback() override { _transport->DeactivateUpgrade(); }
+
+    void OnFailed() override {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        _transport->DeactivateUpgrade();
+        *_connect_error = saved_errno;
+        _socket->SetFailed(saved_errno,
+                           "Fail to complete rdma handshake from %s: %s",
+                           _socket->description().c_str(),
+                           berror(saved_errno));
+    }
+
+private:
+    RdmaTransport* _transport;
+    RdmaHandshakeAdapter* _protocol;
+    Socket* _socket;
+    int* _connect_error;
+};
+
+Transport* CreateRdmaTransportImpl() { return new RdmaTransport; }
+
+bool RdmaTransportUpgradeReady(Transport* transport) {
+    return static_cast<RdmaTransport*>(transport)->UpgradeReady();
+}
+
+void RdmaSetHighSpeedAvailable(Transport* transport, bool available) {
+    static_cast<RdmaTransport*>(transport)->SetHighSpeedAvailable(available);
+}
+
+int RdmaStartUpgradeEvents(Transport* transport, int* err) {
+    RdmaTransport* rdma_transport = static_cast<RdmaTransport*>(transport);
+    if (rdma_transport->StartUpgradeEvents() == 0) {
+        return 0;
+    }
+    *err = errno != 0 ? errno : ERDMA;
+    rdma_transport->DeactivateUpgrade();
+    return -1;
+}
+
+void RunRdmaClientUpgrade(AdapterTransport* adapter, Socket* socket,
+                          int* connect_error) {
+    RdmaTransport* transport =
+        static_cast<RdmaTransport*>(adapter->high_speed_transport());
+    if (!IsRdmaAvailable()) {
+        adapter->FallbackToTcp();
+        adapter->CompleteConnection(handshake::FALLBACK_TCP);
+        return;
+    }
+
+    std::unique_ptr<RdmaHandshakeAdapter> protocol =
+        transport->CreateClientHandshakeAdapter();
+    CHECK(protocol != nullptr);
+    RdmaClientHandshakeTransport participant(
+        transport, protocol.get(), socket, connect_error);
+    const handshake::StepResult result =
+        adapter->handshake_session()->RunClient(protocol.get(), &participant);
+    if (result == handshake::STEP_OK &&
+        transport->StartUpgradeEvents() < 0) {
+        const int saved_errno = errno != 0 ? errno : ERDMA;
+        transport->DeactivateUpgrade();
+        adapter->handshake_session()->MarkFailed();
+        socket->SetFailed(saved_errno,
+                          "Fail to start RDMA CQ events from %s: %s",
+                          socket->description().c_str(),
+                          berror(saved_errno));
+        *connect_error = saved_errno;
+    }
+    if (result == handshake::STEP_ERROR && *connect_error == 0) {
+        *connect_error = errno != 0 ? errno : EPROTO;
+    }
+    adapter->CompleteConnection(static_cast<handshake::Phase>(
+        adapter->handshake_session()->phase(butil::memory_order_acquire)));
+}
+
+}  // namespace
+
 }  // namespace rdma
 }  // namespace brpc
 
@@ -570,6 +675,39 @@ StepResult RdmaServerHandshakeAdapter::RunServerStep(
 #endif
     return RunFallbackServerHandshake(source, socket);
 }
+
+namespace {
+
+// Recognition-only channel, always compiled: a TCP-only peer still gets a
+// clean NAK. v3 is preferred over v2.
+const FrameSpec kRdmaRecognizeSpecs[] = {
+    rdma::RdmaHelloFrameSpec(3),
+    rdma::RdmaHelloFrameSpec(2),
+};
+
+}  // namespace
+
+void RegisterRdmaHandshake() {
+    if (TransportHandshakeRegistry::Find(SOCKET_MODE_RDMA) != nullptr) {
+        return;
+    }
+    TransportHandshakeEntry entry;
+    entry.mode = SOCKET_MODE_RDMA;
+    entry.name = "rdma";
+    entry.recognize_specs = kRdmaRecognizeSpecs;
+    entry.recognize_spec_count = 2;
+    entry.server_adapter = &GetRdmaServerHandshakeAdapter;
+#if BRPC_WITH_RDMA
+    entry.create_transport = &rdma::CreateRdmaTransportImpl;
+    entry.upgrade_ready = &rdma::RdmaTransportUpgradeReady;
+    entry.set_high_speed_available = &rdma::RdmaSetHighSpeedAvailable;
+    entry.start_upgrade_events = &rdma::RdmaStartUpgradeEvents;
+    entry.run_client_upgrade = &rdma::RunRdmaClientUpgrade;
+#endif
+    TransportHandshakeRegistry::Register(entry);
+}
+
+const int g_rdma_handshake_registration = (RegisterRdmaHandshake(), 0);
 
 }  // namespace handshake
 }  // namespace brpc

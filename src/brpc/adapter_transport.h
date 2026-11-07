@@ -74,6 +74,9 @@ public:
 
     ParseResult ProcessUpgradeReadable(butil::IOBuf* source);
     void CompleteConnection(handshake::Phase terminal_phase);
+    // Publishes the TCP-fallback outcome; called by the registered
+    // client-upgrade flows and by server-side fallback handling.
+    void FallbackToTcp();
     bool connection_completed() const {
         return _connection_completed.load(butil::memory_order_acquire) != 0;
     }
@@ -86,7 +89,6 @@ private:
 
     Transport* ActiveTransport() const;
     void SetHighSpeedAvailable(bool available);
-    void FallbackToTcp();
     void TryReadOnTcp();
     void ProcessTcpEvent();
     void CheckUnexpectedTcpData();

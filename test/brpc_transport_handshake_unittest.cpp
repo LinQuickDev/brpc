@@ -42,6 +42,9 @@
 #include "butil/sys_byteorder.h"
 #include <gflags/gflags.h>
 #include "brpc/handshake/handshake_io.h"
+#include "brpc/handshake/rdma_handshake.h"
+#include "brpc/handshake/ubshm_handshake.h"
+#include "brpc/handshake/urma_handshake.h"
 #include "brpc/handshake/transport_registry.h"
 #include "brpc/transport_handshake.h"
 
@@ -475,10 +478,26 @@ TEST(TransportHandshakeTest, DescriptorDefaultsAndDependencyFreeSlots) {
 // ---------------------------------------------------------------------------
 // Transport registry
 // ---------------------------------------------------------------------------
+// Re-registers the entries the real transports install at static-init time.
+// Needed after ResetForTest, which wipes those registrations too.
+static void RestoreBuiltinRegistrations() {
+    RegisterRdmaHandshake();
+    RegisterUrmaHandshake();
+#if BRPC_WITH_UBRING
+    RegisterUBShmHandshake();
+#endif
+}
+
 class TransportRegistryTest : public ::testing::Test {
 protected:
     void SetUp() override { TransportHandshakeRegistry::ResetForTest(); }
-    void TearDown() override { TransportHandshakeRegistry::ResetForTest(); }
+    void TearDown() override {
+        TransportHandshakeRegistry::ResetForTest();
+        // Leave the process in the same state as program startup: other
+        // tests (and other binaries sharing this registry) expect the
+        // builtin transports to stay registered.
+        RestoreBuiltinRegistrations();
+    }
 };
 
 static const FrameSpec kLoopbackRecognizeSpecs[] = {
@@ -560,6 +579,71 @@ TEST_F(TransportRegistryTest, DuplicateModeIsRejected) {
     entry.name = "loopback-b";
     EXPECT_DEATH(TransportHandshakeRegistry::Register(entry),
                  "duplicate handshake registration");
+}
+
+// The real transports self-register at static-init time: RDMA and URMA
+// always provide the recognition-only channel (a TCP-only server still NAKs
+// their hellos), while UBSHM registers only in UBSHM-enabled builds so
+// other builds keep the legacy TRY_OTHERS behavior for "UB" prefixes.
+TEST_F(TransportRegistryTest, BuiltinTransportsSelfRegistered) {
+    RestoreBuiltinRegistrations();
+
+    const TransportHandshakeEntry* rdma =
+        TransportHandshakeRegistry::Find(SOCKET_MODE_RDMA);
+    ASSERT_TRUE(rdma != nullptr);
+    EXPECT_STREQ("rdma", rdma->name);
+    ASSERT_TRUE(rdma->server_adapter != nullptr);
+    EXPECT_TRUE(rdma->server_adapter() != nullptr);
+#if BRPC_WITH_RDMA
+    EXPECT_TRUE(rdma->create_transport != nullptr);
+    EXPECT_TRUE(rdma->upgrade_ready != nullptr);
+    EXPECT_TRUE(rdma->set_high_speed_available != nullptr);
+    EXPECT_TRUE(rdma->start_upgrade_events != nullptr);
+    EXPECT_TRUE(rdma->run_client_upgrade != nullptr);
+#else
+    EXPECT_TRUE(rdma->create_transport == nullptr);
+    EXPECT_TRUE(rdma->run_client_upgrade == nullptr);
+#endif
+
+    const TransportHandshakeEntry* urma =
+        TransportHandshakeRegistry::Find(SOCKET_MODE_URMA);
+    ASSERT_TRUE(urma != nullptr);
+    EXPECT_STREQ("urma", urma->name);
+    ASSERT_TRUE(urma->server_adapter != nullptr);
+#if BRPC_WITH_URMA
+    EXPECT_TRUE(urma->create_transport != nullptr);
+    EXPECT_TRUE(urma->run_client_upgrade != nullptr);
+#else
+    EXPECT_TRUE(urma->create_transport == nullptr);
+    EXPECT_TRUE(urma->run_client_upgrade == nullptr);
+#endif
+
+#if BRPC_WITH_UBRING
+    const TransportHandshakeEntry* ubshm =
+        TransportHandshakeRegistry::Find(SOCKET_MODE_UBRING);
+    ASSERT_TRUE(ubshm != nullptr);
+    EXPECT_STREQ("ubshm", ubshm->name);
+    EXPECT_TRUE(ubshm->create_transport != nullptr);
+    EXPECT_EQ(ubshm, TransportHandshakeRegistry::FindByMagic("UB", 2));
+#else
+    EXPECT_EQ(nullptr, TransportHandshakeRegistry::Find(SOCKET_MODE_UBRING));
+    EXPECT_EQ(nullptr, TransportHandshakeRegistry::FindByMagic("UB", 2));
+#endif
+
+    // RDMA/URMA magics are always recognized (v2 and v3 spellings).
+    EXPECT_EQ(rdma, TransportHandshakeRegistry::FindByMagic("RDMAxxxx", 8));
+    EXPECT_EQ(rdma, TransportHandshakeRegistry::FindByMagic("RDM3xxxx", 8));
+    EXPECT_EQ(urma, TransportHandshakeRegistry::FindByMagic("URMAxxxx", 8));
+    EXPECT_EQ(urma, TransportHandshakeRegistry::FindByMagic("URM3xxxx", 8));
+    // An incomplete magic is not dispatchable yet...
+    EXPECT_EQ(nullptr, TransportHandshakeRegistry::FindByMagic("RDM", 3));
+    // ...but may become dispatchable with more bytes.
+    EXPECT_TRUE(TransportHandshakeRegistry::CouldMatchMagic("R", 1));
+    EXPECT_TRUE(TransportHandshakeRegistry::CouldMatchMagic("RDM", 3));
+    EXPECT_TRUE(TransportHandshakeRegistry::CouldMatchMagic("URM", 3));
+    // A prefix that no registered magic starts with never dispatches.
+    EXPECT_FALSE(TransportHandshakeRegistry::CouldMatchMagic("POST", 4));
+    EXPECT_FALSE(TransportHandshakeRegistry::CouldMatchMagic("XXXX", 4));
 }
 
 // ---------------------------------------------------------------------------

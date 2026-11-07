@@ -32,6 +32,13 @@ namespace handshake {
 HandshakeAdapter* GetUrmaServerHandshakeAdapter();
 StepResult RunUrmaFallbackServerHandshake(butil::IOBuf* source, Socket* socket);
 
+// Registers the URMA entry in TransportHandshakeRegistry (idempotent).
+// Runs once at static init; tests call it again to restore builtins after
+// TransportHandshakeRegistry::ResetForTest. The recognition-only channel is
+// registered unconditionally; the full channel joins in URMA-enabled
+// builds.
+void RegisterUrmaHandshake();
+
 }  // namespace handshake
 }  // namespace brpc
 
@@ -41,6 +48,23 @@ StepResult RunUrmaFallbackServerHandshake(butil::IOBuf* source, Socket* socket);
 #include "brpc/transport_handshake.h"
 
 namespace brpc {
+
+class AdapterTransport;
+class Transport;
+
+namespace handshake {
+
+// Full-channel factories consumed by the URMA registration in
+// urma_fallback_handshake.cpp (URMA-enabled builds only).
+Transport* CreateUrmaTransportForRegistry();
+bool UrmaTransportReadyForRegistry(Transport* transport);
+void UrmaSetAvailableForRegistry(Transport* transport, bool available);
+int UrmaStartEventsForRegistry(Transport* transport, int* err);
+void RunUrmaClientUpgradeForRegistry(AdapterTransport* adapter,
+                                     Socket* socket, int* connect_error);
+
+}  // namespace handshake
+
 namespace urma {
 
 class UrmaEndpoint;

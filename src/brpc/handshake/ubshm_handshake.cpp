@@ -23,6 +23,7 @@
 #include "butil/raw_pack.h"
 #include "butil/sys_byteorder.h"
 #include "brpc/adapter_transport.h"
+#include "brpc/handshake/transport_registry.h"
 #include "brpc/socket.h"
 
 #if BRPC_WITH_UBRING
@@ -469,6 +470,135 @@ StepResult UBShmServerHandshakeAdapter::RunUBShmServerHandshake(
     }
     return result;
 }
+
+namespace {
+
+// Participant used by the client-side upgrade: maps session callbacks onto
+// UBShmTransport resource operations.
+class UBShmClientHandshakeTransport : public handshake::HandshakeTransport {
+public:
+    UBShmClientHandshakeTransport(
+        UBShmTransport* transport, ubring::SHM* local_shm,
+        const std::string& shm_name, ubring::UBShmHandshakeAdapter* protocol,
+        Socket* socket, int* connect_error)
+        : _transport(transport), _local_shm(local_shm),
+          _shm_name(shm_name), _protocol(protocol), _socket(socket),
+          _connect_error(connect_error) {}
+
+    handshake::StepResult PrepareResources() override {
+        if (_transport->PrepareUpgradeResources(
+                _local_shm, _shm_name.c_str()) != 0) {
+            return handshake::STEP_FALLBACK;
+        }
+        _protocol->ConfigureClientHello(*_local_shm);
+        return handshake::STEP_OK;
+    }
+
+    handshake::StepResult NegotiateResources() override {
+        return _transport->NegotiateUpgradeResources(
+                   _local_shm, _shm_name.c_str(), _protocol->remote().len,
+                   _protocol->local_format()) == 0
+            ? handshake::STEP_OK : handshake::STEP_FALLBACK;
+    }
+
+    void OnEstablished() override {
+        _transport->GetUBShmEp()->SetNegotiatedDataFormat(
+            _protocol->local_format());
+        _transport->ActivateUpgrade();
+    }
+    void OnFallback() override { _transport->DeactivateUpgrade(); }
+
+    void OnFailed() override {
+        const int saved_errno = errno != 0 ? errno : EPROTO;
+        _transport->DeactivateUpgrade();
+        *_connect_error = saved_errno;
+        _socket->SetFailed(saved_errno,
+                           "Fail to complete ubring handshake from %s: %s",
+                           _socket->description().c_str(),
+                           berror(saved_errno));
+    }
+
+private:
+    UBShmTransport* _transport;
+    ubring::SHM* _local_shm;
+    std::string _shm_name;
+    ubring::UBShmHandshakeAdapter* _protocol;
+    Socket* _socket;
+    int* _connect_error;
+};
+
+Transport* CreateUBShmTransportImpl() { return new UBShmTransport; }
+
+bool UBShmTransportUpgradeReady(Transport* transport) {
+    return static_cast<UBShmTransport*>(transport)->UpgradeReady();
+}
+
+void UBShmSetHighSpeedAvailable(Transport* transport, bool available) {
+    static_cast<UBShmTransport*>(transport)->SetHighSpeedAvailable(available);
+}
+
+int UBShmStartUpgradeEvents(Transport* transport, int* /*err*/) {
+    static_cast<UBShmTransport*>(transport)->GetUBShmEp()
+        ->StartReceiveEvents();
+    return 0;
+}
+
+void RunUBShmClientUpgrade(AdapterTransport* adapter, Socket* socket,
+                           int* connect_error) {
+    UBShmTransport* transport =
+        static_cast<UBShmTransport*>(adapter->high_speed_transport());
+    if (!ubring::IsUBAvailable()) {
+        adapter->FallbackToTcp();
+        adapter->CompleteConnection(handshake::FALLBACK_TCP);
+        return;
+    }
+
+    const size_t local_shm_len =
+        static_cast<size_t>(ubring::FLAGS_data_queue_size) * MB_TO_BYTE;
+    ubring::SHM local_trx_shm = {
+        nullptr, local_shm_len, 0, {0}, static_cast<uint32_t>(socket->fd())};
+    const auto shm_name_str = butil::endpoint2str(socket->local_side());
+    ubring::UBShmHandshakeAdapter wire(
+        ubring::PreferredDataFormatForShmType(ubring::GetShmType()));
+    UBShmClientHandshakeTransport participant(
+        transport, &local_trx_shm, shm_name_str.c_str(), &wire, socket,
+        connect_error);
+    const handshake::StepResult result =
+        adapter->handshake_session()->RunClient(&wire, &participant);
+    if (result == handshake::STEP_OK) {
+        transport->FinishUpgrade();
+        transport->GetUBShmEp()->StartReceiveEvents();
+    }
+    if (result == handshake::STEP_ERROR && *connect_error == 0) {
+        *connect_error = errno != 0 ? errno : EPROTO;
+    }
+    adapter->CompleteConnection(static_cast<handshake::Phase>(
+        adapter->handshake_session()->phase(butil::memory_order_acquire)));
+}
+
+const FrameSpec kUBShmRecognizeSpecs[] = {ubshm_wire::HelloFrameSpec()};
+
+}  // namespace
+
+void RegisterUBShmHandshake() {
+    if (TransportHandshakeRegistry::Find(SOCKET_MODE_UBRING) != nullptr) {
+        return;
+    }
+    TransportHandshakeEntry entry;
+    entry.mode = SOCKET_MODE_UBRING;
+    entry.name = "ubshm";
+    entry.recognize_specs = kUBShmRecognizeSpecs;
+    entry.recognize_spec_count = 1;
+    entry.server_adapter = &GetUBShmServerHandshakeAdapter;
+    entry.create_transport = &CreateUBShmTransportImpl;
+    entry.upgrade_ready = &UBShmTransportUpgradeReady;
+    entry.set_high_speed_available = &UBShmSetHighSpeedAvailable;
+    entry.start_upgrade_events = &UBShmStartUpgradeEvents;
+    entry.run_client_upgrade = &RunUBShmClientUpgrade;
+    TransportHandshakeRegistry::Register(entry);
+}
+
+const int g_ubshm_handshake_registration = (RegisterUBShmHandshake(), 0);
 #endif
 
 StepResult UBShmServerHandshakeAdapter::RunServerStep(

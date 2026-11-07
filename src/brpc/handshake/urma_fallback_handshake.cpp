@@ -20,6 +20,7 @@
 #include <errno.h>
 
 #include "brpc/adapter_transport.h"
+#include "brpc/handshake/transport_registry.h"
 #include "brpc/urma/urma_handshake.pb.h"
 
 namespace brpc {
@@ -110,6 +111,40 @@ HandshakeAdapter* GetUrmaServerHandshakeAdapter() {
     return &adapter;
 }
 #endif
+
+namespace {
+
+// Recognition-only channel, always compiled: a node without liburma still
+// NAKs the peer's hello so the peer falls back to TCP cleanly. v3 is
+// preferred over v2.
+const FrameSpec kUrmaRecognizeSpecs[] = {
+    FrameSpec("URM3", 4, 8, 4104, FrameSpec::U32_BODY_LENGTH),
+    FrameSpec("URMA", 4, 86, 4096, FrameSpec::U16_TOTAL_LENGTH),
+};
+
+}  // namespace
+
+void RegisterUrmaHandshake() {
+    if (TransportHandshakeRegistry::Find(SOCKET_MODE_URMA) != nullptr) {
+        return;
+    }
+    TransportHandshakeEntry entry;
+    entry.mode = SOCKET_MODE_URMA;
+    entry.name = "urma";
+    entry.recognize_specs = kUrmaRecognizeSpecs;
+    entry.recognize_spec_count = 2;
+    entry.server_adapter = &GetUrmaServerHandshakeAdapter;
+#if BRPC_WITH_URMA
+    entry.create_transport = &CreateUrmaTransportForRegistry;
+    entry.upgrade_ready = &UrmaTransportReadyForRegistry;
+    entry.set_high_speed_available = &UrmaSetAvailableForRegistry;
+    entry.start_upgrade_events = &UrmaStartEventsForRegistry;
+    entry.run_client_upgrade = &RunUrmaClientUpgradeForRegistry;
+#endif
+    TransportHandshakeRegistry::Register(entry);
+}
+
+const int g_urma_handshake_registration = (RegisterUrmaHandshake(), 0);
 
 }  // namespace handshake
 }  // namespace brpc

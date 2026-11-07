@@ -26,7 +26,9 @@
 
 namespace brpc {
 
+class AdapterTransport;
 class Socket;
+class Transport;
 
 namespace handshake {
 
@@ -41,8 +43,8 @@ class HandshakeProtocol;
 //   - recognition-only: always linked. Lets a node without the transport
 //     library recognize the peer's hello and NAK so the peer falls back to
 //     TCP cleanly.
-//   - full: linked only when the transport is available. Provides the
-//     server-side adapters that drive real upgrades.
+//   - full: linked only when the transport is available. Creates the
+//     concrete transport and drives real upgrades.
 struct TransportHandshakeEntry {
     SocketMode mode = SOCKET_MODE_TCP;  // unique within the registry
     const char* name = nullptr;         // "rdma"/"ubshm"/...; logs and bvar
@@ -57,10 +59,31 @@ struct TransportHandshakeEntry {
     // when the full channel is always present.
     HandshakeProtocol* (*create_recognizer)() = nullptr;
 
+    // ---- server entry (always compiled) ----
+    // The adapter that InputMessenger's magic dispatch hands the connection
+    // to. It degrades to the recognition-only fallback internally when the
+    // transport is unavailable on this connection.
+    HandshakeAdapter* (*server_adapter)() = nullptr;
+
     // ---- full channel (compiled only with the transport) ----
-    // Creates the per-version server adapters for one accepted connection.
-    // Null when this process has no transport support.
-    std::vector<HandshakeAdapter*> (*create_server_adapters)(Socket*) = nullptr;
+    // Creates the concrete high-speed transport owned by AdapterTransport.
+    Transport* (*create_transport)() = nullptr;
+    // Reports whether a transport from create_transport is ready to drive
+    // an upgrade (devices allocated etc.).
+    bool (*upgrade_ready)(Transport*) = nullptr;
+    // Mirrors AdapterTransport's high-speed availability into the transport.
+    void (*set_high_speed_available)(Transport*, bool) = nullptr;
+    // Starts the post-handshake event machinery after ESTABLISHED on the
+    // server side. Returns 0 on success; on failure returns <0 with *err
+    // set to the errno-style code for Socket::SetFailed. Null means the
+    // transport needs no post-upgrade events.
+    int (*start_upgrade_events)(Transport*, int* err) = nullptr;
+    // Client-side upgrade flow, run on a dedicated bthread. Must drive the
+    // adapter's HandshakeSession to a terminal phase, call
+    // AdapterTransport::CompleteConnection, and store the connect error in
+    // *connect_error (0 = success or a clean TCP fallback).
+    void (*run_client_upgrade)(AdapterTransport*, Socket*,
+                               int* connect_error) = nullptr;
 };
 
 class TransportHandshakeRegistry {
@@ -76,6 +99,12 @@ public:
     // entry matches (a TCP-only peer).
     static const TransportHandshakeEntry* FindByMagic(
         const char* data, size_t len);
+
+    // Returns true when `data' is a proper prefix of at least one
+    // registered hello magic, i.e. more bytes may still dispatch. Used by
+    // the server parser to tell "wait for more bytes" apart from "hand the
+    // connection to the other protocol parsers".
+    static bool CouldMatchMagic(const char* data, size_t len);
 
     // Snapshot of all entries (registration order).
     static std::vector<TransportHandshakeEntry> All();

@@ -841,6 +841,34 @@ behavior:
   registry (including consolidating the `SocketMode` mapping into the
   single registry site); dead-code cleanup; documentation updates.
 
+### Landing Status
+
+P0-P4 have all landed (branch `transport-handshake-dev`):
+
+- P0: common skeleton + registry + loopback conformance baseline
+  (16 unit-test cases).
+- P1: RDMA v2/v3 codecs and the server adapter moved into
+  `handshake/rdma_handshake.*`; `rdma_handshake_server.*` and
+  `policy/rdma_handshake_protocol.*` deleted; master's newer MTU
+  negotiation preserved.
+- P2: UBSHM moved into `handshake/ubshm_handshake.*`; the endpoint's
+  inline state machine deleted; "UB" recognition is compiled only in
+  `BRPC_WITH_UBRING` builds.
+- P3: URMA moved into `handshake/urma_handshake.*` +
+  `urma_fallback_handshake.cpp` (liburma-free recognition channel,
+  compiled unconditionally); the legacy handshake classes moved to
+  `test/brpc_urma_legacy_handshake.h` for interop tests.
+- P4: registry consolidation. `TransportHandshakeEntry` gained the
+  full-channel hooks (`server_adapter`/`create_transport`/
+  `upgrade_ready`/`set_high_speed_available`/`start_upgrade_events`/
+  `run_client_upgrade`) and each transport self-registers from its own
+  handshake TU; `adapter_transport.cpp` now drives magic dispatch,
+  transport creation, `upgrade_capable`, availability mirroring,
+  upgrade-event startup and the client upgrade flow entirely through
+  the registry, with no per-transport switch or `BRPC_WITH_*` branch
+  left; the client-side participant classes moved into the owning
+  handshake TUs together with the upgrade flows.
+
 Regression floor for every phase: `transport_handshake` unit tests all
 green, `urma_fallback` unit tests all green, and the corresponding
 transport's end-to-end example (echo over RDMA/UBSHM/URMA) interoperates.
