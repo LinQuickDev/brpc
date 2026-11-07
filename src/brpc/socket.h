@@ -74,7 +74,6 @@ class SocketHandshakeIO;
 
 namespace ubring {
     class UBShmEndpoint;
-    class UBConnect;
 }
 
 class Socket;
@@ -344,7 +343,6 @@ friend class policy::RtmpContext;
 friend class schan::ChannelBalancer;
 friend class rdma::RdmaEndpoint;
 friend class ubring::UBShmEndpoint;
-friend class ubring::UBConnect;
 friend class UBShmTransport;
 friend class urma::UrmaEndpoint;
 friend class urma::UrmaConnect;

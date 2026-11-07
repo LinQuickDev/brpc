@@ -64,7 +64,7 @@ std::unique_ptr<Transport> TransportFactory::CreateTransport(SocketMode mode) {
 #endif
 #if BRPC_WITH_UBRING
     if (mode == SOCKET_MODE_UBRING) {
-        return std::unique_ptr<UBShmTransport>(new UBShmTransport());
+        return std::unique_ptr<Transport>(new AdapterTransport(mode));
     }
 #endif
     LOG(ERROR) << "Unknown transport type " << mode;

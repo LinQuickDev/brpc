@@ -26,8 +26,11 @@
 #include "brpc/input_messenger.h"
 #include "brpc/destroyable.h"
 #include "brpc/handshake/rdma_handshake.h"
-// UBSHM/URMA handshake headers join once those transports migrate onto the
-// common skeleton (P2/P3).
+#if BRPC_WITH_UBRING
+#include "brpc/handshake/ubshm_handshake.h"
+#endif
+// URMA handshake header joins once URMA migrates onto the common skeleton
+// (P3).
 #if BRPC_WITH_RDMA
 #include "brpc/rdma/rdma_helper.h"
 #endif
@@ -294,8 +297,12 @@ bool AdapterTransport::upgrade_capable(SocketMode mode) const {
         return static_cast<RdmaTransport*>(
             _high_speed_transport.get())->UpgradeReady();
 #endif
-    // UBSHM/URMA cases join once their handshakes move onto the common
-    // skeleton (P2/P3).
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        return static_cast<UBShmTransport*>(
+            _high_speed_transport.get())->UpgradeReady();
+#endif
+    // URMA case joins once its handshake moves onto the common skeleton (P3).
     default:
         return false;
     }
@@ -347,18 +354,26 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
         const size_t prefix_len = std::min(source->size(), MAX_MAGIC_LEN);
         source->copy_to(prefix, prefix_len);
 
-        // Only RDMA magics are matched in this phase; master's legacy
-        // rdma_handshake parser did exactly the same (everything else fell
-        // through to TRY_OTHERS). UBSHM/URMA recognition joins with their
-        // migrations (P2/P3).
+        // UBSHM recognition only exists in UBSHM-enabled builds; elsewhere a
+        // "UB" prefix falls through to the other parsers, matching master's
+        // legacy behavior for builds without the transport.
+        bool matches_ub = false;
+#if BRPC_WITH_UBRING
+        matches_ub = MatchesMagicPrefix(prefix, prefix_len, "UB", 2);
+#endif
         const bool matches_rdma =
             MatchesMagicPrefix(prefix, prefix_len, "RDMA", 4) ||
             MatchesMagicPrefix(prefix, prefix_len, "RDM3", 4);
-        if (!matches_rdma) {
+        if (!matches_ub && !matches_rdma) {
             result = ParseResult(PARSE_ERROR_TRY_OTHERS);
         } else {
-            result = handshake::GetRdmaServerHandshakeAdapter()
-                ->ExecuteServerHandshake(source, _socket);
+            handshake::HandshakeAdapter* adapter = nullptr;
+            if (matches_ub) {
+                adapter = handshake::GetUBShmServerHandshakeAdapter();
+            } else {
+                adapter = handshake::GetRdmaServerHandshakeAdapter();
+            }
+            result = adapter->ExecuteServerHandshake(source, _socket);
         }
     }
     const int phase = _handshake.phase(butil::memory_order_acquire);
@@ -522,8 +537,15 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
             // RDMA server handshake is parsed by InputMessenger.
             _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
-        // UBSHM/URMA branches join once their handshakes move onto the
-        // common skeleton (P2/P3).
+#if BRPC_WITH_UBRING
+        } else if (_mode == SOCKET_MODE_UBRING &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            // UBSHM server handshake is parsed by InputMessenger.
+            _on_edge_trigger = OnNewMessagesAfterUpgrade;
+#endif
+        // URMA branch joins once its handshake moves onto the common
+        // skeleton (P3).
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
         }
@@ -539,8 +561,12 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
         _high_speed_transport.reset(new RdmaTransport);
         break;
 #endif
-    // UBSHM/URMA cases join once their handshakes move onto the common
-    // skeleton (P2/P3).
+#if BRPC_WITH_UBRING
+    case SOCKET_MODE_UBRING:
+        _high_speed_transport.reset(new UBShmTransport);
+        break;
+#endif
+    // URMA case joins once its handshake moves onto the common skeleton (P3).
     default:
         break;
     }
