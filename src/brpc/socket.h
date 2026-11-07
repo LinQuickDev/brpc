@@ -73,6 +73,10 @@ class UrmaHandshakeClientV3;
 class UrmaHandshakeServerV3;
 }
 
+namespace handshake {
+class SocketHandshakeIO;
+}
+
 namespace ubring {
     class UBShmEndpoint;
     class UBConnect;
@@ -364,6 +368,7 @@ friend class policy::H2GlobalStreamCreator;
 friend class VersionedRefWithId<Socket>;
 friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
+friend class handshake::SocketHandshakeIO;
 friend class Transport;
 friend class TcpTransport;
 friend class RdmaTransport;
