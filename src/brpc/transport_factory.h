@@ -23,9 +23,9 @@
 
 namespace brpc {
 
-// Creates AdapterTransport for TCP, RDMA and UBSHM sockets; URMA still uses
-// its concrete transport directly until its handshake moves onto the common
-// skeleton (P3).
+// Creates AdapterTransport for every SocketMode; each mode's concrete
+// high-speed transport is owned by the adapter after its handshake migrated
+// onto the common skeleton.
 class TransportFactory {
 public:
     static int ContextInitOrDie(SocketMode mode, bool server_or_not,

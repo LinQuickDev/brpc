@@ -61,11 +61,6 @@ class RdmaEndpoint;
 
 namespace urma {
 class UrmaEndpoint;
-class UrmaConnect;
-class UrmaHandshakeClientV2;
-class UrmaHandshakeServerV2;
-class UrmaHandshakeClientV3;
-class UrmaHandshakeServerV3;
 }
 
 namespace handshake {
@@ -345,11 +340,6 @@ friend class rdma::RdmaEndpoint;
 friend class ubring::UBShmEndpoint;
 friend class UBShmTransport;
 friend class urma::UrmaEndpoint;
-friend class urma::UrmaConnect;
-friend class urma::UrmaHandshakeClientV2;
-friend class urma::UrmaHandshakeServerV2;
-friend class urma::UrmaHandshakeClientV3;
-friend class urma::UrmaHandshakeServerV3;
 friend class HealthCheckTask;
 friend class OnAppHealthCheckDone;
 friend class HealthCheckManager;

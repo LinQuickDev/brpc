@@ -29,8 +29,7 @@
 #if BRPC_WITH_UBRING
 #include "brpc/handshake/ubshm_handshake.h"
 #endif
-// URMA handshake header joins once URMA migrates onto the common skeleton
-// (P3).
+#include "brpc/handshake/urma_handshake.h"
 #if BRPC_WITH_RDMA
 #include "brpc/rdma/rdma_helper.h"
 #endif
@@ -302,7 +301,11 @@ bool AdapterTransport::upgrade_capable(SocketMode mode) const {
         return static_cast<UBShmTransport*>(
             _high_speed_transport.get())->UpgradeReady();
 #endif
-    // URMA case joins once its handshake moves onto the common skeleton (P3).
+#if BRPC_WITH_URMA
+    case SOCKET_MODE_URMA:
+        return static_cast<UrmaTransport*>(
+            _high_speed_transport.get())->UpgradeReady();
+#endif
     default:
         return false;
     }
@@ -356,7 +359,9 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
 
         // UBSHM recognition only exists in UBSHM-enabled builds; elsewhere a
         // "UB" prefix falls through to the other parsers, matching master's
-        // legacy behavior for builds without the transport.
+        // legacy behavior for builds without the transport. URMA recognition
+        // is always compiled: a TCP-only server still replies with a
+        // disabled hello so the peer falls back (recognition-only channel).
         bool matches_ub = false;
 #if BRPC_WITH_UBRING
         matches_ub = MatchesMagicPrefix(prefix, prefix_len, "UB", 2);
@@ -364,14 +369,19 @@ ParseResult AdapterTransport::ProcessUpgradeReadable(butil::IOBuf* source) {
         const bool matches_rdma =
             MatchesMagicPrefix(prefix, prefix_len, "RDMA", 4) ||
             MatchesMagicPrefix(prefix, prefix_len, "RDM3", 4);
-        if (!matches_ub && !matches_rdma) {
+        const bool matches_urma =
+            MatchesMagicPrefix(prefix, prefix_len, "URMA", 4) ||
+            MatchesMagicPrefix(prefix, prefix_len, "URM3", 4);
+        if (!matches_ub && !matches_rdma && !matches_urma) {
             result = ParseResult(PARSE_ERROR_TRY_OTHERS);
         } else {
             handshake::HandshakeAdapter* adapter = nullptr;
             if (matches_ub) {
                 adapter = handshake::GetUBShmServerHandshakeAdapter();
-            } else {
+            } else if (matches_rdma) {
                 adapter = handshake::GetRdmaServerHandshakeAdapter();
+            } else {
+                adapter = handshake::GetUrmaServerHandshakeAdapter();
             }
             result = adapter->ExecuteServerHandshake(source, _socket);
         }
@@ -544,8 +554,13 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
             // UBSHM server handshake is parsed by InputMessenger.
             _on_edge_trigger = OnNewMessagesAfterUpgrade;
 #endif
-        // URMA branch joins once its handshake moves onto the common
-        // skeleton (P3).
+#if BRPC_WITH_URMA
+        } else if (_mode == SOCKET_MODE_URMA &&
+                   options.user != static_cast<SocketUser*>(
+                       get_client_side_messenger())) {
+            // URMA server handshake is parsed by InputMessenger.
+            _on_edge_trigger = OnNewMessagesAfterUpgrade;
+#endif
         } else {
             _on_edge_trigger = OnNewDataFromTcp;
         }
@@ -566,7 +581,11 @@ void AdapterTransport::Init(Socket* socket, const SocketOptions& options) {
         _high_speed_transport.reset(new UBShmTransport);
         break;
 #endif
-    // URMA case joins once its handshake moves onto the common skeleton (P3).
+#if BRPC_WITH_URMA
+    case SOCKET_MODE_URMA:
+        _high_speed_transport.reset(new UrmaTransport);
+        break;
+#endif
     default:
         break;
     }
