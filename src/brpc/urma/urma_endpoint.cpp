@@ -624,8 +624,7 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
 // Send / recv data path.
 // ============================================================================
 
-// Private IOBuf accessor mirroring RdmaIOBuf: reach into IOBuf block refs to
-// build a urma_sge_t directly, without memcpy.
+// Build send SGEs from IOBuf block references.
 class UrmaIOBuf : private butil::IOBuf {
     friend class ::brpc::urma::UrmaEndpoint;
 public:
@@ -653,18 +652,25 @@ public:
                         static_cast<uintptr_t>(meta));
                 }
             }
-            if (!tseg) {
-                errno = ERDMAMEM;
-                return -1;
-            }
-            size_t this_len = r.length;
-            if (len + this_len > max_len) {
-                this_len = max_len - len;
+            size_t this_len = std::min<size_t>(r.length, max_len - len);
+            if (tseg) {
+                cutn(to, this_len);
+            } else {
+                // Large contiguous FlatBuffers and buffers created before
+                // URMA initialization can live outside the registered pool.
+                // Stage at most one local pool block per SGE. The SQ slot
+                // owns the staged bytes until send completion.
+                this_len = std::min(this_len, GetUrmaRecvBlockSize());
+                start = AppendRegisteredSendCopy(to, start, this_len);
+                if (!start) {
+                    return -1;
+                }
+                tseg = GetPoolSegFor(nullptr);
+                pop_front(this_len);
             }
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
-            cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
         }
@@ -773,6 +779,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             errno = rc;
             return -1;
         }
+        VLOG(1) << "URMA posted data SEND: bytes=" << this_len
+                << " sge_count=" << sge_index << " on "
+                << _socket->description();
         _sq_current = (_sq_current + 1) % (_sq_size - RESERVED_WR_NUM);
         total_len += static_cast<ssize_t>(this_len);
     }

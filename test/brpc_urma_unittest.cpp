@@ -19,6 +19,7 @@
 #include <limits>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
+#include "butil/config.h"
 
 #if BRPC_WITH_URMA
 #include "butil/atomicops.h"
@@ -264,10 +265,11 @@ TEST(UrmaHelperTest, selects_priority_matching_transport_path_type) {
 }
 
 // ---------------------------------------------------------------------------
-// SupportedByUrma: only baidu_std.
+// SupportedByUrma: FlatBuffers RPC is available only in FlatBuffers builds.
 // ---------------------------------------------------------------------------
 TEST(UrmaHandshakeTest, supported_by_urma_protocol_allowlist) {
     EXPECT_TRUE(urma::SupportedByUrma("baidu_std"));
+    EXPECT_EQ(BRPC_WITH_FLATBUFFERS != 0, urma::SupportedByUrma("fb_rpc"));
     EXPECT_FALSE(urma::SupportedByUrma("http"));
     EXPECT_FALSE(urma::SupportedByUrma("hulu_pbrpc"));
     EXPECT_FALSE(urma::SupportedByUrma("nshead"));

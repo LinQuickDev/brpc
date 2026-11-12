@@ -35,6 +35,7 @@
 #include <gflags/gflags.h>
 
 #include "butil/atomicops.h"
+#include "butil/config.h"
 #include "butil/containers/flat_map.h"
 #include "butil/iobuf.h"
 #include "butil/logging.h"
@@ -271,15 +272,7 @@ size_t PreferredShard() {
     return std::hash<pthread_t>()(pthread_self()) % kShardCount;
 }
 
-void* PoolAllocate(size_t size) {
-    if (BAIDU_UNLIKELY(g_skip_urma_init)) {
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
-    // Only serve the configured buffer size; callers always ask for that.
-    if (size > g_pool_buffer_size) {
-        // Larger than a single buffer -- fall back to the system allocator.
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
+void* TryAllocatePoolBuffer() {
     auto start = PreferredShard();
     for (size_t i = 0; i < kShardCount; ++i) {
         auto shard = (start + i) % kShardCount;
@@ -297,6 +290,16 @@ void* PoolAllocate(size_t size) {
         }
         g_pool->outstanding.fetch_add(1, butil::memory_order_relaxed);
         return buf;
+    }
+    return nullptr;
+}
+
+void* PoolAllocate(size_t size) {
+    if (BAIDU_UNLIKELY(g_skip_urma_init) || size > g_pool_buffer_size) {
+        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
+    }
+    if (void* buffer = TryAllocatePoolBuffer()) {
+        return buffer;
     }
     LOG_EVERY_SECOND(WARNING)
         << "URMA buffer pool exhausted; falling back to malloc";
@@ -410,6 +413,29 @@ urma_target_seg_t* GetPoolSegFor(void* buf) {
         return g_pool_seg;
     }
     return nullptr;
+}
+
+void* AppendRegisteredSendCopy(butil::IOBuf* out, const void* data, size_t size) {
+    if (!GetPoolSegFor(nullptr)) {
+        errno = ENODEV;
+        return nullptr;
+    }
+    if (size == 0 || size > g_pool_buffer_size) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    void* buffer = TryAllocatePoolBuffer();
+    if (!buffer) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    memcpy(buffer, data, size);
+    if (out->append_user_data(buffer, size, PoolDeallocate) != 0) {
+        PoolDeallocate(buffer);
+        errno = ENOMEM;
+        return nullptr;
+    }
+    return buffer;
 }
 
 static void GlobalRelease() {
@@ -667,6 +693,11 @@ void GlobalDisableUrma() {
 }
 
 bool SupportedByUrma(const std::string& protocol) {
+#if BRPC_WITH_FLATBUFFERS
+    if (protocol == "fb_rpc") {
+        return true;
+    }
+#endif
     return protocol == "baidu_std";
 }
 

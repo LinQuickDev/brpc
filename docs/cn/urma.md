@@ -90,7 +90,7 @@ Bazel 会自动获取固定 commit 的 UMDK 头文件，并通过 `@umdk//:urma_
 // 客户端
 brpc::ChannelOptions opt;
 opt.socket_mode = brpc::SOCKET_MODE_URMA;
-opt.protocol = "baidu_std";   // URMA 仅支持 baidu_std
+opt.protocol = "baidu_std";   // 启用 WITH_FLATBUFFERS 后也可使用 "fb_rpc"
 brpc::Channel channel;
 channel.Init("127.0.0.1:8003", &opt);
 
@@ -139,10 +139,13 @@ urma::UrmaEndpoint : public SocketUser   (urma/urma_endpoint.{h,cpp})
 ### 内存管理
 
 申请一大段 `mmap` 内存，用 `urma_register_seg` 一次性注册，再切成固定大小
-buffer（默认 8KB）。劫持 `butil::iobuf::blockmem_allocate` 使每个 IOBuf
-block 都由注册 segment 支撑，发送路径可直接从 IOBuf block refs 构建
+buffer（默认 8KB）。传输层替换 `butil::iobuf::blockmem_allocate`，使符合池大小
+限制的 IOBuf block 可以使用注册 segment，发送路径可直接从 IOBuf block refs 构建
 `urma_sge_t`，无需逐消息注册（与 RDMA `block_pool` 设计一致）。用户注册
 内存通过 `urma::RegisterMemoryForUrma` / `DeregisterMemoryForUrma` 支持。
+发送路径直接引用已注册缓冲区。对于未注册的内存，例如超出单个池缓冲区的
+连续 FlatBuffers 消息，发送路径按片段拷贝到注册池并保留到发送完成。
+注册池耗尽时发送失败。
 
 ## 配置
 
@@ -189,7 +192,7 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
 
 ## 限制
 
-- 仅支持 `baidu_std` 协议（与 RDMA 一致）。SSL、RTMP、NSHEAD、MONGO 在
+- 支持 `baidu_std`，以及启用 FlatBuffers 时的 `fb_rpc`。SSL、RTMP、NSHEAD、MONGO 在
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
