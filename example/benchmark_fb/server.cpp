@@ -36,6 +36,7 @@
 DEFINE_string(listen_addr, "127.0.0.1:0", "IPv4 address; port 0 selects a free port. "
               "A non-loopback address also needs --allow_remote");
 DEFINE_bool(allow_remote, false, "Allow a non-loopback --listen_addr for cross-host benchmarks");
+DEFINE_bool(use_urma, false, "Use the URMA socket mode on a URMA-enabled build");
 DEFINE_int32(duration_s, 60, "Exit after 1..86400 seconds, or earlier on SIGINT/SIGTERM");
 DEFINE_int32(max_concurrency, 32, "Maximum concurrent requests, 1..4096");
 DEFINE_int32(reply_delay_ms, 0, "Test aid: delay every reply by 0..10000 milliseconds");
@@ -150,6 +151,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     brpc::ServerOptions options;
+    options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA : brpc::SOCKET_MODE_TCP;
     options.has_builtin_services = false;
     options.enabled_protocols = "fb_rpc baidu_std";
     options.max_concurrency = FLAGS_max_concurrency;

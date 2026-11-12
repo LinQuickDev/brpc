@@ -26,6 +26,10 @@
 #include "bthread/types.h"
 #include "butil/atomicops.h"
 
+namespace butil {
+class IOBuf;
+}
+
 #if BRPC_WITH_URMA
 
 #include "urma_api.h"
@@ -62,6 +66,10 @@ void DeregisterMemoryForUrma(void* buf);
 // the segment backing the whole pool. Returns nullptr for any other address.
 urma_target_seg_t* GetPoolSegFor(void* buf);
 
+// Append a copy in registered pool memory. The IOBuf owns the pool buffer.
+// Returns its address, or nullptr with errno set on failure.
+void* AppendRegisteredSendCopy(butil::IOBuf* out, const void* data, size_t size);
+
 // Get the global URMA context (the urma_context_t created on the selected
 // device / EID). Returns nullptr if URMA is not initialized.
 urma_context_t* GetUrmaContext();
@@ -90,7 +98,7 @@ bool IsUrmaAvailable();
 void GlobalDisableUrma();
 
 // If the given protocol is supported by UrmaTransport.
-// Currently only "baidu_std" is supported.
+// FlatBuffers RPC is supported when built with WITH_FLATBUFFERS.
 bool SupportedByUrma(const std::string& protocol);
 
 // Return the configured recv buffer size (one URMA recv WR's payload size).

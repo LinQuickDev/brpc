@@ -76,6 +76,7 @@ schema rejection (error code -1); timeouts and connection errors are failures.
 | --- | --- | --- |
 | `server` | required | `127.0.0.1:<nonzero-port>`, any IPv4 with `allow_remote` |
 | `protocol` | `fb_rpc` | `fb_rpc`, `baidu_std` (protobuf control service) |
+| `use_urma` | false | Select URMA socket mode on a URMA-enabled build |
 | `request_count` | 16 | 1..1000 total, not per thread |
 | `thread_num` | 2 | 1..16 synchronous callers (1..1024 when timed) |
 | `request_size` | 64 | 0..1048576 string bytes |
@@ -133,6 +134,28 @@ Both services echo the request string and attachment; the FlatBuffers path
 builds and verifies a FlatBuffers response, while the protobuf path parses and
 serializes the equivalent message. The results are only comparable when
 binaries, hosts, concurrency, sizes and duration are the same.
+
+### URMA hardware comparison
+
+Build bRPC with `WITH_FLATBUFFERS=ON`, `WITH_URMA=ON`, and
+`URMA_USE_MOCK=OFF`. For a static example build, pass the same system
+`liburma` to `BRPC_EXTRA_LIBRARIES` and verify the library resolved by
+`ldd` on both executables.
+
+Start the server on one host and run the client on the peer. Enable
+`--use_urma` and select the local URMA device on both hosts. On a provider
+with a 4 KiB CTP SEND limit, set `--urma_buffer_size=4096` on both peers
+so the negotiated receive payload per work request stays within that limit.
+Run count-mode cases with a small payload and then a 64 KiB payload, including
+an attachment. Check exit status and verified reply counts. For these short
+runs, enable `--v=1` and confirm both hosts log `URMA posted data SEND` for
+the test connection. A successful RPC can also complete through TCP fallback.
+
+For the timed comparison, turn off verbose logging and keep message size,
+attachment, concurrency, connection type and warm-up fixed. Compare
+`fb_rpc` over URMA against `fb_rpc` over TCP using the same build. The
+FlatBuffers receive path may copy fragmented or unaligned payloads into
+contiguous storage, even with `--urma_recv_zerocopy=true`.
 
 ## Smoke test
 

@@ -34,6 +34,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,10 @@
 #include "brpc/stream.h"
 #include "bvar/variable.h"
 #include "flatbuffers_message_generated.h"
+#if BRPC_WITH_URMA
+#include <gflags/gflags.h>
+#include "brpc/urma/urma_helper.h"
+#endif
 
 namespace {
 
@@ -2315,6 +2320,89 @@ TEST(FlatBuffersProbeOrderTest, ProbedRightAfterBaiduStd) {
     server.Stop(0);
     server.Join();
 }
+
+#if BRPC_WITH_URMA
+class UrmaPayloadService : public PayloadService {
+public:
+    void FBCallMethod(const MethodDescriptor* method,
+                      google::protobuf::RpcController* controller,
+                      const Message* request, Message* response,
+                      google::protobuf::Closure* done) override {
+        brpc::ControllerPrivateAccessor accessor(
+            static_cast<brpc::Controller*>(controller));
+        brpc::Socket* socket = accessor.get_sending_socket();
+        if (socket) {
+            std::ostringstream debug;
+            brpc::Socket::DebugSocket(debug, socket->id());
+            established.store(debug.str().find("state=ESTABLISHED") !=
+                              std::string::npos);
+        }
+        PayloadService::FBCallMethod(method, controller, request, response, done);
+    }
+
+    std::atomic<bool> established{false};
+};
+
+TEST(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
+    urma_init_attr_t attr{};
+    const auto status = urma_init(&attr);
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+        GTEST_SKIP() << "Requires the URMA link-time mock";
+    }
+    int device_count = 0;
+    urma_device_t** devices = urma_get_device_list(&device_count);
+    const bool mock = devices && device_count > 0 &&
+        strcmp(devices[0]->name, "mock_urma_device") == 0;
+    if (devices) {
+        urma_free_device_list(devices);
+    }
+    if (status == URMA_SUCCESS) {
+        ASSERT_EQ(URMA_SUCCESS, urma_uninit());
+    }
+    if (!mock) {
+        GTEST_SKIP() << "Requires the URMA link-time mock";
+    }
+
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_size", "4096");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_count", "4096");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_use_polling", "false");
+    const Message request = MakePayload(64 * 1024);
+
+    UrmaPayloadService service;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddFlatBuffersService(
+        &service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions server_options;
+    server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+    server_options.has_builtin_services = false;
+    server_options.enabled_protocols = "fb_rpc";
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    ASSERT_TRUE(brpc::urma::IsUrmaAvailable());
+    EXPECT_EQ(nullptr, brpc::urma::GetPoolSegFor(
+        const_cast<uint8_t*>(request.data())));
+
+    brpc::ChannelOptions channel_options;
+    channel_options.protocol = "fb_rpc";
+    channel_options.socket_mode = brpc::SOCKET_MODE_URMA;
+    channel_options.connection_type = "single";
+    channel_options.max_retry = 0;
+    channel_options.timeout_ms = kWaitTimeoutMs;
+    brpc::Channel channel;
+    ASSERT_EQ(0, channel.Init(server.listen_address(), &channel_options));
+    const auto* method = service.GetDescriptor()->FindMethodByIndex(7);
+    ASSERT_NE(nullptr, method);
+    brpc::Controller cntl;
+    Message response;
+    const std::string attachment(8193, 'a');
+    ASSERT_EQ(0, cntl.request_attachment().append(attachment));
+    channel.FBCallMethod(method, &cntl, &request, &response, nullptr);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    EXPECT_TRUE(service.established.load()) << "RPC fell back to TCP";
+    ExpectReply(response, request, method);
+    EXPECT_EQ(attachment, cntl.response_attachment().to_string());
+}
+#endif  // BRPC_WITH_URMA
 
 }  // namespace
 #endif  // BRPC_WITH_FLATBUFFERS
