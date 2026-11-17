@@ -408,6 +408,10 @@ int UrmaEndpoint::AllocateResources() {
     if (_resource) {
         return 0;
     }
+    uint8_t priority;
+    if (!ResolveUrmaJettyPriority(_socket->urma_qos(), &priority)) {
+        return -1;
+    }
     urma_context_t* ctx = GetUrmaContext();
     if (!ctx) {
         errno = ENODEV;
@@ -420,7 +424,8 @@ int UrmaEndpoint::AllocateResources() {
     }
 
     // Try the prepared pool first (sized sq/rq match).
-    if (_sq_size <= static_cast<uint16_t>(FLAGS_urma_sq_size) &&
+    if (priority == GetUrmaJettyPriority() &&
+        _sq_size <= static_cast<uint16_t>(FLAGS_urma_sq_size) &&
         _rq_size <= static_cast<uint16_t>(FLAGS_urma_rq_size)) {
         BAIDU_SCOPED_LOCK(g_prepared_mutex);
         if (g_prepared_list) {
@@ -469,7 +474,7 @@ int UrmaEndpoint::AllocateResources() {
         jetty_cfg.flag.bs.share_jfr = 1;
         jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(_sq_size);
         jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-        jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
+        jetty_cfg.jfs_cfg.priority = priority;
         jetty_cfg.jfs_cfg.max_sge =
             static_cast<uint8_t>(GetUrmaMaxSge());
         jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
@@ -530,6 +535,7 @@ int UrmaEndpoint::AllocateResources() {
     } else {
         PollerAddCqSid();
     }
+    _effective_priority.store(priority, butil::memory_order_relaxed);
     return 0;
 }
 
@@ -546,6 +552,7 @@ void UrmaEndpoint::DeallocateResources() {
 
     // Prepared resources are one-shot. Destroy provider handles before
     // releasing buffers referenced by outstanding work requests.
+    _effective_priority.store(-1, butil::memory_order_relaxed);
     delete _resource;
     _resource = nullptr;
     _sbuf.clear();
@@ -987,6 +994,18 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     if (cr.status != URMA_CR_SUCCESS) {
         LOG(WARNING) << "URMA completion failed, status=" << cr.status
                      << " direction=" << (cr.flag.bs.s_r ? "recv" : "send")
+                     << " urma_priority=" << _socket->urma_qos().priority
+                     << " urma_sl=" << _socket->urma_qos().service_level
+                     << " urma_effective_priority="
+                     << (_resource && _resource->jetty
+                             ? static_cast<int>(
+                                   _resource->jetty->jetty_cfg.jfs_cfg.priority)
+                             : -1)
+                     << " urma_effective_sl="
+                     << (_resource && _resource->jetty
+                             ? GetUrmaServiceLevelForPriority(
+                                   _resource->jetty->jetty_cfg.jfs_cfg.priority)
+                             : -1)
                      << " flags=" << static_cast<unsigned>(cr.flag.value)
                      << " opcode=" << cr.opcode << " local_id=" << cr.local_id
                      << " tpn=" << cr.tpn << " user_ctx=" << cr.user_ctx
@@ -1726,12 +1745,17 @@ std::string UrmaEndpoint::GetStateStr() const {
 }
 
 void UrmaEndpoint::DebugInfo(std::ostream& os, butil::StringPiece) const {
+    const int priority = _effective_priority.load(butil::memory_order_relaxed);
     os << "state=" << GetStateStr() << " sq_size=" << _sq_size
        << " rq_size=" << _rq_size
        << " remote_recv_block_size=" << _remote_recv_block_size
        << " sq_window=" << _sq_window_size.load(butil::memory_order_relaxed)
        << " remote_rq_window="
        << _remote_rq_window_size.load(butil::memory_order_relaxed)
+       << " urma_priority=" << _socket->urma_qos().priority
+       << " urma_sl=" << _socket->urma_qos().service_level
+       << " urma_effective_priority=" << priority
+       << " urma_effective_sl=" << GetUrmaServiceLevelForPriority(priority)
        << " recovery_epoch=" << _recovery_epoch.load(butil::memory_order_relaxed)
        << " runtime_failure=" << UrmaFailureReasonName(_runtime_failure.load())
        << " handshake_version=" << _handshake_version

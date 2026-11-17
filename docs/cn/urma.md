@@ -256,3 +256,51 @@ URMA 恢复及 64 KiB 附件回显。正常短连接关闭也在同一测试中�
 `--urma_copy_send=true` 将每个数据 WR 合并到 64 字节对齐的注册缓冲区，并持有至完成，
 增加一次 CPU 拷贝。两端保持设备、队列和消息大小一致，对比原发送路径与复制路径。
 初始化日志记录 `copy_send`，失败日志记录完成方向、槽位及注册段范围。
+
+## 业务 SL 与优先级
+
+同一进程可以同时运行对延迟敏感的 RPC 和批量传输。两类业务可以分别设置发送优先级，
+未显式配置的业务继承进程默认值。`ChannelOptions.urma_qos` 控制请求发送方向，
+`ServerOptions.urma_qos` 控制响应发送方向。
+
+```cpp
+brpc::ChannelOptions client_options;
+client_options.socket_mode = brpc::SOCKET_MODE_URMA;
+client_options.urma_qos.service_level = 2;
+
+brpc::ServerOptions server_options;
+server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+server_options.urma_qos.service_level = 2;
+```
+
+`--urma_tp_type=auto` 按设备能力优先选择 CTP，其次 RTP；`ctp`、`rtp` 显式选择路径。
+两端使用相同路径，进程初始化后保持固定。设备未提供能力表时，auto/ctp 使用 priority 6，
+rtp 使用 priority 0。
+
+| 配置 | 默认 | 显式范围 | 含义 |
+| --- | --- | --- | --- |
+| `service_level` | -1 | 0–255 | 选择当前路径下首个映射到该 SL 的 priority |
+| `priority` | -1 | 0–15 | 指定当前路径支持的 priority |
+
+两项均为 -1 时使用进程默认 priority。同时指定时，两项须匹配同一设备映射。
+每个设备在所选路径下最多提供 16 个 priority/SL 映射，实际可用项取决于设备能力。
+显式配置不受支持或发生冲突时，Channel 初始化或 Server 启动失败，日志会列出当前路径支持的映射。
+平台配置设备映射与调度策略，brpc 使用进程初始化时的映射快照。
+
+客户端连接签名包含原始 QoS 设置。即使 RTP 的 priority 0 是 SL 2 的首个匹配项，
+只填 `service_level=2` 和同时填 `priority=0` 的两个 Channel 也会分别建连。
+配置随服务发现、连接池、短连接和服务端 accept 传递，Jetty 重建时重新应用。
+
+活跃的 URMA 连接在每端各占用一个 Jetty。匹配默认 priority 和队列大小的连接可以使用
+预建池中的 Jetty，其他连接按需创建 Jetty。v2/v3 握手使用所选路径。
+
+### 功能验证
+
+用 `urma_admin show --dev "$URMA_DEVICE" --whole` 核对当前路径的 priority:SL。
+`example/urma_performance` 的两端均支持 `--urma_tp_type=rtp --urma_sl=2`，
+也可通过 `--urma_priority` 指定匹配项。先以默认配置完成 RPC，再分别改变请求和响应 SL，
+验证合法映射、不支持的 SL 和 SL/priority 冲突。对 v2/v3、single/pooled 及 polling 模式重复验证。
+
+连接调试信息提供 `state`、`urma_effective_priority` 和 `urma_effective_sl`。
+核对 URMA 连接为 `ESTABLISHED`、映射符合设备配置、RPC 无错误。
+调度效果测试结合竞争流量、设备队列计数器、吞吐与 P99。
