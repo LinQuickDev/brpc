@@ -75,12 +75,25 @@ static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
 
 // ---- Globals: prepared jetty pool + poller groups ----
-struct PreparedJetty {
-    UrmaResource* res;
-};
 static butil::Mutex g_prepared_mutex;
-static UrmaResource* g_prepared_list = nullptr;  // singly-linked
-static int g_prepared_cnt = 0;
+using PreparedResources = std::vector<std::unique_ptr<LocalJettyResources>>;
+
+static PreparedResources& PreparedJettyResources() {
+    // The URMA context is kept alive until process exit. Release this cache
+    // explicitly during initialization rollback, before deleting the context.
+    static auto* resources = new PreparedResources;
+    return *resources;
+}
+
+static uint16_t QueueDepth(int depth) {
+    return static_cast<uint16_t>(std::max(16, std::min(4096, depth)));
+}
+
+static LocalJettyConfig MakeLocalJettyConfig(
+        urma_context_t* ctx, uint16_t sq_depth, uint16_t rq_depth) {
+    return {ctx, sq_depth, rq_depth, static_cast<uint8_t>(GetUrmaMaxSge()),
+            GetUrmaJettyPriority(), FLAGS_urma_use_polling};
+}
 
 static int PreparedJettyCount() {
     const int requested =
@@ -115,43 +128,15 @@ static int PreparedJettyCount() {
 std::vector<UrmaEndpoint::PollerGroup> UrmaEndpoint::_poller_groups;
 
 // ============================================================================
-// UrmaResource lifecycle.
-// ============================================================================
-
-UrmaResource::~UrmaResource() {
-    if (remote_jetty) {
-        urma_unimport_jetty(remote_jetty);
-    }
-    if (remote_seg) {
-        urma_unimport_seg(remote_seg);
-    }
-    if (jetty) {
-        urma_delete_jetty(jetty);
-    }
-    if (jfr) {
-        urma_delete_jfr(jfr);
-    }
-    if (jfc) {
-        urma_delete_jfc(jfc);
-    }
-    if (jfce) {
-        urma_delete_jfce(jfce);
-    }
-}
-
-// ============================================================================
 // Constructor / destructor / Reset.
 // ============================================================================
 
 UrmaEndpoint::UrmaEndpoint(Socket* s)
     : _socket(s),
       _state(UNINIT),
-      _handshake_version(0),
-      _resource(nullptr) {
-    _sq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
-    _rq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_rq_size))));
+      _handshake_version(0) {
+    _sq_size = QueueDepth(FLAGS_urma_sq_size);
+    _rq_size = QueueDepth(FLAGS_urma_rq_size);
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
     _input_processor.Init(s, InputMessengerProcessor::STREAM_URMA_JETTY);
@@ -396,72 +381,18 @@ int UrmaEndpoint::AllocateResources() {
         return -1;
     }
 
-    _resource = new (std::nothrow) UrmaResource();
-    if (!_resource) {
-        return -1;
-    }
-
-    // Try the prepared pool first (sized sq/rq match).
-    if (_sq_size <= static_cast<uint16_t>(FLAGS_urma_sq_size) &&
-        _rq_size <= static_cast<uint16_t>(FLAGS_urma_rq_size)) {
+    const auto config = MakeLocalJettyConfig(ctx, _sq_size, _rq_size);
+    {
         BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        if (g_prepared_list) {
-            UrmaResource* next = g_prepared_list->next;
-            delete _resource;
-            _resource = g_prepared_list;
-            g_prepared_list = next;
-            _resource->next = nullptr;
-            --g_prepared_cnt;
+        auto& prepared = PreparedJettyResources();
+        if (!prepared.empty() && prepared.back()->config == config) {
+            _resource = std::move(prepared.back());
+            prepared.pop_back();
         }
     }
-
-    if (!_resource->jfc) {
-        // The SDK requires every JFC to reference a JFCE. Polling mode does
-        // not arm or consume it, but still supplies the required object.
-        _resource->jfce = urma_create_jfce(ctx);
-        if (!_resource->jfce ||
-            (!FLAGS_urma_use_polling && _resource->jfce->fd < 0)) {
-            LOG(ERROR) << "Fail to create a usable URMA JFCE";
-            errno = ENODEV;
-            return -1;
-        }
-
-        urma_jfc_cfg_t jfc_cfg{};
-        jfc_cfg.depth = static_cast<uint32_t>(_sq_size + _rq_size);
-        jfc_cfg.jfce = _resource->jfce;
-        _resource->jfc = urma_create_jfc(ctx, &jfc_cfg);
-        if (!_resource->jfc) {
-            PLOG(ERROR) << "urma_create_jfc";
-            return -1;
-        }
-
-        urma_jfr_cfg_t jfr_cfg{};
-        jfr_cfg.depth = static_cast<uint32_t>(_rq_size);
-        jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
-        jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-        jfr_cfg.jfc = _resource->jfc;
-        _resource->jfr = urma_create_jfr(ctx, &jfr_cfg);
-        if (!_resource->jfr) {
-            PLOG(ERROR) << "urma_create_jfr";
-            return -1;
-        }
-
-        urma_jetty_cfg_t jetty_cfg{};
-        jetty_cfg.flag.bs.share_jfr = 1;
-        jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(_sq_size);
-        jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-        jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
-        jetty_cfg.jfs_cfg.max_sge =
-            static_cast<uint8_t>(GetUrmaMaxSge());
-        jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-        jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-        jetty_cfg.jfs_cfg.jfc = _resource->jfc;
-        jetty_cfg.shared.jfr = _resource->jfr;
-        jetty_cfg.shared.jfc = _resource->jfc;
-        _resource->jetty = urma_create_jetty(ctx, &jetty_cfg);
-        if (!_resource->jetty) {
-            PLOG(ERROR) << "urma_create_jetty";
+    if (!_resource) {
+        _resource = LocalJettyResources::Create(config);
+        if (!_resource) {
             return -1;
         }
     }
@@ -471,18 +402,15 @@ int UrmaEndpoint::AllocateResources() {
     _rbuf_data.resize(_rq_size, nullptr);
 
     // Wrap the JFCE fd in a brpc Socket so PollCq is driven by epoll.
-    if (!FLAGS_urma_use_polling) {
-        if (!_resource->jfce || _resource->jfce->fd < 0) {
-            LOG(ERROR) << "Prepared URMA resource has no usable JFCE";
-            errno = ENODEV;
-            return -1;
-        }
+    if (!_resource->config.use_polling) {
         if (ReqNotifyCq() != 0) {
             return -1;
         }
         SocketOptions options;
         options.user = this;
         options.keytable_pool = _socket->keytable_pool();
+        // liburma owns the JFCE fd. Detach it from the CQ socket before
+        // releasing the local resources.
         options.fd = _resource->jfce->fd;
         options.on_edge_triggered_events = PollCq;
         if (Socket::Create(options, &_cq_sid) < 0) {
@@ -509,7 +437,7 @@ void UrmaEndpoint::DeallocateResources() {
         return;
     }
 
-    if (FLAGS_urma_use_polling) {
+    if (_resource->config.use_polling) {
         PollerRemoveCqSid();
     }
 
@@ -530,8 +458,8 @@ void UrmaEndpoint::DeallocateResources() {
     // Reusing a Jetty requires a driver-supported RESET plus a complete JFC
     // drain. Until that lifecycle is implemented, prepared resources are
     // one-shot: they accelerate connection setup but are destroyed on close.
-    delete _resource;
-    _resource = nullptr;
+    _peer.Reset();
+    _resource.reset();
 }
 
 // ============================================================================
@@ -559,8 +487,8 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
     seg_flag.bs.cacheable = URMA_NON_CACHEABLE;
     seg_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
     seg_flag.bs.mapping = URMA_SEG_NOMAP;
-    _resource->remote_seg = urma_import_seg(ctx, &peer_seg, &seg_token, 0, seg_flag);
-    if (!_resource->remote_seg) {
+    _peer.segment = urma_import_seg(ctx, &peer_seg, &seg_token, 0, seg_flag);
+    if (!_peer.segment) {
         PLOG(ERROR) << "urma_import_seg failed";
         return -1;
     }
@@ -591,7 +519,7 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
         bonding_remote.base = remote;
         bonding_remote.base.flag.bs.has_drv_ext = 1;
         bonding_remote.jetty = _resource->jetty;
-        _resource->remote_jetty =
+        _peer.jetty =
             urma_import_jetty(ctx, &bonding_remote.base, &token);
 #else
         LOG(ERROR) << "Bonding remote jetty import requires provider header "
@@ -599,9 +527,9 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
         errno = ENOTSUP;
 #endif
     } else {
-        _resource->remote_jetty = urma_import_jetty(ctx, &remote, &token);
+        _peer.jetty = urma_import_jetty(ctx, &remote, &token);
     }
-    if (!_resource->remote_jetty) {
+    if (!_peer.jetty) {
         if (errno == 0) {
             errno = EIO;
         }
@@ -673,7 +601,7 @@ public:
 };
 
 ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
-    if (!_resource || !_resource->jetty || !_resource->remote_jetty) {
+    if (!_resource || !_resource->jetty || !_peer.jetty) {
         errno = ENOTCONN;
         return -1;
     }
@@ -734,13 +662,13 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
         wr.flag.bs.complete_enable = 1;
-        wr.tjetty = _resource->remote_jetty;
+        wr.tjetty = _peer.jetty;
         wr.send.src = sg;
         wr.user_ctx = 1;
         urma_jfs_wr_t* bad_wr = nullptr;
         const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
-        const uint32_t remote_jetty_id = _resource->remote_jetty->id.id;
+        const uint32_t remote_jetty_id = _peer.jetty->id.id;
 
         // Reserve both credits before making the WR visible to the provider.
         // In polling mode a completion (and even the peer's receive-credit
@@ -867,7 +795,7 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     if (imm == 0) {
         return 0;
     }
-    if (!_resource || !_resource->jetty || !_resource->remote_jetty) {
+    if (!_resource || !_resource->jetty || !_peer.jetty) {
         errno = ENOTCONN;
         return -1;
     }
@@ -882,7 +810,7 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     wr.opcode = URMA_OPC_SEND_IMM;
     wr.flag.bs.complete_enable = 1;
     wr.flag.bs.solicited_enable = 1;
-    wr.tjetty = _resource->remote_jetty;
+    wr.tjetty = _peer.jetty;
     wr.send.imm_data = imm;
     wr.user_ctx = 0;  // 0 == pure ack (HandleCompletion reuses budget).
     urma_jfs_wr_t* bad = nullptr;
@@ -905,7 +833,7 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
                      << " local_jetty_id="
                      << _resource->jetty->jetty_id.id
                      << " remote_jetty_id="
-                     << _resource->remote_jetty->id.id
+                     << _peer.jetty->id.id
                      << " state=" << GetStateStr()
                      << " on " << _socket->description();
         errno = status;
@@ -1092,7 +1020,7 @@ void UrmaEndpoint::PollCq(Socket* m) {
         return;
     }
 
-    const bool event_mode = !FLAGS_urma_use_polling;
+    const bool event_mode = !ep->_resource->config.use_polling;
     int progress = Socket::PROGRESS_INIT;
     while (true) {
         urma_jfc_t* event_jfc = nullptr;
@@ -1766,78 +1694,35 @@ int UrmaEndpoint::GlobalInitialize() {
         }
         _poller_groups = std::vector<PollerGroup>(ntags);
     }
-    if (g_prepared_cnt > 0) {
-        return 0;
-    }
     urma_context_t* ctx = GetUrmaContext();
     if (!ctx) {
         return 0;
     }
+
+    auto& prepared = PreparedJettyResources();
+    if (!prepared.empty()) {
+        return 0;
+    }
+    const auto config = MakeLocalJettyConfig(
+        ctx, QueueDepth(FLAGS_urma_sq_size), QueueDepth(FLAGS_urma_rq_size));
     const int prepared_jetty_count = PreparedJettyCount();
     for (int i = 0; i < prepared_jetty_count; ++i) {
-        auto* r = new (std::nothrow) UrmaResource();
-        if (!r) {
+        auto resource = LocalJettyResources::Create(config);
+        if (!resource) {
             break;
         }
-        r->jfce = urma_create_jfce(ctx);
-        if (!r->jfce ||
-            (!FLAGS_urma_use_polling && r->jfce->fd < 0)) {
-            delete r;
-            break;
-        }
-        urma_jfc_cfg_t jfc_cfg{};
-        jfc_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size + FLAGS_urma_rq_size);
-        jfc_cfg.jfce = r->jfce;
-        r->jfc = urma_create_jfc(ctx, &jfc_cfg);
-        if (!r->jfc) {
-            delete r;
-            break;
-        }
-        urma_jfr_cfg_t jfr_cfg{};
-        jfr_cfg.depth = static_cast<uint32_t>(FLAGS_urma_rq_size);
-        jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
-        jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-        jfr_cfg.jfc = r->jfc;
-        r->jfr = urma_create_jfr(ctx, &jfr_cfg);
-        if (!r->jfr) {
-            delete r;
-            break;
-        }
-        urma_jetty_cfg_t jetty_cfg{};
-        jetty_cfg.flag.bs.share_jfr = 1;
-        jetty_cfg.jfs_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size);
-        jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-        jetty_cfg.jfs_cfg.priority = GetUrmaJettyPriority();
-        jetty_cfg.jfs_cfg.max_sge =
-            static_cast<uint8_t>(GetUrmaMaxSge());
-        jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-        jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-        jetty_cfg.jfs_cfg.jfc = r->jfc;
-        jetty_cfg.shared.jfr = r->jfr;
-        jetty_cfg.shared.jfc = r->jfc;
-        r->jetty = urma_create_jetty(ctx, &jetty_cfg);
-        if (!r->jetty) {
-            delete r;
-            break;
-        }
-        r->next = g_prepared_list;
-        g_prepared_list = r;
-        ++g_prepared_cnt;
+        prepared.push_back(std::move(resource));
     }
     return 0;
 }
 
 void UrmaEndpoint::GlobalRelease() {
+    PreparedResources prepared;
     {
         BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        while (g_prepared_list) {
-            UrmaResource* next = g_prepared_list->next;
-            delete g_prepared_list;
-            g_prepared_list = next;
-        }
-        g_prepared_cnt = 0;
+        prepared.swap(PreparedJettyResources());
     }
+    prepared.clear();
     for (size_t tag = 0; tag < _poller_groups.size(); ++tag) {
         PollingModeRelease(static_cast<bthread_tag_t>(tag));
     }

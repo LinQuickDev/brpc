@@ -21,12 +21,17 @@
 #include <gflags/gflags.h>
 
 #if BRPC_WITH_URMA
+#include <fcntl.h>
+#include <cerrno>
+
 #include "butil/atomicops.h"
+#include "butil/memory/scope_guard.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma/urma_resource.h"
 #include "urma_types.h"
 
 using namespace brpc;
@@ -350,6 +355,45 @@ TEST_F(UrmaMockTest, create_context_and_query_device) {
 
     EXPECT_EQ(URMA_SUCCESS, urma_delete_context(ctx));
     urma_free_device_list(devices);
+}
+
+TEST_F(UrmaMockTest, creates_local_queues_with_requested_config) {
+    int num_devices = 0;
+    urma_device_t** devices = urma_get_device_list(&num_devices);
+    ASSERT_NE(nullptr, devices);
+    auto free_devices = butil::MakeScopeGuard(
+        [&] { urma_free_device_list(devices); });
+    ASSERT_GT(num_devices, 0);
+    urma_context_t* ctx = urma_create_context(devices[0], 0);
+    ASSERT_NE(nullptr, ctx);
+    auto delete_context = butil::MakeScopeGuard(
+        [&] { EXPECT_EQ(URMA_SUCCESS, urma_delete_context(ctx)); });
+
+    for (bool polling : {false, true}) {
+        const urma::LocalJettyConfig config{ctx, 32, 64, 2, 1, polling};
+        auto queues = urma::LocalJettyResources::Create(config);
+        ASSERT_NE(nullptr, queues);
+        EXPECT_TRUE(config == queues->config);
+        EXPECT_EQ(96u, queues->jfc->jfc_cfg.depth);
+        EXPECT_EQ(32u, queues->jetty->jetty_cfg.jfs_cfg.depth);
+        EXPECT_EQ(2u, queues->jetty->jetty_cfg.jfs_cfg.max_sge);
+        EXPECT_EQ(1u, queues->jetty->jetty_cfg.jfs_cfg.priority);
+        EXPECT_EQ(queues->jfr, queues->jetty->jetty_cfg.shared.jfr);
+        EXPECT_EQ(queues->jfc, queues->jetty->jetty_cfg.shared.jfc);
+
+        auto different_depth = config;
+        ++different_depth.rq_depth;
+        EXPECT_FALSE(different_depth == queues->config);
+        auto different_mode = config;
+        different_mode.use_polling = !polling;
+        EXPECT_FALSE(different_mode == queues->config);
+
+        const int fd = queues->jfce->fd;
+        ASSERT_GE(fcntl(fd, F_GETFD), 0);
+        queues.reset();
+        EXPECT_EQ(-1, fcntl(fd, F_GETFD));
+        EXPECT_EQ(EBADF, errno);
+    }
 }
 
 TEST_F(UrmaMockTest, rejects_send_without_target_jetty) {
