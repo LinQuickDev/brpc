@@ -75,13 +75,10 @@ static const uint32_t HELLO_ACK_URMA_OK = 0x1;
 static const size_t IOBUF_BLOCK_HEADER_LEN = sizeof(butil::IOBuf::Block);
 
 // ---- Globals: prepared jetty pool + poller groups ----
-static butil::Mutex g_prepared_mutex;
-using PreparedResources = std::vector<std::unique_ptr<LocalJettyResources>>;
-
-static PreparedResources& PreparedJettyResources() {
+static PreparedJettyPool& PreparedJettyResources() {
     // The URMA context is kept alive until process exit. Release this cache
     // explicitly during initialization rollback, before deleting the context.
-    static auto* resources = new PreparedResources;
+    static auto* resources = new PreparedJettyPool;
     return *resources;
 }
 
@@ -382,19 +379,9 @@ int UrmaEndpoint::AllocateResources() {
     }
 
     const auto config = MakeLocalJettyConfig(ctx, _sq_size, _rq_size);
-    {
-        BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        auto& prepared = PreparedJettyResources();
-        if (!prepared.empty() && prepared.back()->config == config) {
-            _resource = std::move(prepared.back());
-            prepared.pop_back();
-        }
-    }
+    _resource = PreparedJettyResources().Acquire(config);
     if (!_resource) {
-        _resource = LocalJettyResources::Create(config);
-        if (!_resource) {
-            return -1;
-        }
+        return -1;
     }
 
     _sbuf.resize(_sq_size - RESERVED_WR_NUM);
@@ -1699,30 +1686,14 @@ int UrmaEndpoint::GlobalInitialize() {
         return 0;
     }
 
-    auto& prepared = PreparedJettyResources();
-    if (!prepared.empty()) {
-        return 0;
-    }
     const auto config = MakeLocalJettyConfig(
         ctx, QueueDepth(FLAGS_urma_sq_size), QueueDepth(FLAGS_urma_rq_size));
-    const int prepared_jetty_count = PreparedJettyCount();
-    for (int i = 0; i < prepared_jetty_count; ++i) {
-        auto resource = LocalJettyResources::Create(config);
-        if (!resource) {
-            break;
-        }
-        prepared.push_back(std::move(resource));
-    }
+    PreparedJettyResources().Prepare(config, PreparedJettyCount());
     return 0;
 }
 
 void UrmaEndpoint::GlobalRelease() {
-    PreparedResources prepared;
-    {
-        BAIDU_SCOPED_LOCK(g_prepared_mutex);
-        prepared.swap(PreparedJettyResources());
-    }
-    prepared.clear();
+    PreparedJettyResources().Clear();
     for (size_t tag = 0; tag < _poller_groups.size(); ++tag) {
         PollingModeRelease(static_cast<bthread_tag_t>(tag));
     }
