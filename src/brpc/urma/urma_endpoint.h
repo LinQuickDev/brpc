@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <ostream>
 #include <vector>
 
@@ -38,6 +39,7 @@
 #include "urma_types.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
+#include "brpc/urma/urma_resource.h"
 
 namespace brpc {
 
@@ -73,27 +75,6 @@ private:
     void (*_done)(int, void*){nullptr};
     void* _data{nullptr};
     int _error{0};
-};
-
-// POD holder for the URMA kernel objects backing one connection:
-//   - the send jetty (JFS), shared-JFR jetty, JFR, JFC, and (event mode) JFCE
-//   - the imported peer jetty and peer segment
-// Mirrors the role of rdma::RdmaResource, but the URMA object graph is a
-// little different (no separate QP/CQ split).
-struct UrmaResource {
-    UrmaResource* next{nullptr};  // singly-linked list for the prepared pool
-
-    urma_jfc_t* jfc{nullptr};
-    urma_jfce_t* jfce{nullptr};   // event mode only; null in polling mode
-    urma_jfr_t* jfr{nullptr};
-    urma_jetty_t* jetty{nullptr};
-    // Imported peer objects (created per-connection, not pooled).
-    urma_target_jetty_t* remote_jetty{nullptr};
-    urma_target_seg_t* remote_seg{nullptr};
-
-    UrmaResource() = default;
-    ~UrmaResource();
-    DISALLOW_COPY_AND_ASSIGN(UrmaResource);
 };
 
 // One per Socket. Carries the handshake state machine, the send/recv
@@ -278,8 +259,9 @@ private:
     butil::atomic<int64_t> _pending_received_bytes{0};
     butil::Mutex _dispatch_mutex;
 
-    // The URMA resources (jetty / jfc / jfr / jfce / imported peer objects).
-    UrmaResource* _resource{nullptr};
+    // Local queues and the remote handles imported for this connection.
+    std::unique_ptr<LocalJettyResources> _resource;
+    PeerResources _peer;
 
     // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
     // (polling mode). PollCq is the edge-triggered callback on this socket.

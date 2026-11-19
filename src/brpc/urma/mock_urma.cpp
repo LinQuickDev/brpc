@@ -43,6 +43,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -68,6 +69,7 @@ std::vector<urma_device_t *> device_list;
 std::map<urma_context_t *, int> context_map;
 std::map<urma_jfce_t *, int> jfce_map;
 std::map<urma_jfc_t *, JfcState *> jfc_state_map;
+std::set<urma_jfs_t*> jfs_set;
 std::map<urma_jfr_t *, int> jfr_map;
 // Side-table: JFR -> the JFC it was created with (used to route recv
 // completions to the right JfcState, since the JFR is an opaque handle).
@@ -78,6 +80,7 @@ std::map<urma_jetty_t *, int> jetty_map;
 std::map<uint32_t, urma_jetty_t *> jetty_id_map;
 std::map<urma_target_jetty_t *, int> target_jetty_map;
 std::atomic<uint32_t> next_jetty_id{1};
+constexpr uint32_t kMaxStandaloneQueueDepth = 4096;
 
 void PushCompletion(urma_jfc_t* jfc, JfcState* state,
                     const urma_cr_t& completion) {
@@ -140,6 +143,10 @@ urma_status_t urma_uninit(void) {
         delete kv.second;
     }
     jfc_state_map.clear();
+    for (auto* jfs : jfs_set) {
+        delete jfs;
+    }
+    jfs_set.clear();
     jfr_map.clear();
     jfr_jfc_map.clear();
     jfr_recv_map.clear();
@@ -240,11 +247,16 @@ urma_status_t urma_query_device(urma_device_t *device,
     if (!device || !attr) {
         return URMA_EINVAL;
     }
-    mock_device_attr.dev_cap.max_jfc = 1024;
-    mock_device_attr.dev_cap.max_jetty = 1024;
-    mock_device_attr.dev_cap.max_jfs_sge = 8;
-    mock_device_attr.dev_cap.max_jfr_sge = 8;
-    memcpy(attr, &mock_device_attr, sizeof(urma_device_attr_t));
+    *attr = mock_device_attr;
+    attr->dev_cap.max_jfc = 1024;
+    attr->dev_cap.max_jfs = 1024;
+    attr->dev_cap.max_jfr = 1024;
+    attr->dev_cap.max_jetty = 1024;
+    attr->dev_cap.max_jfc_depth = 2 * kMaxStandaloneQueueDepth;
+    attr->dev_cap.max_jfs_depth = kMaxStandaloneQueueDepth;
+    attr->dev_cap.max_jfr_depth = kMaxStandaloneQueueDepth;
+    attr->dev_cap.max_jfs_sge = 8;
+    attr->dev_cap.max_jfr_sge = 8;
     return URMA_SUCCESS;
 }
 
@@ -357,9 +369,35 @@ urma_status_t urma_delete_jfc(urma_jfc_t *jfc) {
     return URMA_SUCCESS;
 }
 
+urma_jfs_t* urma_create_jfs(urma_context_t* ctx, urma_jfs_cfg_t* cfg) {
+    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!ctx || !cfg || !cfg->depth || cfg->depth > kMaxStandaloneQueueDepth ||
+        context_map.find(ctx) == context_map.end() ||
+        jfc_state_map.find(cfg->jfc) == jfc_state_map.end()) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    auto* jfs = new urma_jfs_t{};
+    jfs->urma_ctx = ctx;
+    jfs->jfs_cfg = *cfg;
+    jfs_set.insert(jfs);
+    return jfs;
+}
+
+urma_status_t urma_delete_jfs(urma_jfs_t* jfs) {
+    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!jfs_set.erase(jfs)) {
+        return URMA_EINVAL;
+    }
+    delete jfs;
+    return URMA_SUCCESS;
+}
+
 urma_jfr_t *urma_create_jfr(urma_context_t *ctx, urma_jfr_cfg_t *cfg) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
-    if (!ctx || !cfg || context_map.find(ctx) == context_map.end()) {
+    if (!ctx || !cfg || !cfg->depth || cfg->depth > kMaxStandaloneQueueDepth ||
+        context_map.find(ctx) == context_map.end()) {
+        errno = EINVAL;
         return nullptr;
     }
     // Opaque handle (avoids partially initializing urma_jfr_t's pthread
