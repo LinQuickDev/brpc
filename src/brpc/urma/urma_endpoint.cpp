@@ -699,7 +699,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     ssize_t total_len = 0;
     while (current < ndata) {
         uint16_t remote_wnd = _remote_rq_window_size.load(butil::memory_order_relaxed);
-        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_relaxed);
+        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_acquire);
         if (remote_wnd == 0 || sq_wnd == 0) {
             if (total_len > 0) {
                 break;
@@ -755,7 +755,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // window and makes the strict credit check tear down a healthy
         // connection.
         _remote_rq_window_size.fetch_sub(1, butil::memory_order_relaxed);
-        _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+        _sq_window_size.fetch_sub(1, butil::memory_order_release);
         int rc = urma_post_jetty_send_wr(_resource->jetty, &wr, &bad_wr);
         if (rc != URMA_SUCCESS) {
             const int provider_errno = errno;
@@ -958,31 +958,21 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             SendAck(0);
             return 0;
         }
-        uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
-        uint16_t old =
-            _sq_window_size.load(butil::memory_order_relaxed);
-        while (true) {
-            if (old >= _local_window_capacity) {
-                LOG(WARNING)
-                    << "URMA send completion exceeds SQ window: old=" << old
-                    << " increment=" << wnd
-                    << " capacity=" << _local_window_capacity
-                    << " user_ctx=" << cr.user_ctx
-                    << " on " << _socket->description();
-                errno = EPROTO;
-                return -1;
-            }
-            if (_sq_window_size.compare_exchange_weak(
-                    old, static_cast<uint16_t>(old + wnd),
-                    butil::memory_order_relaxed)) {
-                break;
-            }
+        const uint16_t old =
+            _sq_window_size.load(butil::memory_order_acquire);
+        if (old >= _local_window_capacity) {
+            LOG(WARNING) << "URMA send completion exceeds SQ window: old="
+                         << old << " capacity=" << _local_window_capacity
+                         << " user_ctx=" << cr.user_ctx << " on "
+                         << _socket->description();
+            errno = EPROTO;
+            return -1;
         }
-        for (uint16_t i = 0; i < wnd; ++i) {
-            _sbuf[_sq_sent].clear();
-            _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
-        }
-        butil::subtle::MemoryBarrier();
+        // Each data WR signals once. Release the slot before publishing its
+        // credit so the writer sees a reclaimed buffer when the ring wraps.
+        _sbuf[_sq_sent].clear();
+        _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
+        _sq_window_size.fetch_add(1, butil::memory_order_release);
         if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
             _local_window_capacity / 8) {
             _socket->WakeAsEpollOut();
@@ -1062,13 +1052,6 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
         return;
     }
 
-    // PollCq and the handshake bthread can both reach this method when the
-    // state changes to ESTABLISHED. Serialize them so each byte added to the
-    // URMA input processor is reported to InputMessenger exactly once.
-    std::unique_lock<butil::Mutex> dispatch_lock(_dispatch_mutex);
-    if (_state.load(butil::memory_order_acquire) != ESTABLISHED) {
-        return;
-    }
     pending = _pending_received_bytes.exchange(
         0, butil::memory_order_acq_rel);
     if (pending <= 0 || s->Failed()) {
@@ -1118,6 +1101,9 @@ void UrmaEndpoint::PollCq(Socket* m) {
             }
         }
 
+        // Protect appending and parsing the input stream with the same lock
+        // the handshake uses when delivering bytes already received.
+        std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
         ssize_t bytes = 0;
         auto drain_cq = [&]() -> int {
             while (true) {
@@ -1392,6 +1378,7 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
         ep->FailHandshake(tp, saved_errno, "send client ack");
         return nullptr;
     }
+    std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
     ep->DispatchReceivedBytes(s, 0);
@@ -1477,6 +1464,7 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
             ep->FailHandshake(tp, EPROTO, "client ack mismatch");
             return nullptr;
         }
+        std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
         ep->DispatchReceivedBytes(s, 0);

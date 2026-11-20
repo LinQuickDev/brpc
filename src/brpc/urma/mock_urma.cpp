@@ -48,6 +48,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "butil/memory/scope_guard.h"
+
 namespace {
 
 struct JfcState {
@@ -533,7 +535,7 @@ urma_status_t urma_modify_jetty(urma_jetty_t *jetty, urma_jetty_attr_t *attr) {
 
 urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                                       urma_jfs_wr_t **bad_wr) {
-    std::shared_lock<std::shared_mutex> read_lock(g_rw_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     auto local_it = jetty_map.find(jetty);
     auto local_jfc_it =
         jetty ? jfc_state_map.find(jetty->jetty_cfg.jfs_cfg.jfc)
@@ -546,7 +548,6 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
         return URMA_EINVAL;
     }
     JfcState* local_state = local_jfc_it->second;
-    read_lock.unlock();
 
     for (urma_jfs_wr_t* current = wr; current; current = current->next) {
         if (!current->tjetty) {
@@ -556,35 +557,34 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             return URMA_EINVAL;
         }
 
-        urma_cr_t send_cr{};
-        send_cr.status = URMA_CR_SUCCESS;
-        send_cr.user_ctx = current->user_ctx;
-        send_cr.flag.bs.s_r = 0;
-        if (current->flag.bs.complete_enable) {
-            PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
-                           local_state, send_cr);
-        }
+        // A successful SEND completion lets the caller release the source
+        // buffers. Publish it only after this iteration finishes reading SGEs.
+        BRPC_SCOPE_EXIT {
+            if (current->flag.bs.complete_enable) {
+                urma_cr_t send_cr{};
+                send_cr.status = URMA_CR_SUCCESS;
+                send_cr.user_ctx = current->user_ctx;
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
+                               local_state, send_cr);
+            }
+        };
 
-        PendingRecv recv{};
-        urma_jfc_t* remote_jfc = nullptr;
-        {
-            std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
-            auto remote_it = jetty_id_map.find(current->tjetty->id.id);
-            if (remote_it == jetty_id_map.end()) {
-                continue;
-            }
-            urma_jfr_t* remote_jfr =
-                remote_it->second->jetty_cfg.shared.jfr;
-            auto recv_it = jfr_recv_map.find(remote_jfr);
-            auto jfc_it = jfr_jfc_map.find(remote_jfr);
-            if (recv_it == jfr_recv_map.end() || recv_it->second.empty() ||
-                jfc_it == jfr_jfc_map.end()) {
-                continue;
-            }
-            recv = recv_it->second.front();
-            recv_it->second.pop_front();
-            remote_jfc = jfc_it->second;
+        // Keep dequeue, copy, and publication ordered even when a data SEND
+        // and a credit ACK are posted by different threads.
+        auto remote_it = jetty_id_map.find(current->tjetty->id.id);
+        if (remote_it == jetty_id_map.end()) {
+            continue;
         }
+        urma_jfr_t* remote_jfr = remote_it->second->jetty_cfg.shared.jfr;
+        auto recv_it = jfr_recv_map.find(remote_jfr);
+        auto jfc_it = jfr_jfc_map.find(remote_jfr);
+        if (recv_it == jfr_recv_map.end() || recv_it->second.empty() ||
+            jfc_it == jfr_jfc_map.end()) {
+            continue;
+        }
+        const PendingRecv recv = recv_it->second.front();
+        recv_it->second.pop_front();
+        urma_jfc_t* remote_jfc = jfc_it->second;
 
         uint32_t copied = 0;
         for (uint32_t i = 0;
@@ -596,15 +596,8 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             copied += n;
         }
 
-        JfcState* remote_state = nullptr;
-        {
-            std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
-            auto state_it = jfc_state_map.find(remote_jfc);
-            if (state_it != jfc_state_map.end()) {
-                remote_state = state_it->second;
-            }
-        }
-        if (remote_state) {
+        const auto state_it = jfc_state_map.find(remote_jfc);
+        if (state_it != jfc_state_map.end()) {
             urma_cr_t recv_cr{};
             recv_cr.status = URMA_CR_SUCCESS;
             recv_cr.user_ctx = recv.user_ctx;
@@ -615,7 +608,7 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
                     ? URMA_CR_OPC_SEND_WITH_IMM
                     : URMA_CR_OPC_SEND;
             recv_cr.imm_data = current->send.imm_data;
-            PushCompletion(remote_jfc, remote_state, recv_cr);
+            PushCompletion(remote_jfc, state_it->second, recv_cr);
         }
     }
     if (bad_wr) {

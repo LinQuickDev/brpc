@@ -25,6 +25,7 @@
 #include "butil/atomicops.h"
 #include "butil/sys_byteorder.h"
 #include "urma_api.h"
+#include "brpc/urma/urma_endpoint.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_helper.h"
@@ -41,6 +42,37 @@ extern butil::atomic<bool> g_urma_available;
 
 }  // namespace urma
 }  // namespace brpc
+
+TEST(UrmaEndpointTest, SendSlotIsReclaimedBeforeCreditIsPublished) {
+    SocketId id;
+    ASSERT_EQ(0, Socket::Create(SocketOptions(), &id));
+    SocketUniquePtr socket;
+    ASSERT_EQ(0, Socket::Address(id, &socket));
+    bool reclaimed = false;
+    uint16_t credits_while_reclaiming = 1;
+    char payload = 0;
+    urma::UrmaEndpoint endpoint(socket.get());
+    const auto slots = endpoint._sq_size - endpoint.RESERVED_WR_NUM;
+    endpoint._sbuf.resize(slots);
+    endpoint._sq_sent = slots - 1;
+    endpoint._local_window_capacity = slots;
+    ASSERT_EQ(0, endpoint._sbuf.back().append_user_data(&payload, 1,
+        [&](void*) {
+            reclaimed = true;
+            credits_while_reclaiming =
+                endpoint._sq_window_size.load(butil::memory_order_relaxed);
+        }));
+
+    urma_cr_t completion{};
+    completion.status = URMA_CR_SUCCESS;
+    completion.user_ctx = 1;
+    EXPECT_EQ(0, endpoint.HandleCompletion(completion));
+    EXPECT_TRUE(reclaimed);
+    EXPECT_EQ(0, credits_while_reclaiming);
+    EXPECT_EQ(1, endpoint._sq_window_size.load(butil::memory_order_relaxed));
+    EXPECT_EQ(0, endpoint._sq_sent);
+    socket->SetFailed();
+}
 
 // ---------------------------------------------------------------------------
 // v2 binary HelloMessage: serialize + deserialize round-trips.

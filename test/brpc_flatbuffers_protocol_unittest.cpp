@@ -2343,7 +2343,9 @@ public:
     std::atomic<bool> established{false};
 };
 
-TEST(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
+class FlatBuffersUrmaTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
     urma_init_attr_t attr{};
     const auto status = urma_init(&attr);
     if (status != URMA_SUCCESS && status != URMA_EEXIST) {
@@ -2367,7 +2369,22 @@ TEST(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_size", "4096");
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_count", "4096");
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_use_polling", "false");
-    const Message request = MakePayload(64 * 1024);
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_sq_size", "16");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_rq_size", "16");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_max_sge", "1");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_recv_zerocopy",
+                                           GetParam() ? "true" : "false");
+    std::string body(64 * 1024, '\0');
+    for (size_t i = 0; i < body.size(); ++i) {
+        // Give the WR slices distinct data so swapping slices changes the reply.
+        body[i] = static_cast<char>(i / 256);
+    }
+    MessageBuilder builder(8);
+    auto text = builder.CreateString(body);
+    const int32_t numbers[] = {0, -3, -6, -9};
+    auto values = builder.CreateVector(numbers, ARRAY_SIZE(numbers));
+    builder.Finish(brpc_fbtest::CreatePayload(builder, 123, text, values));
+    const Message request = builder.ReleaseMessage();
 
     UrmaPayloadService service;
     brpc::Server server;
@@ -2392,16 +2409,22 @@ TEST(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
     ASSERT_EQ(0, channel.Init(server.listen_address(), &channel_options));
     const auto* method = service.GetDescriptor()->FindMethodByIndex(7);
     ASSERT_NE(nullptr, method);
-    brpc::Controller cntl;
-    Message response;
+    // Keep one connection open through repeated wraps of both WR rings.
     const std::string attachment(8193, 'a');
-    ASSERT_EQ(0, cntl.request_attachment().append(attachment));
-    channel.FBCallMethod(method, &cntl, &request, &response, nullptr);
-    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
-    EXPECT_TRUE(service.established.load()) << "RPC fell back to TCP";
-    ExpectReply(response, request, method);
-    EXPECT_EQ(attachment, cntl.response_attachment().to_string());
+    for (int i = 0; i < 32; ++i) {
+        SCOPED_TRACE(i);
+        brpc::Controller cntl;
+        Message response;
+        ASSERT_EQ(0, cntl.request_attachment().append(attachment));
+        channel.FBCallMethod(method, &cntl, &request, &response, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_TRUE(service.established.load()) << "RPC fell back to TCP";
+        ExpectReply(response, request, method);
+        EXPECT_EQ(attachment, cntl.response_attachment().to_string());
+    }
 }
+
+INSTANTIATE_TEST_SUITE_P(ReceiveMode, FlatBuffersUrmaTest, ::testing::Bool());
 #endif  // BRPC_WITH_URMA
 
 }  // namespace

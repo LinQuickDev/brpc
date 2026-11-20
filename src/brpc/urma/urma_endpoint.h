@@ -245,6 +245,7 @@ private:
     // ACK. Keep those bytes in the URMA input processor and dispatch them only
     // after ESTABLISHED, matching the connection-ready boundary seen by user
     // code.
+    // Caller holds _dispatch_mutex.
     void DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes);
 
     // Consume one async event from the JFCE fd (event mode only). The caller
