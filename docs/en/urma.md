@@ -94,7 +94,7 @@ Select the transport by setting `socket_mode` on the channel / server:
 // Client
 brpc::ChannelOptions opt;
 opt.socket_mode = brpc::SOCKET_MODE_URMA;
-opt.protocol = "baidu_std";   // URMA supports baidu_std only
+opt.protocol = "baidu_std";   // Or "fb_rpc" with WITH_FLATBUFFERS enabled
 brpc::Channel channel;
 channel.Init("127.0.0.1:8003", &opt);
 
@@ -149,11 +149,14 @@ Like RDMA / UBRing, the control plane is TCP and the data plane is URMA:
 
 A single large region is `mmap`-ed and registered once with
 `urma_register_seg`, then sliced into fixed-size buffers (default 8 KB).
-`butil::iobuf::blockmem_allocate` is hijacked so every IOBuf block is backed
-by the registered segment, allowing the send path to build `urma_sge_t`
+The transport overrides `butil::iobuf::blockmem_allocate` so pool-sized IOBuf
+blocks can use the registered segment, allowing the send path to build `urma_sge_t`
 directly from IOBuf block refs without per-message registration (mirroring the
 RDMA `block_pool` design). User-registered memory is supported via
-`urma::RegisterMemoryForUrma` / `DeregisterMemoryForUrma`.
+`urma::RegisterMemoryForUrma` / `DeregisterMemoryForUrma`. The send path retains
+registered buffers by reference. It copies unregistered ranges, including
+large contiguous FlatBuffers allocations, into registered pool buffers held
+until send completion. Pool exhaustion fails the send.
 
 ## Configuration
 
@@ -203,7 +206,8 @@ is tracked as a future enhancement.
 
 ## Limitations
 
-- `baidu_std` protocol only (same as RDMA). SSL, RTMP, NSHEAD, MONGO are
+- The supported RPC protocols are `baidu_std` and, with FlatBuffers enabled,
+  `fb_rpc`. SSL, RTMP, NSHEAD, MONGO are
   rejected at `ContextInitOrDie`.
 - A hardware data path requires a supported UMDK provider and `liburma`.
 - The current implementation targets Linux.

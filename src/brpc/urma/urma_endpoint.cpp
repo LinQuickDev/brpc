@@ -624,8 +624,7 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
 // Send / recv data path.
 // ============================================================================
 
-// Private IOBuf accessor mirroring RdmaIOBuf: reach into IOBuf block refs to
-// build a urma_sge_t directly, without memcpy.
+// Build send SGEs from IOBuf block references.
 class UrmaIOBuf : private butil::IOBuf {
     friend class ::brpc::urma::UrmaEndpoint;
 public:
@@ -653,18 +652,25 @@ public:
                         static_cast<uintptr_t>(meta));
                 }
             }
-            if (!tseg) {
-                errno = ERDMAMEM;
-                return -1;
-            }
-            size_t this_len = r.length;
-            if (len + this_len > max_len) {
-                this_len = max_len - len;
+            size_t this_len = std::min<size_t>(r.length, max_len - len);
+            if (tseg) {
+                cutn(to, this_len);
+            } else {
+                // Large contiguous FlatBuffers and buffers created before
+                // URMA initialization can live outside the registered pool.
+                // Stage at most one local pool block per SGE. The SQ slot
+                // owns the staged bytes until send completion.
+                this_len = std::min(this_len, GetUrmaRecvBlockSize());
+                start = AppendRegisteredSendCopy(to, start, this_len);
+                if (!start) {
+                    return -1;
+                }
+                tseg = GetPoolSegFor(nullptr);
+                pop_front(this_len);
             }
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
-            cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
         }
@@ -693,7 +699,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
     ssize_t total_len = 0;
     while (current < ndata) {
         uint16_t remote_wnd = _remote_rq_window_size.load(butil::memory_order_relaxed);
-        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_relaxed);
+        uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_acquire);
         if (remote_wnd == 0 || sq_wnd == 0) {
             if (total_len > 0) {
                 break;
@@ -733,6 +739,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // Piggybacking credits turns every payload into SEND_IMM and can
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
+        // The input processor assembles an ordered stream. Require both
+        // placement and receive completion order across consecutive SENDs.
+        wr.flag.bs.place_order = URMA_STRONG_ORDER;
+        wr.flag.bs.comp_order = 1;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
@@ -749,7 +759,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // window and makes the strict credit check tear down a healthy
         // connection.
         _remote_rq_window_size.fetch_sub(1, butil::memory_order_relaxed);
-        _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+        _sq_window_size.fetch_sub(1, butil::memory_order_release);
         int rc = urma_post_jetty_send_wr(_resource->jetty, &wr, &bad_wr);
         if (rc != URMA_SUCCESS) {
             const int provider_errno = errno;
@@ -773,6 +783,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             errno = rc;
             return -1;
         }
+        VLOG(1) << "URMA posted data SEND: bytes=" << this_len
+                << " sge_count=" << sge_index << " on "
+                << _socket->description();
         _sq_current = (_sq_current + 1) % (_sq_size - RESERVED_WR_NUM);
         total_len += static_cast<ssize_t>(this_len);
     }
@@ -949,31 +962,21 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             SendAck(0);
             return 0;
         }
-        uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
-        uint16_t old =
-            _sq_window_size.load(butil::memory_order_relaxed);
-        while (true) {
-            if (old >= _local_window_capacity) {
-                LOG(WARNING)
-                    << "URMA send completion exceeds SQ window: old=" << old
-                    << " increment=" << wnd
-                    << " capacity=" << _local_window_capacity
-                    << " user_ctx=" << cr.user_ctx
-                    << " on " << _socket->description();
-                errno = EPROTO;
-                return -1;
-            }
-            if (_sq_window_size.compare_exchange_weak(
-                    old, static_cast<uint16_t>(old + wnd),
-                    butil::memory_order_relaxed)) {
-                break;
-            }
+        const uint16_t old =
+            _sq_window_size.load(butil::memory_order_acquire);
+        if (old >= _local_window_capacity) {
+            LOG(WARNING) << "URMA send completion exceeds SQ window: old="
+                         << old << " capacity=" << _local_window_capacity
+                         << " user_ctx=" << cr.user_ctx << " on "
+                         << _socket->description();
+            errno = EPROTO;
+            return -1;
         }
-        for (uint16_t i = 0; i < wnd; ++i) {
-            _sbuf[_sq_sent].clear();
-            _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
-        }
-        butil::subtle::MemoryBarrier();
+        // Each data WR signals once. Release the slot before publishing its
+        // credit so the writer sees a reclaimed buffer when the ring wraps.
+        _sbuf[_sq_sent].clear();
+        _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
+        _sq_window_size.fetch_add(1, butil::memory_order_release);
         if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
             _local_window_capacity / 8) {
             _socket->WakeAsEpollOut();
@@ -1053,13 +1056,6 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
         return;
     }
 
-    // PollCq and the handshake bthread can both reach this method when the
-    // state changes to ESTABLISHED. Serialize them so each byte added to the
-    // URMA input processor is reported to InputMessenger exactly once.
-    std::unique_lock<butil::Mutex> dispatch_lock(_dispatch_mutex);
-    if (_state.load(butil::memory_order_acquire) != ESTABLISHED) {
-        return;
-    }
     pending = _pending_received_bytes.exchange(
         0, butil::memory_order_acq_rel);
     if (pending <= 0 || s->Failed()) {
@@ -1109,6 +1105,9 @@ void UrmaEndpoint::PollCq(Socket* m) {
             }
         }
 
+        // Protect appending and parsing the input stream with the same lock
+        // the handshake uses when delivering bytes already received.
+        std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
         ssize_t bytes = 0;
         auto drain_cq = [&]() -> int {
             while (true) {
@@ -1383,6 +1382,7 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
         ep->FailHandshake(tp, saved_errno, "send client ack");
         return nullptr;
     }
+    std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
     ep->DispatchReceivedBytes(s, 0);
@@ -1468,6 +1468,7 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
             ep->FailHandshake(tp, EPROTO, "client ack mismatch");
             return nullptr;
         }
+        std::unique_lock<butil::Mutex> receive_lock(ep->_dispatch_mutex);
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
         ep->DispatchReceivedBytes(s, 0);

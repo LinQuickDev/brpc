@@ -52,6 +52,7 @@ DEFINE_string(server, "", "IPv4 endpoint printed by benchmark_fb_server; "
               "a non-loopback address also needs --allow_remote");
 DEFINE_bool(allow_remote, false, "Allow a non-loopback --server for cross-host benchmarks");
 DEFINE_string(protocol, "fb_rpc", "fb_rpc, or baidu_std for the protobuf control service");
+DEFINE_bool(use_urma, false, "Use the URMA socket mode on a URMA-enabled build");
 DEFINE_string(connection_type, "single", "single, pooled, or short");
 DEFINE_int32(request_count, 16, "Count mode: total requests across all threads, 1..1000");
 DEFINE_int32(duration_s, 0, "0 selects count mode; 1..3600 runs a timed benchmark");
@@ -540,6 +541,7 @@ int RunTimed(const CallFn& call) {
 int RunClient(const butil::EndPoint& endpoint) {
     brpc::Channel channel;
     brpc::ChannelOptions options;
+    options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA : brpc::SOCKET_MODE_TCP;
     options.protocol = FLAGS_protocol;
     options.connection_type = FLAGS_connection_type;
     options.timeout_ms = FLAGS_timeout_ms;

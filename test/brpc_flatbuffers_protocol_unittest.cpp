@@ -34,6 +34,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,10 @@
 #include "brpc/stream.h"
 #include "bvar/variable.h"
 #include "flatbuffers_message_generated.h"
+#if BRPC_WITH_URMA
+#include <gflags/gflags.h>
+#include "brpc/urma/urma_helper.h"
+#endif
 
 namespace {
 
@@ -2315,6 +2320,143 @@ TEST(FlatBuffersProbeOrderTest, ProbedRightAfterBaiduStd) {
     server.Stop(0);
     server.Join();
 }
+
+#if BRPC_WITH_URMA
+class UrmaPayloadService : public PayloadService {
+public:
+    void FBCallMethod(const MethodDescriptor* method,
+                      google::protobuf::RpcController* controller,
+                      const Message* request, Message* response,
+                      google::protobuf::Closure* done) override {
+        brpc::ControllerPrivateAccessor accessor(
+            static_cast<brpc::Controller*>(controller));
+        brpc::Socket* socket = accessor.get_sending_socket();
+        if (socket) {
+            std::ostringstream debug;
+            brpc::Socket::DebugSocket(debug, socket->id());
+            established.store(debug.str().find("state=ESTABLISHED") !=
+                              std::string::npos);
+        }
+        PayloadService::FBCallMethod(method, controller, request, response, done);
+    }
+
+    std::atomic<bool> established{false};
+};
+
+class FlatBuffersUrmaTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(FlatBuffersUrmaTest, MockRoundTripWithLargePayload) {
+    urma_init_attr_t attr{};
+    const auto status = urma_init(&attr);
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+        GTEST_SKIP() << "Requires the URMA link-time mock";
+    }
+    int device_count = 0;
+    urma_device_t** devices = urma_get_device_list(&device_count);
+    const bool mock = devices && device_count > 0 &&
+        strcmp(devices[0]->name, "mock_urma_device") == 0;
+    if (devices) {
+        urma_free_device_list(devices);
+    }
+    if (status == URMA_SUCCESS) {
+        ASSERT_EQ(URMA_SUCCESS, urma_uninit());
+    }
+    if (!mock) {
+        GTEST_SKIP() << "Requires the URMA link-time mock";
+    }
+
+    GFLAGS_NAMESPACE::FlagSaver flags;
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_size", "4096");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_buffer_count", "4096");
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_large_buffer_count", "4").empty());
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_large_buffer_size", "131072").empty());
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_use_polling", "false");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_sq_size", "16");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_rq_size", "16");
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_max_sge", "1");
+    // The mock already delivers FIFO, so check the endpoint's WR contract too.
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_mock_require_ordered_data_send", "true").empty());
+    GFLAGS_NAMESPACE::SetCommandLineOption("urma_recv_zerocopy",
+                                           GetParam() ? "true" : "false");
+    std::string body(64 * 1024, '\0');
+    for (size_t i = 0; i < body.size(); ++i) {
+        // Give the WR slices distinct data so swapping slices changes the reply.
+        body[i] = static_cast<char>(i / 256);
+    }
+    const auto build_request = [&]() {
+        MessageBuilder builder(body.size() + 256);
+        auto text = builder.CreateString(body);
+        const int32_t numbers[] = {0, -3, -6, -9};
+        auto values = builder.CreateVector(numbers, ARRAY_SIZE(numbers));
+        builder.Finish(brpc_fbtest::CreatePayload(builder, 123, text, values));
+        return builder.ReleaseMessage();
+    };
+
+    UrmaPayloadService service;
+    brpc::Server server;
+    ASSERT_EQ(0, server.AddFlatBuffersService(
+        &service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions server_options;
+    server_options.socket_mode = brpc::SOCKET_MODE_URMA;
+    server_options.has_builtin_services = false;
+    server_options.enabled_protocols = "fb_rpc";
+    ASSERT_EQ(0, server.Start("127.0.0.1:0", &server_options));
+    ASSERT_TRUE(brpc::urma::IsUrmaAvailable());
+    auto segment = [](const Message& message) {
+        return brpc::urma::GetPoolSegFor(const_cast<uint8_t*>(message.data()));
+    };
+
+    const Message registered_request = build_request();
+    auto* large_segment = segment(registered_request);
+    ASSERT_NE(nullptr, large_segment);
+    EXPECT_NE(brpc::urma::GetPoolSegFor(nullptr), large_segment);
+    Message unregistered_request;
+    {
+        const Message second = build_request();
+        const Message third = build_request();
+        const Message fourth = build_request();
+        EXPECT_EQ(large_segment, segment(second));
+        EXPECT_EQ(large_segment, segment(third));
+        EXPECT_EQ(large_segment, segment(fourth));
+        unregistered_request = build_request();
+        EXPECT_EQ(nullptr, segment(unregistered_request));
+    }
+    {
+        const Message reused = build_request();
+        EXPECT_EQ(large_segment, segment(reused));
+    }
+
+    brpc::ChannelOptions channel_options;
+    channel_options.protocol = "fb_rpc";
+    channel_options.socket_mode = brpc::SOCKET_MODE_URMA;
+    channel_options.connection_type = "single";
+    channel_options.max_retry = 0;
+    channel_options.timeout_ms = kWaitTimeoutMs;
+    brpc::Channel channel;
+    ASSERT_EQ(0, channel.Init(server.listen_address(), &channel_options));
+    const auto* method = service.GetDescriptor()->FindMethodByIndex(7);
+    ASSERT_NE(nullptr, method);
+    // Keep one connection open through repeated wraps of both WR rings.
+    const std::string attachment(8193, 'a');
+    for (int i = 0; i < 32; ++i) {
+        SCOPED_TRACE(i);
+        const Message& request = i % 2 == 0 ? registered_request : unregistered_request;
+        brpc::Controller cntl;
+        Message response;
+        ASSERT_EQ(0, cntl.request_attachment().append(attachment));
+        channel.FBCallMethod(method, &cntl, &request, &response, nullptr);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+        ASSERT_TRUE(service.established.load()) << "RPC fell back to TCP";
+        ExpectReply(response, request, method);
+        EXPECT_EQ(attachment, cntl.response_attachment().to_string());
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ReceiveMode, FlatBuffersUrmaTest, ::testing::Bool());
+#endif  // BRPC_WITH_URMA
 
 }  // namespace
 #endif  // BRPC_WITH_FLATBUFFERS

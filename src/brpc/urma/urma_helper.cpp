@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <new>
 #include <utility>
 #include <vector>
@@ -35,6 +36,7 @@
 #include <gflags/gflags.h>
 
 #include "butil/atomicops.h"
+#include "butil/config.h"
 #include "butil/containers/flat_map.h"
 #include "butil/iobuf.h"
 #include "butil/logging.h"
@@ -96,6 +98,10 @@ DEFINE_int32(urma_buffer_size, 8 * 1024,
              "Must match IOBuf block size to keep zero-copy working.");
 DEFINE_int32(urma_buffer_count, 65536,
              "Number of buffers in the URMA buffer pool.");
+DEFINE_int32(urma_large_buffer_count, 0,
+             "Number of registered large IOBuf blocks; 0 disables the optional pool.");
+DEFINE_int32(urma_large_buffer_size, 8 * 1024 * 1024 + 64 * 1024,
+             "Bytes per registered large IOBuf block, rounded up to a page.");
 
 DEFINE_bool(urma_poller_yield, false,
             "Yield (bthread_yield) in the busy poll loop to let other "
@@ -258,6 +264,118 @@ struct BufferPool {
 };
 BufferPool* g_pool = nullptr;
 
+urma_target_seg_t* RegisterPoolSegment(void* base, size_t size) {
+    urma_reg_seg_flag_t flag{};
+    flag.bs.token_policy = URMA_TOKEN_NONE;
+    flag.bs.cacheable = URMA_NON_CACHEABLE;
+    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
+
+    urma_seg_cfg_t cfg{};
+    cfg.va = reinterpret_cast<uint64_t>(base);
+    cfg.len = size;
+    cfg.flag = flag;
+    cfg.user_ctx = reinterpret_cast<uint64_t>(base);
+    errno = 0;
+    return urma_register_seg(g_context, &cfg);
+}
+
+// Keep large, contiguous IOBuf blocks in a separate local segment. Their
+// capacity must not change the recv size advertised during the handshake.
+struct RegisteredLargeBuffers {
+    void* base = nullptr;
+    size_t block_size = 0;
+    size_t size = 0;
+    urma_target_seg_t* segment = nullptr;
+    butil::Mutex mutex;
+    std::vector<void*> available;
+
+    bool Contains(const void* p) const {
+        const auto start = reinterpret_cast<uintptr_t>(base);
+        const auto addr = reinterpret_cast<uintptr_t>(p);
+        return addr >= start && addr - start < size;
+    }
+
+    void* Allocate(size_t bytes) {
+        if (bytes > block_size) {
+            return nullptr;
+        }
+        BAIDU_SCOPED_LOCK(mutex);
+        if (available.empty()) {
+            return nullptr;
+        }
+        void* buffer = available.back();
+        available.pop_back();
+        return buffer;
+    }
+
+    void Recycle(void* buffer) {
+        BAIDU_SCOPED_LOCK(mutex);
+        available.push_back(buffer);
+    }
+
+    ~RegisteredLargeBuffers() {
+        if (segment) {
+            urma_unregister_seg(segment);
+        }
+        if (base) {
+            munmap(base, size);
+        }
+    }
+};
+
+// Like the small pool, this stays alive until process exit after initialization.
+RegisteredLargeBuffers* g_large_pool = nullptr;
+
+void InitLargeBufferPool() {
+    if (FLAGS_urma_large_buffer_count == 0) {
+        return;
+    }
+    constexpr size_t kMaxPoolBytes = 1ULL << 30;
+    const int count = FLAGS_urma_large_buffer_count;
+    const int requested_size = FLAGS_urma_large_buffer_size;
+    if (count < 0 || requested_size <= FLAGS_urma_buffer_size ||
+        static_cast<size_t>(requested_size) > kMaxPoolBytes) {
+        LOG(WARNING) << "Invalid URMA large buffer pool configuration";
+        return;
+    }
+    const size_t block_size = AlignUp(static_cast<size_t>(requested_size), PageSize());
+    if (static_cast<size_t>(count) > kMaxPoolBytes / block_size) {
+        LOG(WARNING) << "URMA large buffer pool exceeds 1 GiB";
+        return;
+    }
+
+    std::unique_ptr<RegisteredLargeBuffers> pool(new (std::nothrow) RegisteredLargeBuffers);
+    if (!pool) {
+        return;
+    }
+    try {
+        pool->available.reserve(static_cast<size_t>(count));
+    } catch (const std::bad_alloc&) {
+        LOG(WARNING) << "Cannot allocate URMA large buffer pool metadata";
+        return;
+    }
+    pool->block_size = block_size;
+    pool->size = block_size * static_cast<size_t>(count);
+    pool->base = mmap(nullptr, pool->size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool->base == MAP_FAILED) {
+        PLOG(WARNING) << "Cannot map URMA large buffer pool";
+        pool->base = nullptr;
+        return;
+    }
+    pool->segment = RegisterPoolSegment(pool->base, pool->size);
+    if (!pool->segment) {
+        PLOG(WARNING) << "Cannot register URMA large buffer pool";
+        return;
+    }
+    for (int i = 0; i < count; ++i) {
+        pool->available.push_back(static_cast<char*>(pool->base) + i * block_size);
+    }
+    g_large_pool = pool.release();
+    LOG(INFO) << "URMA large buffer pool initialized: block_size=" << block_size
+              << " count=" << count;
+}
+
 size_t ShardFor(void* buf) {
     auto* base = static_cast<char*>(buf);
     auto offset = static_cast<size_t>(base - static_cast<char*>(g_pool_base));
@@ -271,15 +389,7 @@ size_t PreferredShard() {
     return std::hash<pthread_t>()(pthread_self()) % kShardCount;
 }
 
-void* PoolAllocate(size_t size) {
-    if (BAIDU_UNLIKELY(g_skip_urma_init)) {
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
-    // Only serve the configured buffer size; callers always ask for that.
-    if (size > g_pool_buffer_size) {
-        // Larger than a single buffer -- fall back to the system allocator.
-        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
-    }
+void* TryAllocatePoolBuffer() {
     auto start = PreferredShard();
     for (size_t i = 0; i < kShardCount; ++i) {
         auto shard = (start + i) % kShardCount;
@@ -297,6 +407,24 @@ void* PoolAllocate(size_t size) {
         }
         g_pool->outstanding.fetch_add(1, butil::memory_order_relaxed);
         return buf;
+    }
+    return nullptr;
+}
+
+void* PoolAllocate(size_t size) {
+    if (BAIDU_UNLIKELY(g_skip_urma_init)) {
+        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
+    }
+    if (size > g_pool_buffer_size) {
+        if (g_large_pool) {
+            if (void* buffer = g_large_pool->Allocate(size)) {
+                return buffer;
+            }
+        }
+        return g_mem_alloc_orig ? g_mem_alloc_orig(size) : malloc(size);
+    }
+    if (void* buffer = TryAllocatePoolBuffer()) {
+        return buffer;
     }
     LOG_EVERY_SECOND(WARNING)
         << "URMA buffer pool exhausted; falling back to malloc";
@@ -317,7 +445,9 @@ void PoolDeallocate(void* buf) {
     if (!base || p < base || p >= base + g_pool_size ||
         static_cast<size_t>(p - base) % g_pool_buffer_size != 0) {
         // Not a pool buffer -- hand back to the original allocator.
-        if (g_mem_dealloc_orig) {
+        if (g_large_pool && g_large_pool->Contains(buf)) {
+            g_large_pool->Recycle(buf);
+        } else if (g_mem_dealloc_orig) {
             g_mem_dealloc_orig(buf);
         } else {
             free(buf);
@@ -361,22 +491,7 @@ bool InitPool() {
         return false;
     }
 
-    urma_reg_seg_flag_t flag{};
-    flag.bs.token_policy = URMA_TOKEN_NONE;
-    flag.bs.cacheable = URMA_NON_CACHEABLE;
-    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
-
-    urma_seg_cfg_t cfg{};
-    cfg.va = reinterpret_cast<uint64_t>(g_pool_base);
-    cfg.len = g_pool_size;
-    cfg.token_id = nullptr;
-    cfg.token_value = {};
-    cfg.flag = flag;
-    cfg.user_ctx = reinterpret_cast<uint64_t>(g_pool_base);
-    cfg.iova = 0;
-
-    errno = 0;
-    g_pool_seg = urma_register_seg(g_context, &cfg);
+    g_pool_seg = RegisterPoolSegment(g_pool_base, g_pool_size);
     if (!g_pool_seg) {
         PLOG(WARNING) << "Fail to urma_register_seg";
         munmap(g_pool_base, g_pool_size);
@@ -394,9 +509,8 @@ bool InitPool() {
 
 }  // namespace
 
-// Exposed to urma_endpoint.cpp: return the per-buffer target_seg pointer.
-// All pool buffers share the same segment, so we return g_pool_seg for any
-// pool address; the per-WR length selects the slice.
+// The per-WR length selects a slice of the buffer's registered segment.
+// A null address specifically selects the small pool used by recv and staging.
 urma_target_seg_t* GetPoolSegFor(void* buf) {
     if (g_skip_urma_init || !g_pool_seg || !g_pool_base) {
         return nullptr;
@@ -409,7 +523,30 @@ urma_target_seg_t* GetPoolSegFor(void* buf) {
     if (p >= base && p - base < g_pool_size) {
         return g_pool_seg;
     }
-    return nullptr;
+    return g_large_pool && g_large_pool->Contains(buf) ? g_large_pool->segment : nullptr;
+}
+
+void* AppendRegisteredSendCopy(butil::IOBuf* out, const void* data, size_t size) {
+    if (!GetPoolSegFor(nullptr)) {
+        errno = ENODEV;
+        return nullptr;
+    }
+    if (size == 0 || size > g_pool_buffer_size) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    void* buffer = TryAllocatePoolBuffer();
+    if (!buffer) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    memcpy(buffer, data, size);
+    if (out->append_user_data(buffer, size, PoolDeallocate) != 0) {
+        PoolDeallocate(buffer);
+        errno = ENOMEM;
+        return nullptr;
+    }
+    return buffer;
 }
 
 static void GlobalRelease() {
@@ -427,6 +564,8 @@ static void GlobalRelease() {
         g_default_block_size_orig = 0;
     }
     UrmaEndpoint::GlobalRelease();
+    delete g_large_pool;
+    g_large_pool = nullptr;
     if (g_pool_seg) {
         urma_unregister_seg(g_pool_seg);
         g_pool_seg = nullptr;
@@ -605,9 +744,10 @@ static bool GlobalUrmaInitializeImpl() {
         return false;
     }
 
-    // Hijack IOBuf allocation so every IOBuf block is backed by a registered
-    // segment. This makes the send path trivial: any IOBuf can be posted
-    // directly as an urma_sge_t pointing at g_pool_seg.
+    InitLargeBufferPool();
+
+    // Use registered blocks when available. The send path stages ordinary
+    // memory through the small pool when an allocation falls back.
     g_mem_alloc_orig = butil::iobuf::blockmem_allocate;
     g_mem_dealloc_orig = butil::iobuf::blockmem_deallocate;
     g_default_block_size_orig = butil::GetDefaultBlockSize();
@@ -667,6 +807,11 @@ void GlobalDisableUrma() {
 }
 
 bool SupportedByUrma(const std::string& protocol) {
+#if BRPC_WITH_FLATBUFFERS
+    if (protocol == "fb_rpc") {
+        return true;
+    }
+#endif
     return protocol == "baidu_std";
 }
 
