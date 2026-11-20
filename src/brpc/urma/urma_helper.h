@@ -62,8 +62,8 @@ uint64_t RegisterMemoryForUrma(void* buf, size_t len);
 // Deregister a previously registered user buffer.
 void DeregisterMemoryForUrma(void* buf);
 
-// Return the target segment for a buffer-pool address. Passing nullptr returns
-// the segment backing the whole pool. Returns nullptr for any other address.
+// Return the target segment for a registered pool address. A null address
+// selects the small receive/staging pool. Other addresses return nullptr.
 urma_target_seg_t* GetPoolSegFor(void* buf);
 
 // Append a copy in registered pool memory. The IOBuf owns the pool buffer.
