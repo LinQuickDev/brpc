@@ -46,11 +46,16 @@
 #include <shared_mutex>
 #include <sys/eventfd.h>
 #include <unistd.h>
+
+#include <gflags/gflags.h>
 #include <vector>
 
 #include "butil/memory/scope_guard.h"
 
 namespace {
+
+DEFINE_bool(urma_mock_require_ordered_data_send, false,
+            "Require ordered data SEND flags when validating the bRPC stream");
 
 struct JfcState {
     std::mutex mutex;
@@ -550,7 +555,11 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
     JfcState* local_state = local_jfc_it->second;
 
     for (urma_jfs_wr_t* current = wr; current; current = current->next) {
-        if (!current->tjetty) {
+        const bool missing_order = FLAGS_urma_mock_require_ordered_data_send &&
+            current->opcode == URMA_OPC_SEND &&
+            (current->flag.bs.place_order != URMA_STRONG_ORDER ||
+             !current->flag.bs.comp_order);
+        if (!current->tjetty || missing_order) {
             if (bad_wr) {
                 *bad_wr = current;
             }

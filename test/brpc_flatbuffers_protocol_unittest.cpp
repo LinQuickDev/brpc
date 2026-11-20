@@ -2372,6 +2372,9 @@ TEST_P(FlatBuffersUrmaTest, MockRoundTripWithUnregisteredLargePayload) {
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_sq_size", "16");
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_rq_size", "16");
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_max_sge", "1");
+    // The mock already delivers FIFO, so check the endpoint's WR contract too.
+    ASSERT_FALSE(GFLAGS_NAMESPACE::SetCommandLineOption(
+        "urma_mock_require_ordered_data_send", "true").empty());
     GFLAGS_NAMESPACE::SetCommandLineOption("urma_recv_zerocopy",
                                            GetParam() ? "true" : "false");
     std::string body(64 * 1024, '\0');

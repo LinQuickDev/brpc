@@ -739,6 +739,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // Piggybacking credits turns every payload into SEND_IMM and can
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
+        // The input processor assembles an ordered stream. Require both
+        // placement and receive completion order across consecutive SENDs.
+        wr.flag.bs.place_order = URMA_STRONG_ORDER;
+        wr.flag.bs.comp_order = 1;
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
