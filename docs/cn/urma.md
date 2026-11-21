@@ -193,3 +193,16 @@ UrmaTransport 推荐用于**大包和跨节点**高吞吐路径，而 UBRing
   `ContextInitOrDie` 阶段拒绝。
 - 硬件数据通路需要受支持的 UMDK provider 和 `liburma`。
 - 当前实现面向 Linux。
+
+## 稳定性测试
+
+URMA mock 构建可运行故障注入和端到端测试：
+
+```sh
+ctest --test-dir build -R '^(brpc_urma_stability_unittest|urma_stability_.*)$' --output-on-failure
+python3 tools/urma_stability.py build/test/brpc_urma_stability_unittest --connections 1024 --rounds 100
+```
+
+覆盖 credit/SQ 延迟、发送与接收重投失败、异常完成、断连、资源重建及注册池耗尽。
+规模测试维持独立 URMA 连接，逐请求校验混合大小消息，依次运行事件、轮询和轮询内联配置。
+使用真实 `liburma` 构建的测试程序可在硬件上运行同一规模测试，通过 `--device` 选择设备。
