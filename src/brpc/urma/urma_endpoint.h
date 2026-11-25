@@ -103,6 +103,7 @@ struct UrmaResource {
 // false sharing between connections.
 class BAIDU_CACHELINE_ALIGNMENT UrmaEndpoint : public SocketUser {
     friend class UrmaRecoveryTestPeer;
+    friend class UrmaQosTestPeer;
     friend class UrmaConnect;
     friend class Socket;
     friend class UrmaTransport;
@@ -294,6 +295,8 @@ private:
 
     // The URMA resources (jetty / jfc / jfr / jfce / imported peer objects).
     UrmaResource* _resource{nullptr};
+    // Diagnostics can read the effective priority during handshake teardown.
+    butil::atomic<int> _effective_priority{-1};
 
     // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
     // (polling mode). PollCq is the edge-triggered callback on this socket.

@@ -240,14 +240,20 @@ urma_status_t urma_query_device(urma_device_t *device,
     if (!device || !attr) {
         return URMA_EINVAL;
     }
+    mock_device_attr.dev_cap.priority_info[3].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[3].SL = 3;
+    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
+    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[6].SL = 2;
+    mock_device_attr.dev_cap.priority_info[10].tp_type.bs.ctp = 1;
+    mock_device_attr.dev_cap.priority_info[10].tp_type.bs.rtp = 1;
+    mock_device_attr.dev_cap.priority_info[10].SL = 4;
     mock_device_attr.dev_cap.max_jfc = 1024;
     mock_device_attr.dev_cap.max_jetty = 1024;
     mock_device_attr.dev_cap.max_jfs_sge = 8;
     mock_device_attr.dev_cap.max_jfr_sge = 8;
     mock_device_attr.dev_cap.priority_info[0].tp_type.bs.rtp = 1;
     mock_device_attr.dev_cap.priority_info[0].SL = 2;
-    mock_device_attr.dev_cap.priority_info[6].tp_type.bs.ctp = 1;
-    mock_device_attr.dev_cap.priority_info[6].SL = 6;
     memcpy(attr, &mock_device_attr, sizeof(urma_device_attr_t));
     return URMA_SUCCESS;
 }
