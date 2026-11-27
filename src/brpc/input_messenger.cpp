@@ -101,6 +101,11 @@ void InputMessageClosure::reset(InputMessageBase* m) {
 }
 
 void InputMessenger::OnNewMessages(Socket* m) {
+    OnNewMessagesUntil(m, nullptr);
+}
+
+void InputMessenger::OnNewMessagesUntil(
+    Socket* m, bool (*stop_reading)(Socket*)) {
     // Notes:
     // - If the socket has only one message, the message will be parsed and
     //   processed in this bthread. nova-pbrpc and http works in this way.
@@ -150,7 +155,8 @@ void InputMessenger::OnNewMessages(Socket* m) {
         }
 
         if (processor.ProcessNewMessage(nr, read_eof, received_us,
-                                        base_realtime, last_msg) < 0) {
+                                        base_realtime, last_msg) < 0 ||
+            (stop_reading != nullptr && stop_reading(m))) {
             return;
         }
     }
@@ -276,6 +282,11 @@ int InputMessenger::AddNonProtocolHandler(const InputMessageHandler& handler) {
         return -1;
     }
     const int index = _max_index.load(butil::memory_order_relaxed) + 1;
+    if (static_cast<size_t>(index) >= _capacity) {
+        LOG(ERROR) << "Non-protocol handler capacity exhausted (index="
+                   << index << ", capacity=" << _capacity << ')';
+        return -1;
+    }
     _handlers[index] = handler;
     _max_index.store(index, butil::memory_order_release);
     return 0;
